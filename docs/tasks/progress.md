@@ -18,7 +18,7 @@
 - [x] **M09** · [`stages`](./09-stages.md) — 7 个 Stage
 - [x] **M10** · [`orchestrator`](./10-orchestrator.md) — 顶层循环 + 续跑
 - [x] **M11** · [`cli`](./11-cli.md) — `src/bin/atlas.ts` 命令行
-- [ ] **M12** · [`smoke-e2e`](./12-smoke-e2e.md) — 端到端冒烟 + AC 自检
+- [~] **M12** · [`smoke-e2e`](./12-smoke-e2e.md) — 端到端冒烟 + AC 自检（selfcheck 脚本 + 样本就位；真 claude run 受环境阻塞，详见 [`known-issues.md`](../known-issues.md)）
 
 ## 依赖关系（速览）
 
@@ -44,4 +44,4 @@ M00 ─┬─▶ M01 ─┬─▶ M03 ─▶ M10 ─▶ M11 ─▶ M12
 - [x] **里程碑 A（数据层通）**：M00–M06 完成，`bun test` 全绿（topo/pool/io/manifest/run-claude 共 134 用例 0 失败）。
 - [x] **里程碑 B（单 Stage 通）**：M07–M08 完成，mock 可调起 Surveyor/Architect/Critic/Reader/Writer/Assembler，AC-7 只读不变量成立。
 - [x] **里程碑 C（流水线通）**：M09–M11 完成，`runPipeline` mock 端到端跑通，AC-1/4/5/6/7 指标全绿（243 测试通过）。
-- [ ] **里程碑 D（验收通）**：M12 完成，AC-1..AC-7 全绿。
+- [~] **里程碑 D（验收通）**：M12 selfcheck+样本就位；真 claude run 受 headless 权限非确定性阻塞（AC-4/AC-7 已由单测+mock 验证通过，AC-1/2/3/5/6 待环境修复后复跑）。详见 [`known-issues.md`](../known-issues.md)。
