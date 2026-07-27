@@ -6,13 +6,13 @@
 
 ## 模块清单
 
-- [ ] **M00** · [`project-scaffolding`](./00-project-scaffolding.md) — 项目脚手架（package.json / tsconfig / 目录骨架 / 全局常量）
-- [ ] **M01** · [`lib-io`](./01-lib-io.md) — 路径约定、JSON 读写、取源原语
-- [ ] **M02** · [`lib-run-claude`](./02-lib-run-claude.md) — `claude -p` 子进程统一封装
-- [ ] **M03** · [`lib-manifest`](./03-lib-manifest.md) — manifest 状态机读写（CAS 纪律）
-- [ ] **M04** · [`lib-pool`](./04-lib-pool.md) — 有界并发池
-- [ ] **M05** · [`lib-topo`](./05-lib-topo.md) — 拓扑排序 + 环检测 + 闭包校验
-- [ ] **M06** · [`test-topo`](./06-test-topo.md) — topo 单元测试
+- [x] **M00** · [`project-scaffolding`](./00-project-scaffolding.md) — 项目脚手架（package.json / tsconfig / 目录骨架 / 全局常量）
+- [x] **M01** · [`lib-io`](./01-lib-io.md) — 路径约定、JSON 读写、取源原语
+- [x] **M02** · [`lib-run-claude`](./02-lib-run-claude.md) — `claude -p` 子进程统一封装
+- [x] **M03** · [`lib-manifest`](./03-lib-manifest.md) — manifest 状态机读写（CAS 纪律）
+- [x] **M04** · [`lib-pool`](./04-lib-pool.md) — 有界并发池
+- [x] **M05** · [`lib-topo`](./05-lib-topo.md) — 拓扑排序 + 环检测 + 闘包校验
+- [x] **M06** · [`test-topo`](./06-test-topo.md) — topo 单元测试
 - [ ] **M07** · [`prompts`](./07-prompts.md) — 6 类角色 prompt 模板
 - [ ] **M08** · [`agents`](./08-agents.md) — 6 类 Agent 封装（拼 prompt + 调 run-claude）
 - [ ] **M09** · [`stages`](./09-stages.md) — 7 个 Stage
@@ -41,7 +41,7 @@ M00 ─┬─▶ M01 ─┬─▶ M03 ─▶ M10 ─▶ M11 ─▶ M12
 
 ## 总体里程碑
 
-- [ ] **里程碑 A（数据层通）**：M00–M06 完成，`bun test test/topo.test.ts` 绿。
+- [x] **里程碑 A（数据层通）**：M00–M06 完成，`bun test` 全绿（topo/pool/io/manifest/run-claude 共 134 用例 0 失败）。
 - [ ] **里程碑 B（单 Stage 通）**：M07–M08 完成，能用代码单独调起 Surveyor/Architect。
 - [ ] **里程碑 C（流水线通）**：M09–M11 完成，`atlas run` 可端到端跑完一个仓库。
 - [ ] **里程碑 D（验收通）**：M12 完成，AC-1..AC-7 全绿。
