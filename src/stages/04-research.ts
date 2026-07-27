@@ -66,7 +66,19 @@ export async function research(ctx: StageContext): Promise<StageResult> {
       ? outline.topoOrder
       : outline.chapters.map((c) => c.slug);
   const knownSlugs = new Set(outline.chapters.map((c) => c.slug));
-  const slugs = order.filter((s) => knownSlugs.has(s));
+  // 续跑（AC-3）：跳过 manifest 里 research 已 done 的章节，避免重复 Reader 调用（省钱 + 幂等）。
+  // failed / pending 的章节仍会重跑（failed 章给重试机会，符合 design §15 的 --force 重跑语义）。
+  const slugs = order.filter((s) => {
+    if (!knownSlugs.has(s)) return false;
+    return manifest.chapters[s]?.research?.status !== "done";
+  });
+
+  // 若全部章已 done（resume 场景），直接置 stage done 返回，不调任何 reader。
+  if (slugs.length === 0) {
+    m = setStageStatus(m, "research", "done");
+    await saveManifest(key, m);
+    return m;
+  }
 
   // 并发跑 reader（mapPool：单点失败隔离，结果按原序回填）。
   const results = await mapPool(

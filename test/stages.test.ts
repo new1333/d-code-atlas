@@ -49,10 +49,12 @@ import {
   setStageStatus,
   registerChapters,
   setChapterStatus,
+  setChapterReview,
   setNow,
   resetNow,
   type Manifest,
   type SourceInfo,
+  type ReviewSummary,
 } from "../src/lib/manifest.ts";
 import { topoSort } from "../src/lib/topo.ts";
 import type { SpawnFn } from "../src/lib/run-claude.ts";
@@ -571,6 +573,52 @@ describe("04-research · 并发 + 单点隔离", () => {
     expect(next.stages.research.status).toBe("failed");
     expect(next.stages.research.cmd).toContain("读 outline 失败");
   });
+
+  test("续跑（AC-3）：manifest 里 research 已 done 的章节被跳过，不重复调 Reader", async () => {
+    const key = "res-resume-skip";
+    let m = await prepManifestThroughOutline(key);
+    // 预置 beta 章已 done（带一个标识性 cmd，便于断言未被覆盖）。
+    m = setChapterStatus(m, "beta", "research", "done", { cmd: "PRE_EXISTING_BETA_CMD" });
+    await writeJson(manifestPath(key), m);
+
+    // mock spawn：对任意次调用都按 slug 返回合法 markdown fence。
+    const calls: SpawnCall[] = [];
+    const spawn: SpawnFn = async (args, opts) => {
+      const call: SpawnCall = { args: [...args], cwd: opts.cwd };
+      calls.push(call);
+      const slugMatch = args[1].match(/本章 slug: ([a-z]+)/);
+      const slug = slugMatch ? slugMatch[1] : "";
+      return { exitCode: 0, stdout: mdFence(`# ${slug} ok`), stderr: "" };
+    };
+
+    const next = await research(ctxFor(key, m, spawn));
+    expect(next.stages.research.status).toBe("done");
+    // beta 仍 done，且 cmd 未被覆盖（没重跑）。
+    expect(next.chapters.beta.research.status).toBe("done");
+    expect(next.chapters.beta.research.cmd).toBe("PRE_EXISTING_BETA_CMD");
+    // alpha/gamma 被处理为 done。
+    expect(next.chapters.alpha.research.status).toBe("done");
+    expect(next.chapters.gamma.research.status).toBe("done");
+    // 调用次数：只跑了 alpha+gamma（beta 被跳过）。
+    const calledSlugs = calls.map((c) => c.args[1].match(/本章 slug: ([a-z]+)/)?.[1]).filter(Boolean);
+    expect(calledSlugs).not.toContain("beta");
+    expect(calledSlugs.sort()).toEqual(["alpha", "gamma"].sort());
+  });
+
+  test("续跑：全部章已 done → stage 直接 done，不调任何 Reader", async () => {
+    const key = "res-all-done";
+    let m = await prepManifestThroughOutline(key);
+    // 三章全部 research done。
+    for (const slug of ["alpha", "beta", "gamma"]) {
+      m = setChapterStatus(m, slug, "research", "done", { cmd: `cmd-${slug}` });
+    }
+    await writeJson(manifestPath(key), m);
+
+    const calls: SpawnCall[] = [];
+    const next = await research(ctxFor(key, m, makeSeqSpawn(calls, [])));
+    expect(next.stages.research.status).toBe("done");
+    expect(calls.length).toBe(0); // 没有任何 reader 调用
+  });
 });
 
 // ===========================================================================
@@ -692,6 +740,43 @@ describe("05-write · 并发 + 每章对抗评审", () => {
     expect(next.chapters.alpha.write.cmd).toContain("research.md 缺失");
     // 不调 claude。
     expect(calls.length).toBe(0);
+  });
+
+  test("续跑（AC-3）：manifest 里 write 已 done 的章节被跳过，保留既有 review trace", async () => {
+    const key = "wr-resume-skip";
+    let m = await prepManifestThroughOutline(key);
+    // 三章都有 research.md（让 write 子流程能进）。
+    for (const slug of ["alpha", "beta", "gamma"]) {
+      await writeText(researchPath(key, slug), `# ${slug} 研究`);
+    }
+    // 预置 beta write 已 done + 一条既有 review trace（标识性 cmd）。
+    const betaReview: ReviewSummary = {
+      rounds: 1,
+      final: "approved",
+      trace: [{ round: 1, verdict: "approve", cmd: "PRE_EXISTING_BETA_WRITE_CMD" }],
+    };
+    m = setChapterReview(m, "beta", betaReview);
+    m = setChapterStatus(m, "beta", "write", "done", { cmd: "PRE_EXISTING_BETA_WRITE_CMD" });
+    await writeJson(manifestPath(key), m);
+
+    // mock：alpha/gamma 走 approve，1 轮短路。
+    const calls: SpawnCall[] = [];
+    const spawn = makeWriterCriticSpawn(key, ["approve"], calls);
+    const next = await write(ctxFor(key, m, spawn));
+
+    expect(next.stages.write.status).toBe("done");
+    // beta 仍 done + review trace 未被覆盖。
+    expect(next.chapters.beta.write.status).toBe("done");
+    expect(next.chapters.beta.write.cmd).toBe("PRE_EXISTING_BETA_WRITE_CMD");
+    expect(next.chapters.beta.write.review).toEqual(betaReview);
+    // alpha/gamma 被处理为 done。
+    expect(next.chapters.alpha.write.status).toBe("done");
+    expect(next.chapters.gamma.write.status).toBe("done");
+    // 调用里不应出现 beta 的 writer（beta 被跳过）。
+    const betaWriterCalls = calls.filter((c) =>
+      c.args[1].includes("Writer") && c.args[1].includes("本章 slug: beta"),
+    );
+    expect(betaWriterCalls.length).toBe(0);
   });
 });
 

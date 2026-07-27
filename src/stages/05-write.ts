@@ -183,7 +183,19 @@ export async function write(ctx: StageContext): Promise<StageResult> {
       ? outline.topoOrder
       : outline.chapters.map((c) => c.slug);
   const knownSlugs = new Set(outline.chapters.map((c) => c.slug));
-  const slugs = order.filter((s) => knownSlugs.has(s));
+  // 续跑（AC-3）：跳过 manifest 里 write 已 done 的章节，避免重复 Writer⇄Critic 调用 + 保留既有 review trace。
+  // failed / pending 的章节仍会重跑。
+  const slugs = order.filter((s) => {
+    if (!knownSlugs.has(s)) return false;
+    return manifest.chapters[s]?.write?.status !== "done";
+  });
+
+  // 若全部章已 done（resume 场景），直接置 stage done 返回，不调任何 writer/critic。
+  if (slugs.length === 0) {
+    m = setStageStatus(m, "write", "done");
+    await saveManifest(key, m);
+    return m;
+  }
 
   // 并发跑每章 write 子流程（mapPool：单点失败隔离）。
   const results = await mapPool(
