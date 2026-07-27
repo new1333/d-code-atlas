@@ -16,7 +16,7 @@ import { runClaude } from "../lib/run-claude.ts";
 import { runDir } from "../lib/io.ts";
 import { extractJson } from "../lib/extract.ts";
 import type { RepoMap } from "../lib/types.ts";
-import { promptPath, type AgentOutcome, type AgentCommonOpts } from "./types.ts";
+import { promptPath, agentAddDirs, type AgentOutcome, type AgentCommonOpts } from "./types.ts";
 
 /**
  * Surveyor 入参的取源方式（语义层，区别于 manifest 的 `SourceKind`）：
@@ -99,6 +99,9 @@ export async function surveyor(opts: SurveyorOpts): Promise<SurveyorOutcome> {
     tools: "readonly",
     model,
     spawn,
+    // 本地源在 cwd 之外，必须 --add-dir 声明，否则 claude Read/Glob/Grep 被拦截。
+    // 同时声明 prompts 目录（角色 prompt 文件在 cwd 外，claude 可能 Read 它）。
+    addDirs: agentAddDirs(!isGit ? sourcePath : undefined),
   });
 
   // 从 stdout 提取 RepoMap（fence 优先，fallback 兜底；失败 null）。

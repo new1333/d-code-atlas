@@ -15,7 +15,7 @@
 import { runClaude } from "../lib/run-claude.ts";
 import { runDir } from "../lib/io.ts";
 import { extractFence } from "../lib/extract.ts";
-import { promptPath, type AgentOutcome, type AgentCommonOpts } from "./types.ts";
+import { promptPath, agentAddDirs, type AgentOutcome, type AgentCommonOpts } from "./types.ts";
 
 /** Reader 入参。 */
 export interface ReaderOpts extends AgentCommonOpts {
@@ -41,7 +41,7 @@ export interface ReaderOutcome extends AgentOutcome {
  * 不落盘（Stage 负责）。返回 cmd 供 manifest 记录 + AC-7 核验。
  */
 export async function reader(opts: ReaderOpts): Promise<ReaderOutcome> {
-  const { key, slug, model, spawn } = opts;
+  const { key, slug, model, spawn, sourcePath } = opts;
 
   const cwd = runDir(key);
   const systemPromptPath = promptPath("reader");
@@ -81,6 +81,8 @@ export async function reader(opts: ReaderOpts): Promise<ReaderOutcome> {
     tools: "readonly",
     model,
     spawn,
+    // 本地源在 cwd 之外，必须 --add-dir 声明（否则 claude 读取源码被拦截）。
+    addDirs: agentAddDirs(sourcePath),
   });
 
   // 从 stdout 提取 ```markdown fence 内文本（注意：Reader 不用 JSON，用 markdown fence）。

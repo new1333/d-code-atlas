@@ -68,7 +68,14 @@ export interface ClaudeRunOptions {
   tools: ToolMode;
   /** 透传给 claude 的 model 别名/全名（如 "sonnet"）。可选。 */
   model?: string;
-  /** 超时毫秒，默认 5 分钟。超时 → exitCode=124、ok=false、不抛。 */
+  /**
+   * 额外可访问目录（透传 claude `--add-dir`）。
+   * cwd 之外的目录（如本地源码 absPath）必须在此声明，否则 claude 工具会被
+   * "may only access files in the allowed working directories" 拦截（实测阻塞 survey）。
+   * 对 URL 克隆源（已在 cwd 下 work/source/）无需传。
+   */
+  addDirs?: string[];
+  /** 超时毫秒，默认 15 分钟。超时 → exitCode=124、ok=false、不抛。 */
   timeoutMs?: number;
   /** 额外/覆盖环境变量。可选。 */
   env?: Record<string, string>;
@@ -119,10 +126,25 @@ export function buildCmd(opts: ClaudeRunOptions): { cmd: string; args: string[] 
 
   // 真实传给 spawn 的参数数组（不经 shell，无需转义）。
   // flag 名与值分作两个 arg（符合 commander 解析惯例：值是独立参数）。
-  const args: string[] = ["-p", opts.prompt, "--allowedTools", toolsValue];
+  // - `--dangerously-skip-permissions`：headless 子进程下，claude 默认对 cwd 外的读取
+  //   会因「工作目录白名单」策略拦截（即便 --add-dir 声明了）。本引擎的只读不变量由
+  //   `--allowedTools` 强制（无 Write/Edit 工具，物理不可写），故跳过 claude 的交互式
+  //   权限提示是安全的——真正的安全边界是工具白名单，不是权限弹窗（ADR-0005）。
+  const args: string[] = [
+    "-p",
+    opts.prompt,
+    "--allowedTools",
+    toolsValue,
+    "--dangerously-skip-permissions",
+  ];
 
   if (opts.model && opts.model.trim() !== "") {
     args.push("--model", opts.model);
+  }
+  if (opts.addDirs && opts.addDirs.length > 0) {
+    // 透传 claude --add-dir：声明 cwd 之外的可访问目录（本地源码路径）。
+    // claude 的 --add-dir 接受多个值，故 flag 后把每个目录作为一个 arg。
+    args.push("--add-dir", ...opts.addDirs.filter((d) => d && d.trim() !== ""));
   }
   if (opts.systemPromptPath && opts.systemPromptPath.trim() !== "") {
     // 角色作系统级指令：读文件追加到默认 system prompt 后。

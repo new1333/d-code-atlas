@@ -45,6 +45,30 @@ export function promptPath(role: PromptRole): string {
   return resolve(projectRoot, "src", "prompts", `${role}.md`);
 }
 
+/**
+ * prompts 目录绝对路径（`src/prompts/`）。
+ * agent cwd 在 `atlas/{key}/`，prompt 文件在项目根的 `src/prompts/`——cwd 之外。
+ * claude 即便用 `--append-system-prompt-file` 加载了角色 prompt，user prompt 里仍会
+ * 引用该文件路径，claude 若用 Read 工具去读它会被 sandbox 拦截，故需 --add-dir 声明。
+ */
+export function promptsDir(): string {
+  const here = dirname(fileURLToPath(import.meta.url)); // .../src/agents
+  const projectRoot = resolve(here, "../..");
+  return resolve(projectRoot, "src", "prompts");
+}
+
+/**
+ * 计算 agent 需要透传给 claude `--add-dir` 的额外目录列表。
+ * - 本地源 sourcePath：cwd 之外的源码目录（git 克隆源在 work/source/ 下，无需）。
+ * - prompts 目录：角色 prompt 文件所在（claude 可能用 Read 读取其引用）。
+ * 去重 + 过滤空值。
+ */
+export function agentAddDirs(sourcePath?: string): string[] {
+  const dirs = [promptsDir()];
+  if (sourcePath && sourcePath.trim() !== "") dirs.push(sourcePath);
+  return [...new Set(dirs)];
+}
+
 // ---------------------------------------------------------------------------
 // AgentOutcome：所有 agent 的统一返回基类
 // ---------------------------------------------------------------------------
@@ -77,6 +101,13 @@ export interface AgentOutcome {
 export interface AgentCommonOpts {
   /** 透传给 claude 的 model 别名/全名（如 "sonnet"）。可选。 */
   model?: string;
+  /**
+   * 本地源绝对路径（仅 source.kind=local 时有意义）。
+   * 只读 agent 会把它透传给 claude `--add-dir`，否则 cwd 之外的源目录会被
+   * "may only access files in the allowed working directories" 拦截。
+   * git 克隆源在 cwd 下 work/source/，无需传。
+   */
+  sourcePath?: string;
   /**
    * spawn 注入点（透传给 runClaude）。
    * 单测注入假 spawn 返回预设 {exitCode,stdout,stderr}，不真调 claude。

@@ -78,10 +78,11 @@ describe("buildCmd · 只读模式", () => {
       cwd: ".",
       tools: "readonly",
     });
-    // args: flag 名与值分开
-    expect(args).toEqual(["-p", "hi", "--allowedTools", "Read,Glob,Grep"]);
-    // cmd 形态：claude -p "hi" --allowedTools Read,Glob,Grep
+    // args: flag 名与值分开。--dangerously-skip-permissions 为 headless 必需（见 buildCmd 注释）。
+    expect(args).toEqual(["-p", "hi", "--allowedTools", "Read,Glob,Grep", "--dangerously-skip-permissions"]);
+    // cmd 形态：claude -p "hi" --allowedTools Read,Glob,Grep --dangerously-skip-permissions
     expect(cmd.startsWith("claude -p \"hi\" --allowedTools Read,Glob,Grep")).toBe(true);
+    expect(cmd.includes("--dangerously-skip-permissions")).toBe(true);
   });
 });
 

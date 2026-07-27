@@ -41,6 +41,8 @@ import type { StageContext, StageResult } from "./types.ts";
 export async function research(ctx: StageContext): Promise<StageResult> {
   const { key, manifest, spawn, model } = ctx;
   const concurrency = ctx.concurrency ?? DEFAULT_CONCURRENCY;
+  // 本地源绝对路径：透传给 reader 作 --add-dir（cwd 之外的源目录需声明才可读）。
+  const sourcePath = manifest.source.kind === "local" ? (manifest.source.localPath ?? manifest.source.ref) : undefined;
 
   // 读 outline（含 chapters + topoOrder）。
   // 若 outline.json 缺失/解析失败：这是上游异常（outline stage 应已 done），置 failed。
@@ -83,7 +85,7 @@ export async function research(ctx: StageContext): Promise<StageResult> {
   // 并发跑 reader（mapPool：单点失败隔离，结果按原序回填）。
   const results = await mapPool(
     slugs,
-    async (slug) => reader({ key, slug, model, spawn }),
+    async (slug) => reader({ key, slug, model, spawn, sourcePath }),
     concurrency,
   );
 

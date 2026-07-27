@@ -15,7 +15,7 @@
 import { runClaude } from "../lib/run-claude.ts";
 import { runDir } from "../lib/io.ts";
 import { extractCriticVerdict, type CriticVerdict } from "../lib/extract.ts";
-import { promptPath, type AgentOutcome, type AgentCommonOpts } from "./types.ts";
+import { promptPath, agentAddDirs, type AgentOutcome, type AgentCommonOpts } from "./types.ts";
 
 /** Critic 评审模式：outline（大纲）/ chapter（单章草稿）。 */
 export type CriticMode = "outline" | "chapter";
@@ -56,7 +56,7 @@ interface CriticVerdictPartial {
  *   outline（取 dependsOn），按 4 条标准评审。
  */
 export async function critic(opts: CriticOpts): Promise<CriticOutcome> {
-  const { key, mode, slug, model, spawn } = opts;
+  const { key, mode, slug, model, spawn, sourcePath } = opts;
 
   if (mode === "chapter" && !slug) {
     // chapter 模式缺 slug：直接返回失败（不调 claude，省一次调用）。
@@ -88,6 +88,8 @@ export async function critic(opts: CriticOpts): Promise<CriticOutcome> {
     tools: "readonly",
     model,
     spawn,
+    // 本地源在 cwd 之外，必须 --add-dir 声明（critic 需读源码做准确性抽查）。
+    addDirs: agentAddDirs(sourcePath),
   });
 
   // 从 stdout 提取并校验 {verdict, fixes}。

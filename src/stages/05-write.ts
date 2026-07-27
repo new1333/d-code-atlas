@@ -70,6 +70,7 @@ async function writeChapter(
   spawn: StageContext["spawn"],
   model: string | undefined,
   maxRounds: number,
+  sourcePath?: string,
 ): Promise<ChapterWriteResult> {
   // 1) 确认 research.md 存在（缺料 → write failed）。
   const hasResearch = await pathExists(researchPath(key, slug));
@@ -103,7 +104,7 @@ async function writeChapter(
       break;
     }
 
-    const critOutcome = await critic({ key, mode: "chapter", slug, spawn });
+    const critOutcome = await critic({ key, mode: "chapter", slug, spawn, sourcePath });
 
     if (!critOutcome.ok || critOutcome.verdict === null) {
       // Critic 自身失败（解析失败等）= 工具异常 → 本章 failed（同 outline stage 取舍）。
@@ -161,6 +162,8 @@ export async function write(ctx: StageContext): Promise<StageResult> {
   const { key, manifest, spawn, model } = ctx;
   const concurrency = ctx.concurrency ?? DEFAULT_CONCURRENCY;
   const maxRounds = ctx.reviewRounds ?? REVIEW_ROUNDS;
+  // 本地源绝对路径：透传给 chapter critic 作 --add-dir（critic 需读源码做准确性抽查）。
+  const sourcePath = manifest.source.kind === "local" ? (manifest.source.localPath ?? manifest.source.ref) : undefined;
 
   // 读 outline。
   let outline: Outline;
@@ -200,7 +203,7 @@ export async function write(ctx: StageContext): Promise<StageResult> {
   // 并发跑每章 write 子流程（mapPool：单点失败隔离）。
   const results = await mapPool(
     slugs,
-    async (slug) => writeChapter(key, slug, spawn, model, maxRounds),
+    async (slug) => writeChapter(key, slug, spawn, model, maxRounds, sourcePath),
     concurrency,
   );
 

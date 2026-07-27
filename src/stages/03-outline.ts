@@ -54,6 +54,8 @@ import type { StageContext, StageResult } from "./types.ts";
 export async function outline(ctx: StageContext): Promise<StageResult> {
   const { key, manifest, spawn, model } = ctx;
   const maxRounds = ctx.reviewRounds ?? REVIEW_ROUNDS;
+  // 本地源绝对路径：透传给只读 agent 作 --add-dir（cwd 之外的源目录需声明才可读）。
+  const sourcePath = manifest.source.kind === "local" ? (manifest.source.localPath ?? manifest.source.ref) : undefined;
 
   // 标记 running + save（开始标记）。
   let m = setStageStatus(manifest, "outline", "running");
@@ -71,7 +73,7 @@ export async function outline(ctx: StageContext): Promise<StageResult> {
     // 把上一轮 critic 的 fixes 透传给 architect 作 feedback（首轮无 feedback）。
     // 这是 M08 architect 的可选新增参数（非破坏性扩展），让 Producer 据反馈修订。
     const prevFixes = round === 1 ? undefined : trace[trace.length - 1]?.fixes;
-    const archOutcome = await architect({ key, model, spawn, feedback: prevFixes });
+    const archOutcome = await architect({ key, model, spawn, feedback: prevFixes, sourcePath });
 
     if (!archOutcome.ok || archOutcome.chapters === null) {
       // Architect 失败（claude 非零退出 / chapters 解析失败）→ 直接 failed，不走 critic。
@@ -115,7 +117,7 @@ export async function outline(ctx: StageContext): Promise<StageResult> {
     await writeJson(outlinePath(key), draftOutline);
 
     // ---- 4) Critic 评审 ----
-    const critOutcome = await critic({ key, mode: "outline", spawn });
+    const critOutcome = await critic({ key, mode: "outline", spawn, sourcePath });
 
     if (!critOutcome.ok || critOutcome.verdict === null) {
       // Critic 失败（解析失败等）→ 当本轮 reject 处理？还是直接 failed？

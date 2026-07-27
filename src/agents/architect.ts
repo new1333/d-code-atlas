@@ -16,7 +16,7 @@ import { runClaude } from "../lib/run-claude.ts";
 import { runDir } from "../lib/io.ts";
 import { extractJson } from "../lib/extract.ts";
 import type { ArchitectOutput, Chapter } from "../lib/types.ts";
-import { promptPath, type AgentOutcome, type AgentCommonOpts } from "./types.ts";
+import { promptPath, agentAddDirs, type AgentOutcome, type AgentCommonOpts } from "./types.ts";
 
 /** Architect 入参。 */
 export interface ArchitectOpts extends AgentCommonOpts {
@@ -48,7 +48,7 @@ export interface ArchitectOutcome extends AgentOutcome {
  * 不落盘、不注入 topoOrder（Stage 负责）。返回 cmd 供 manifest 记录 + AC-7 核验。
  */
 export async function architect(opts: ArchitectOpts): Promise<ArchitectOutcome> {
-  const { key, model, spawn, feedback } = opts;
+  const { key, model, spawn, feedback, sourcePath } = opts;
 
   const cwd = runDir(key);
   const systemPromptPath = promptPath("architect");
@@ -103,6 +103,8 @@ export async function architect(opts: ArchitectOpts): Promise<ArchitectOutcome> 
     tools: "readonly",
     model,
     spawn,
+    // 本地源在 cwd 之外，必须 --add-dir 声明（否则 claude 读取源码被拦截）。
+    addDirs: agentAddDirs(sourcePath),
   });
 
   // 从 stdout 提取 {chapters:[...]}。
