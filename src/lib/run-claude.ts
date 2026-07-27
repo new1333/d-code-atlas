@@ -77,6 +77,11 @@ export interface ClaudeRunOptions {
   addDirs?: string[];
   /** 超时毫秒，默认 15 分钟。超时 → exitCode=124、ok=false、不抛。 */
   timeoutMs?: number;
+  /**
+   * 失败重试次数，默认 1。应对 claude headless 非确定性「声称被拦截」/瞬时非 0 退出。
+   * exitCode!=0 或 stdout 疑似「声称被拦截」时重试；产物正常则不重试。
+   */
+  retries?: number;
   /** 额外/覆盖环境变量。可选。 */
   env?: Record<string, string>;
   /**
@@ -252,12 +257,22 @@ export async function runClaude(opts: ClaudeRunOptions): Promise<ClaudeResult> {
   const { cmd, args } = buildCmd(opts);
   const spawn = opts.spawn ?? defaultSpawn;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const retries = opts.retries ?? 1; // 默认重试 1 次（应对 claude headless 非确定性「声称被拦截」）
 
-  const { exitCode, stdout, stderr } = await spawn(args, {
-    cwd: opts.cwd,
-    env: opts.env,
-    timeoutMs,
-  });
+  let last: { exitCode: number; stdout: string; stderr: string } | null = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const r = await spawn(args, { cwd: opts.cwd, env: opts.env, timeoutMs });
+    last = r;
+    // claude 正常退出（exitCode=0）但产出「声称被拦截」的文本时，重试一次。
+    // 这是 claude CLI headless 模式对 cwd 外读取的非确定性行为（实测同命令有时成功有时声称被拦）。
+    if (r.exitCode === 0 && !looksBlocked(r.stdout) && attempt < retries) break;
+    if (r.exitCode !== 0 && attempt < retries) {
+      // 非 0 退出也重试一次（瞬时失败）。
+      continue;
+    }
+    break;
+  }
+  const { exitCode, stdout, stderr } = last!;
 
   return {
     ok: exitCode === 0,
@@ -266,4 +281,15 @@ export async function runClaude(opts: ClaudeRunOptions): Promise<ClaudeResult> {
     stderr,
     cmd,
   };
+}
+
+/**
+ * 启发式判断 claude 的 stdout 是否是「声称被拦截/无法访问」的失败输出。
+ * claude headless 模式下，有时即便 --add-dir/--dangerously-skip-permissions 已授予，
+ * 仍会输出「我无法访问/被沙箱拦截」之类文本而不产出真实产物。识别后由 runClaude 重试。
+ */
+function looksBlocked(stdout: string): boolean {
+  // 只在 stdout 较短（非真实产物）且含典型阻塞措辞时判定。
+  const blockers = ["无法访问", "被拦截", "被阻塞", "权限未授予", "未授权", "may only access files", "blocked", "无法继续"];
+  return blockers.some((kw) => stdout.includes(kw));
 }
