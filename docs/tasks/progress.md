@@ -13,8 +13,8 @@
 - [x] **M04** · [`lib-pool`](./04-lib-pool.md) — 有界并发池
 - [x] **M05** · [`lib-topo`](./05-lib-topo.md) — 拓扑排序 + 环检测 + 闘包校验
 - [x] **M06** · [`test-topo`](./06-test-topo.md) — topo 单元测试
-- [ ] **M07** · [`prompts`](./07-prompts.md) — 6 类角色 prompt 模板
-- [ ] **M08** · [`agents`](./08-agents.md) — 6 类 Agent 封装（拼 prompt + 调 run-claude）
+- [x] **M07** · [`prompts`](./07-prompts.md) — 6 类角色 prompt 模板
+- [x] **M08** · [`agents`](./08-agents.md) — 6 类 Agent 封装（拼 prompt + 调 run-claude）
 - [ ] **M09** · [`stages`](./09-stages.md) — 7 个 Stage
 - [ ] **M10** · [`orchestrator`](./10-orchestrator.md) — 顶层循环 + 续跑
 - [ ] **M11** · [`cli`](./11-cli.md) — `src/bin/atlas.ts` 命令行
@@ -42,6 +42,6 @@ M00 ─┬─▶ M01 ─┬─▶ M03 ─▶ M10 ─▶ M11 ─▶ M12
 ## 总体里程碑
 
 - [x] **里程碑 A（数据层通）**：M00–M06 完成，`bun test` 全绿（topo/pool/io/manifest/run-claude 共 134 用例 0 失败）。
-- [ ] **里程碑 B（单 Stage 通）**：M07–M08 完成，能用代码单独调起 Surveyor/Architect。
+- [x] **里程碑 B（单 Stage 通）**：M07–M08 完成，mock 可调起 Surveyor/Architect/Critic/Reader/Writer/Assembler，AC-7 只读不变量成立。
 - [ ] **里程碑 C（流水线通）**：M09–M11 完成，`atlas run` 可端到端跑完一个仓库。
 - [ ] **里程碑 D（验收通）**：M12 完成，AC-1..AC-7 全绿。
