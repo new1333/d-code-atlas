@@ -1,0 +1,17 @@
+# dependencies
+node_modules/
+
+# atlas run workspaces — keep manifest.json & artifacts, ignore heavy/generated bits
+atlas/*/work/source/
+atlas/*/site/node_modules/
+atlas/*/site/.vitepress/dist/
+atlas/*/site/.vitepress/cache/
+
+# logs
+*.log
+
+# os / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
