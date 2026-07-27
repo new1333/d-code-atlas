@@ -27,8 +27,11 @@ import { READONLY_TOOLS, WRITE_TOOLS, CLAUDE_BIN } from "./config.ts";
 // - 工作目录：claude CLI 无 `--cwd` flag → 靠 spawn 的 cwd 参数透传
 // ---------------------------------------------------------------------------
 
-/** 默认超时：5 分钟（claude 一次 agent 调用的合理上限）。 */
-const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
+/** 默认超时：15 分钟（claude 一次 agent 调用的合理上限）。
+ *  曾为 5 分钟，但实测 Surveyor 对小仓库的结构测绘也可能耗时 7~8 分钟
+ *  （读多文件 + 推理 + 生成 JSON），5 分钟会在产物产出前被 kill（exitCode=124 → stage failed）。
+ *  15 分钟兼顾「成本有界」与「深度分析能跑完」。flag `--timeout` 可覆盖。 */
+const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 
 /** 超时约定的退出码：与 GNU `timeout` 一致（124）。 */
 const TIMEOUT_EXIT_CODE = 124;
