@@ -20,6 +20,12 @@ claude 子进程（exitCode=0，正常退出）输出的不是 repo-map JSON，�
 ### 根因判断
 Claude Code CLI 在 **headless（`-p`）模式**下，面对「读 cwd 外目录 + 产出结构化分析」的复杂任务时，会**非确定性地**声称缺乏目录访问权限（"may only access files in the allowed working directories"），即便 `--add-dir` + `--dangerously-skip-permissions` 已正确授予。这是 **claude CLI 的环境/LLM 行为问题**，不是引擎缺陷——引擎已把所有该传的权限 flag 都传了，且最小复现证明 flag 本身有效。
 
+### 进一步诊断（深挖后更新）
+- **各 agent 单独直跑都能成功**：surveyor（URL 源）、architect、critic 分别用真实 claude 直跑，均产出正确产物（surveyor 出 repo-map、architect 出 13 章 outline、critic 出 verdict+fixes）。失败集中在**流水线串行重复调用**时的偶发阻塞。
+- **URL 克隆源比本地源更稳**：URL 克隆后源在 cwd 的 `work/source/` 下（cwd 内），surveyor 不再因「源在 cwd 外」被拦。本地源（absPath 在 cwd 外）触发率更高。**建议真实 run 优先用 URL 源**。
+- **surveyor 偶发自创 schema**：即便 user prompt 内联了完整 schema，claude 有时仍产出字段名不符的 JSON（如 `repo/structure/files` 而非 `root/languages/tree`）。这是因为 claude 声称读不到 surveyor.md（在 cwd 外），改用「通用约定」。已加 schema 内联缓解，但非确定性，未完全消除。
+- **加了 1 次自动重试**（`runClaude` retries=1 + `looksBlocked` 启发式）：exitCode!=0 或 stdout 命中「无法访问/被拦截」措辞时重试一次。降低了失败率但不足以让完整流水线稳定跑完（多 agent 串行，累积失败概率仍高）。
+
 ### 已尝试的修复（均未稳定解决）
 - ✅ `DEFAULT_TIMEOUT_MS` 5min→15min（修了一个真问题：survey 耗时 7~8 分钟会被 5min 超时 kill；但这不是本次阻塞的根因）。
 - ✅ `--add-dir <源码目录>` + `--add-dir <prompts 目录>`（命令层正确声明 cwd 外可访问目录）。
@@ -44,7 +50,7 @@ Claude Code CLI 在 **headless（`-p`）模式**下，面对「读 cwd 外目录
 | 验收项 | 状态 | 验证方式 |
 |--------|------|----------|
 | AC-4（自底向上：topoOrder 无环/闭包/文件名编号） | ✅ | `bun test test/topo.test.ts`（38 用例）+ mock 端到端 runPipeline 探针（topoOrder=`[signal,effect,app]`、verifyClosure ok） |
-| AC-7（只读：分析类 agent cmd 含 `--allowedTools Read,Glob,Grep` 且无 Write/Edit） | ✅ | `bun test test/run-claude.test.ts` + `test/agents.test.ts` 的逃逸口防御 + mock runPipeline 探针（survey + 3×research cmd 全 PASS） |
+| AC-7（只读：分析类 agent cmd 含 `--allowedTools Read,Glob,Grep` 且无 Write/Edit） | ✅ | `bun test test/run-claude.test.ts` + `test/agents.test.ts` 的逃逸口防御 + **真 run 的 selfcheck.sh 实测**（hello-world 部分跑：survey+outline 的 cmd 均含只读工具集、无 Write/Edit，PASS） |
 | AC-6（对抗评审 trace 结构） | ✅（算法层） | mock runPipeline 探针：outline + 每章 write review trace 齐全（approved, 1 round）；真 run 因 survey 阻塞未产出 |
 | 全量单测 | ✅ | `bun test` 243/243 绿，`bunx tsc --noEmit` exit 0 |
 | 引擎架构完整性（M00-M11） | ✅ | 里程碑 A/B/C 全通；mock 端到端 runPipeline 跑通并打印 `[atlas] run {key} complete.` |
