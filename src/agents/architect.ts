@@ -22,6 +22,14 @@ import { promptPath, type AgentOutcome, type AgentCommonOpts } from "./types.ts"
 export interface ArchitectOpts extends AgentCommonOpts {
   /** Run key（决定 runDir）。 */
   key: string;
+  /**
+   * 对抗评审反馈（可选，M09 outline stage 透传）。
+   * 上一轮 Critic reject 时给出的 fixes 列表；Architect 据此修订大纲。
+   * 首轮调用不提供（undefined）。
+   *
+   * 这是 M08 的非破坏性扩展（新增可选参数，不改既有签名），由 M09 stage 透传。
+   */
+  feedback?: string[];
 }
 
 /** Architect 返回：AgentOutcome + 解析出的 chapters（解析失败为 null）。 */
@@ -40,10 +48,21 @@ export interface ArchitectOutcome extends AgentOutcome {
  * 不落盘、不注入 topoOrder（Stage 负责）。返回 cmd 供 manifest 记录 + AC-7 核验。
  */
 export async function architect(opts: ArchitectOpts): Promise<ArchitectOutcome> {
-  const { key, model, spawn } = opts;
+  const { key, model, spawn, feedback } = opts;
 
   const cwd = runDir(key);
   const systemPromptPath = promptPath("architect");
+
+  // 若 stage 透传了 critic 上一轮的 fixes，拼到 prompt 末尾让 Architect 据反馈修订。
+  const feedbackBlock =
+    feedback && feedback.length > 0
+      ? [
+          "",
+          "## 上一轮 Critic 反馈（请据此修订大纲）",
+          "上一轮 Critic reject 了你的大纲，给出以下修改点。请逐条对照修订，产出新的 chapters：",
+          ...feedback.map((f, i) => `${i + 1}. ${f}`),
+        ].join("\n")
+      : "";
 
   const prompt = [
     "你是 Architect（大纲架构师）。请基于 repo-map 和源码，把这仓库拆成 8~20 章自底向上的概念大纲。",
@@ -75,7 +94,7 @@ export async function architect(opts: ArchitectOpts): Promise<ArchitectOutcome> 
     "}",
     "```",
     "**不要**写 topoOrder / repo / generatedAt（由 stage 注入）。fence 外不写任何正文。",
-  ].join("\n");
+  ].join("\n") + feedbackBlock;
 
   const result = await runClaude({
     prompt,

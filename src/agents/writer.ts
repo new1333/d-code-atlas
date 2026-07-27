@@ -26,6 +26,14 @@ export interface WriterOpts extends AgentCommonOpts {
   key: string;
   /** 本章 slug（写作对象）。 */
   slug: string;
+  /**
+   * 对抗评审反馈（可选，M09 write stage 透传）。
+   * 上一轮 Critic reject 时给出的 fixes 列表；Writer 据此修订 draft/replica。
+   * 首轮调用不提供（undefined）。
+   *
+   * 这是 M08 的非破坏性扩展（新增可选参数，不改既有签名），由 M09 stage 透传。
+   */
+  feedback?: string[];
 }
 
 /** Writer 返回：通用 AgentOutcome（产物在磁盘，无额外字段）。 */
@@ -39,10 +47,21 @@ export interface WriterOutcome extends AgentOutcome {}
  * 返回 cmd 供 manifest 记录。
  */
 export async function writer(opts: WriterOpts): Promise<WriterOutcome> {
-  const { key, slug, model, spawn } = opts;
+  const { key, slug, model, spawn, feedback } = opts;
 
   const cwd = workDir(key);
   const systemPromptPath = promptPath("writer");
+
+  // 若 stage 透传了 critic 上一轮的 fixes，拼到 prompt 末尾让 Writer 据反馈修订。
+  const feedbackBlock =
+    feedback && feedback.length > 0
+      ? [
+          "",
+          "## 上一轮 Critic 反馈（请据此修订 draft.md / replica）",
+          "上一轮 Critic reject 了你的章节草稿，给出以下修改点。请逐条对照修订 draft.md 与 replica/（保持复刻一致）：",
+          ...feedback.map((f, i) => `${i + 1}. ${f}`),
+        ].join("\n")
+      : "";
 
   const prompt = [
     "你是 Writer（章节撰写员）。请基于 Reader 的事实摘录和 outline 依赖结构，撰写一章中文文档。",
@@ -77,7 +96,7 @@ export async function writer(opts: WriterOpts): Promise<WriterOutcome> {
     "  ② 衔接：用到的前置概念确实在 dependsOn 章节已讲解。",
     "  ③ 可运行：内嵌复刻与 replica/ 逐字一致、replica 能独立 bun run。",
     "  ④ 清晰：有图示/步骤/输入输出，不是流水账。",
-  ].join("\n");
+  ].join("\n") + feedbackBlock;
 
   const result = await runClaude({
     prompt,
