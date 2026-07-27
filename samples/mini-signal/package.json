@@ -1,0 +1,10 @@
+{
+  "name": "mini-signal",
+  "version": "1.0.0",
+  "description": "最小响应式原语 demo —— Code Atlas 端到端冒烟样本",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "demo": "bun run src/index.ts"
+  }
+}
