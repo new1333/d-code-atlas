@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "@code-atlas/engine",
+      "name": "d-code-atlas",
       "devDependencies": {
         "@types/bun": "latest",
         "typescript": "^5",
