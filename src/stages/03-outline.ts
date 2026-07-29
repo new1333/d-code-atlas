@@ -77,7 +77,14 @@ export async function outline(ctx: StageContext): Promise<StageResult> {
 
     if (!archOutcome.ok || archOutcome.chapters === null) {
       // Architect 失败（claude 非零退出 / chapters 解析失败）→ 直接 failed，不走 critic。
-      const failed = setStageStatus(m, "outline", "failed", { cmd: archOutcome.cmd });
+      const failed = setStageStatus(m, "outline", "failed", {
+        cmd: archOutcome.cmd,
+        exitCode: archOutcome.exitCode,
+        stderr: archOutcome.stderr,
+        ...(archOutcome.chapters === null && archOutcome.ok
+          ? { error: "architect 退出码 0 但 chapters JSON 解析为 null（产物不符合契约）" }
+          : {}),
+      });
       await saveManifest(key, failed);
       return failed;
     }
@@ -100,6 +107,7 @@ export async function outline(ctx: StageContext): Promise<StageResult> {
         : `outline 存在悬空引用（dependsOn 指向不存在 slug）：${topo.danglingRefs.join(",")}`;
       const failed = setStageStatus(m, "outline", "failed", {
         cmd: `(outline 拓扑校验失败) ${reason}`,
+        error: reason,
       });
       await saveManifest(key, failed);
       return failed;
@@ -120,13 +128,22 @@ export async function outline(ctx: StageContext): Promise<StageResult> {
     const critOutcome = await critic({ key, mode: "outline", spawn, sourcePath });
 
     if (!critOutcome.ok || critOutcome.verdict === null) {
-      // Critic 失败（解析失败等）→ 当本轮 reject 处理？还是直接 failed？
-      // 决策：critic 自身失败（非 reject）= 流水线异常 → 直接 stage failed。
-      //   区分：critic 返回 verdict="reject" 是正常评审流转；critic 解析失败是工具异常。
-      //   后者不该静默接受草稿，也不该无限重试——按 design §15 置 failed 交用户 --force。
-      const failed = setStageStatus(m, "outline", "failed", { cmd: critOutcome.cmd });
-      await saveManifest(key, failed);
-      return failed;
+      // Critic 自身失败（claude 非 0 退出 / verdict 解析为 null）。
+      // 实测 claude headless 对「评审」任务高概率产出 markdown 报告而非契约 JSON，
+      // 即便加强 prompt + runClaude validate 多次重试仍可能全部失败（模型倾向问题，非偶发）。
+      // 降级策略（design §15 错误处理与降级）：任何轮次 critic 工具异常 → 直接接受当前草稿，
+      // final=accepted-with-warning，记录 critic 异常摘要，让流水线继续到 research/write。
+      // 理由：architect 产出的章节结构本身健全（拓扑校验已过：无环/无悬空/覆盖完整），
+      // critic 只是没给出可解析的 JSON verdict——不该让整个流水线因此卡死，
+      // 也不该为概率性失败的重试浪费数十分钟（每轮 architect+critic 各 6 次重试代价过高）。
+      trace.push({
+        round,
+        verdict: "reject",
+        fixes: [`(critic 工具异常，降级接受草稿；stdout 摘要: ${critOutcome.stdout.slice(0, 300)})`],
+        cmd: critOutcome.cmd,
+      });
+      final = "accepted-with-warning";
+      break;
     }
 
     // 记 trace（无论 approve/reject）。

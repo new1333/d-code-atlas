@@ -12,11 +12,11 @@
 
 ### 必装
 
-| 工具 | 版本 | 用途 |
-|------|------|------|
-| [Bun](https://bun.sh) | ≥ 1.3 | 引擎运行时 + 测试 + 站点构建 |
+| 工具                                                           | 版本       | 用途                                    |
+| -------------------------------------------------------------- | ---------- | --------------------------------------- |
+| [Bun](https://bun.sh)                                          | ≥ 1.3      | 引擎运行时 + 测试 + 站点构建            |
 | [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) | 已登录可用 | 各 Agent 实际执行（`claude -p` 子进程） |
-| git | 任意 | URL 取源（`git clone --depth 1`） |
+| git                                                            | 任意       | URL 取源（`git clone --depth 1`）       |
 
 确认：
 
@@ -35,8 +35,8 @@ bun install          # 仅装 dev 依赖（@types/bun + typescript），零运�
 
 ### 可选环境变量
 
-| 变量 | 默认 | 作用 |
-|------|------|------|
+| 变量               | 默认     | 作用                                          |
+| ------------------ | -------- | --------------------------------------------- |
 | `ATLAS_CLAUDE_BIN` | `claude` | 覆盖 claude 可执行路径（CI / 自定义安装位置） |
 
 ---
@@ -45,7 +45,7 @@ bun install          # 仅装 dev 依赖（@types/bun + typescript），零运�
 
 ```bash
 # 1) 跑一个公开 GitHub 仓库（推荐，源码会被克隆到 cwd 内，最稳定）
-bun run src/bin/atlas.ts run https://github.com/octocat/Hello-World.git
+bun run src/bin/atlas.ts run https://github.com/vuejs/pinia
 
 # 2) 或跑本地目录（原地只读，不复制、不改源）
 bun run src/bin/atlas.ts run ./samples/mini-signal
@@ -164,15 +164,15 @@ atlas clean <key> [-y]
 
 ### 3.6 全局 flag（`run`/`resume` 生效）
 
-| flag | 默认 | 说明 |
-|------|------|------|
-| `--concurrency <n>` | 4 | 逐章并发上限（research/write 阶段） |
-| `--review-rounds <n>` | 2 | 对抗评审（Producer⇄Critic）轮数上限 |
-| `--skip-build` | 关 | build 阶段直接置 done，不真跑 `bun run docs:build` |
-| `--model <name>` | claude 默认 | 透传给 claude 的 model 别名（如 `sonnet`） |
-| `--from <stage>` | — | 见 resume |
-| `--only <stage>` | — | 见 resume |
-| `--force` | — | 见 resume |
+| flag                  | 默认        | 说明                                               |
+| --------------------- | ----------- | -------------------------------------------------- |
+| `--concurrency <n>`   | 4           | 逐章并发上限（research/write 阶段）                |
+| `--review-rounds <n>` | 2           | 对抗评审（Producer⇄Critic）轮数上限                |
+| `--skip-build`        | 关          | build 阶段直接置 done，不真跑 `bun run docs:build` |
+| `--model <name>`      | claude 默认 | 透传给 claude 的 model 别名（如 `sonnet`）         |
+| `--from <stage>`      | —           | 见 resume                                          |
+| `--only <stage>`      | —           | 见 resume                                          |
+| `--force`             | —           | 见 resume                                          |
 
 其它：`-h`/`--help` 打印用法；`-v`/`--version` 打印 `atlas 0.1.0`。
 
@@ -207,15 +207,15 @@ atlas/{key}/
 
 ### 7 个 Stage 产出对照
 
-| Stage | 产物 | 说明 |
-|-------|------|------|
-| acquire | `work/source/`（URL）或 manifest 记 sourcePath（本地） | 取源 |
-| survey | `work/repo-map.json` | 结构测绘 |
-| outline | `work/outline.json`（含 topoOrder） | 拆章 + 依赖 DAG + 对抗评审 |
-| research | `work/chapters/{slug}/research.md` ×N | 逐章精读 |
-| write | `work/chapters/{slug}/draft.md` + `replica/` ×N | 逐章写作 + 对抗评审 |
-| assemble | `site/` | 组装 VitePress 工程 |
-| build | `site/.vitepress/dist/` | 构建冒烟 |
+| Stage    | 产物                                                   | 说明                       |
+| -------- | ------------------------------------------------------ | -------------------------- |
+| acquire  | `work/source/`（URL）或 manifest 记 sourcePath（本地） | 取源                       |
+| survey   | `work/repo-map.json`                                   | 结构测绘                   |
+| outline  | `work/outline.json`（含 topoOrder）                    | 拆章 + 依赖 DAG + 对抗评审 |
+| research | `work/chapters/{slug}/research.md` ×N                  | 逐章精读                   |
+| write    | `work/chapters/{slug}/draft.md` + `replica/` ×N        | 逐章写作 + 对抗评审        |
+| assemble | `site/`                                                | 组装 VitePress 工程        |
+| build    | `site/.vitepress/dist/`                                | 构建冒烟                   |
 
 ---
 
@@ -270,14 +270,14 @@ bash scripts/selfcheck.sh <key> --no-build
 
 输出逐条 PASS/FAIL 汇总，覆盖：
 
-| AC | 核验内容 |
-|----|----------|
-| AC-1 | `site/` 结构完整 + `bun run docs:build` 成功产出 `dist/` |
-| AC-2 | 本地源只读不变（kind=local + 无克隆副本） |
-| AC-3 | done 的 stage 有时间戳（续跑不重置） |
-| AC-4 | outline 无环/无悬空/topoOrder 复算一致/依赖闭包满足/文件名编号==topo 序号 |
-| AC-5 | 每章 draft 有代码块 + `replica/` 有可运行文件 |
-| AC-6 | outline + 每章 write 有对抗评审 trace（rounds/final/trace） |
+| AC   | 核验内容                                                                   |
+| ---- | -------------------------------------------------------------------------- |
+| AC-1 | `site/` 结构完整 + `bun run docs:build` 成功产出 `dist/`                   |
+| AC-2 | 本地源只读不变（kind=local + 无克隆副本）                                  |
+| AC-3 | done 的 stage 有时间戳（续跑不重置）                                       |
+| AC-4 | outline 无环/无悬空/topoOrder 复算一致/依赖闭包满足/文件名编号==topo 序号  |
+| AC-5 | 每章 draft 有代码块 + `replica/` 有可运行文件                              |
+| AC-6 | outline + 每章 write 有对抗评审 trace（rounds/final/trace）                |
 | AC-7 | 所有分析类 agent 的 cmd 含 `--allowedTools Read,Glob,Grep`（只读无逃生口） |
 
 退出码：全 PASS → 0；任一 FAIL → 1。

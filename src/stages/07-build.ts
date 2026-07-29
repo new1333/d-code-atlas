@@ -93,6 +93,7 @@ export async function build(ctx: StageContext): Promise<StageResult> {
   if (!(await pathExists(pkgPath))) {
     const failed = setStageStatus(m, "build", "failed", {
       cmd: `(build 跳过：site/package.json 不存在) ${pkgPath}`,
+      error: `site/package.json 不存在（assemble 未产出或失败）: ${pkgPath}`,
     });
     await saveManifest(key, failed);
     return failed;
@@ -110,6 +111,9 @@ export async function build(ctx: StageContext): Promise<StageResult> {
     const summary = r.stderr.trim().slice(-500);
     const failed = setStageStatus(m, "build", "failed", {
       cmd: `cd ${site} && ${cmd} (exit=${r.exitCode}) ${summary}`,
+      exitCode: r.exitCode,
+      stderr: r.stderr,
+      error: `bun install/docs:build 失败 (exit=${r.exitCode})`,
     });
     await saveManifest(key, failed);
     return failed;
@@ -125,6 +129,7 @@ export async function build(ctx: StageContext): Promise<StageResult> {
     // 退出码 0 但无 dist：仍视为失败（产物没出来）。
     const failed = setStageStatus(m, "build", "failed", {
       cmd: `cd ${site} && ${cmd} (exit=0 但未产出 dist/)`,
+      error: "build 退出码 0 但未产出 dist/（vitepress 构建产物缺失）",
     });
     await saveManifest(key, failed);
     return failed;

@@ -596,6 +596,8 @@ async function cmdShow(
     if (s === "outline") {
       line += formatReviewSuffix(st.review);
     }
+    // 失败诊断后缀（让用户 atlas show 直接看到失败原因，而非只看到 "failed"）。
+    line += formatDiagSuffix(st);
     // 时间戳摘要。
     if (st.startedAt) line += `  started=${st.startedAt}`;
     if (st.finishedAt) line += ` finished=${st.finishedAt}`;
@@ -615,6 +617,9 @@ async function cmdShow(
       let line = `  ${slug}: research=${r} write=${w}`;
       // 每章 write 行：挂 chapter 级 review（AC-6）。
       line += formatReviewSuffix(c.write.review);
+      // 失败章的诊断后缀（research / write 任一 failed 时展示对应诊断）。
+      if (r === "failed") line += formatDiagSuffix(c.research);
+      if (w === "failed") line += formatDiagSuffix(c.write);
       deps.log(line);
     }
   }
@@ -632,6 +637,22 @@ function formatReviewSuffix(review: ReviewSummary | null | undefined): string {
   if (!review) return "";
   const final = review.final === "approved" ? "approve" : review.final;
   return ` [review: ${final}, ${review.rounds}r]`;
+}
+
+/**
+ * 把 StageState 的失败诊断格式化成后缀串（仅 failed 时有意义）。
+ * 形如：` [exit=126 err: <摘要> stderr: <末段>]`
+ *   - exitCode 存在 → ` exit=<n>`；
+ *   - error 存在 → ` err: <摘要>`（截断 ~200 字符）；
+ *   - stderr 存在且非空 → ` stderr: <末段 ~200 字符>`（取末段，因编译/运行错误常在末尾）。
+ * 全无 → 空串。
+ */
+function formatDiagSuffix(st: StageState): string {
+  const parts: string[] = [];
+  if (st.exitCode !== undefined) parts.push(`exit=${st.exitCode}`);
+  if (st.error && st.error.trim() !== "") parts.push(`err: ${st.error.trim().slice(-200)}`);
+  if (st.stderr && st.stderr.trim() !== "") parts.push(`stderr: ${st.stderr.trim().slice(-200)}`);
+  return parts.length > 0 ? ` [${parts.join(" ")}]` : "";
 }
 
 /** source 字段的展示串。 */

@@ -90,6 +90,10 @@ export async function critic(opts: CriticOpts): Promise<CriticOutcome> {
     spawn,
     // 本地源在 cwd 之外，必须 --add-dir 声明（critic 需读源码做准确性抽查）。
     addDirs: agentAddDirs(sourcePath),
+    // critic 对「评审」任务高概率产出 markdown 报告而非契约 JSON（实测，模型倾向问题）。
+    // 给额外重试机会（3 次 = 共 4 次尝试）；全部失败时 outline stage 会降级接受草稿。
+    retries: 3,
+    validate: (stdout) => extractCriticVerdict(stdout) !== null,
   });
 
   // 从 stdout 提取并校验 {verdict, fixes}。
@@ -115,6 +119,19 @@ function buildOutlinePrompt(key: string, cwd: string): string {
   return [
     "你是 Critic（对抗评审员）· Outline 模式。请对 Architect 产出的大纲做对抗评审。",
     "",
+    "## ⚠️ 输出格式（最重要，违反则本次评审作废）",
+    "你的最终回复**必须且只能**是一个 ```json fence 包裹的 JSON 对象，**fence 之外绝不写任何文字**。",
+    "不要写 markdown 报告、不要写「评审结论」「总体裁决」之类的标题或正文——那些会让解析失败。",
+    "你的所有评审意见都放进 JSON 的 fixes 数组（每条是一个字符串，可长可短）。",
+    "正确示例（approve）：",
+    "```json",
+    '{ "verdict": "approve", "fixes": [] }',
+    "```",
+    "正确示例（reject）：",
+    "```json",
+    '{ "verdict": "reject", "fixes": ["章节 X 违反标准②：缺少对 Y 的覆盖，应补充...", "..."] }',
+    "```",
+    "",
     "## 本次输入",
     `- Run key: ${key}`,
     `- cwd: ${cwd}（相对 cwd 读 work/... 即 atlas/${key}/work/...）`,
@@ -135,11 +152,8 @@ function buildOutlinePrompt(key: string, cwd: string): string {
     "全过 → approve；任一不过 → reject + 具体可执行修改点。",
     "全程**只读**：禁止 Write/Edit；绝不自己生产 outline 内容（只描述「Architect 应该怎么改」）。",
     "",
-    "## 输出契约（严格）",
-    "你的最终回复**只**包含一个被 ```json fence 包裹的 JSON 对象：",
-    '- approve: { "verdict": "approve", "fixes": [] }',
-    '- reject:  { "verdict": "reject", "fixes": ["具体修改点1", "..."] }（fixes 至少 1 条）',
-    "fence 外不写任何正文。verdict 只能是 approve/reject（小写）。",
+    "## 再次强调输出格式",
+    "**只输出 ```json fence 包裹的 {verdict, fixes} JSON，不写任何 markdown 正文。**",
   ].join("\n");
 }
 
@@ -147,6 +161,19 @@ function buildOutlinePrompt(key: string, cwd: string): string {
 function buildChapterPrompt(key: string, cwd: string, slug: string): string {
   return [
     "你是 Critic（对抗评审员）· Chapter 模式。请对 Writer 产出的单章草稿做对抗评审。",
+    "",
+    "## ⚠️ 输出格式（最重要，违反则本次评审作废）",
+    "你的最终回复**必须且只能**是一个 ```json fence 包裹的 JSON 对象，**fence 之外绝不写任何文字**。",
+    "不要写 markdown 报告、不要写「评审结论」「总体裁决」之类的标题或正文——那些会让解析失败。",
+    "你的所有评审意见都放进 JSON 的 fixes 数组（每条是一个字符串，可长可短）。",
+    "正确示例（approve）：",
+    "```json",
+    '{ "verdict": "approve", "fixes": [] }',
+    "```",
+    "正确示例（reject）：",
+    "```json",
+    '{ "verdict": "reject", "fixes": ["draft 第 X 段技术陈述有误：...应改为...", "..."] }',
+    "```",
     "",
     "## 本次输入",
     `- Run key: ${key}`,
@@ -171,10 +198,7 @@ function buildChapterPrompt(key: string, cwd: string, slug: string): string {
     "全过 → approve；任一不过 → reject + 具体可执行修改点（指明 draft/replica 的哪一处 + 怎么改）。",
     "全程**只读**：禁止 Write/Edit；绝不自己生产 draft/replica 内容（只描述「Writer 应该怎么改」）。",
     "",
-    "## 输出契约（严格）",
-    "你的最终回复**只**包含一个被 ```json fence 包裹的 JSON 对象：",
-    '- approve: { "verdict": "approve", "fixes": [] }',
-    '- reject:  { "verdict": "reject", "fixes": ["具体修改点1", "..."] }（fixes 至少 1 条）',
-    "fence 外不写任何正文。verdict 只能是 approve/reject（小写）。",
+    "## 再次强调输出格式",
+    "**只输出 ```json fence 包裹的 {verdict, fixes} JSON，不写任何 markdown 正文。**",
   ].join("\n");
 }

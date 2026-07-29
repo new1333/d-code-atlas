@@ -45,7 +45,16 @@ export async function survey(ctx: StageContext): Promise<StageResult> {
 
   // 失败：ok=false 或 repoMap 解析为 null。
   if (!outcome.ok || outcome.repoMap === null) {
-    const failed = setStageStatus(m, "survey", "failed", { cmd: outcome.cmd });
+    const failed = setStageStatus(m, "survey", "failed", {
+      cmd: outcome.cmd,
+      // 失败诊断落盘（exitCode/stderr），让 atlas show 能直接看到失败原因，
+      // 而非只看到 "survey failed"。repoMap 解析失败时 error 给一句话提示。
+      exitCode: outcome.exitCode,
+      stderr: outcome.stderr,
+      ...(outcome.repoMap === null && outcome.ok
+        ? { error: "survey 退出码 0 但 repo-map JSON 解析为 null（产物不符合契约）" }
+        : {}),
+    });
     await saveManifest(key, failed);
     return failed;
   }

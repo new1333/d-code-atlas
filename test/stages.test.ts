@@ -642,12 +642,9 @@ describe("05-write · 并发 + 每章对抗评审", () => {
       const call: SpawnCall = { args: [...args], cwd: opts.cwd };
       calls.push(call);
       const prompt = args[1] ?? "";
-      if (prompt.includes("你是 Writer")) {
-        // 从 prompt 抽 slug，落盘 draft.md（Writer 自己落盘的模拟）。
-        const slugMatch = prompt.match(/本章 slug: ([a-z]+)/);
-        const slug = slugMatch ? slugMatch[1] : "x";
-        await writeText(draftPath(key, slug), `# ${slug} 草稿\n正文`);
-        return { exitCode: 0, stdout: "writer done", stderr: "" };
+      if (prompt.includes("技术文档撰写员")) {
+        // writer 从 stdout markdown fence 提取 draft（模拟）。
+        return { exitCode: 0, stdout: mdFence(`# 草稿\n正文`), stderr: "" };
       }
       if (prompt.includes("你是 Critic")) {
         const verdict = criticSeq[criticIdx++] ?? "approve";

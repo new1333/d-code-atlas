@@ -32,6 +32,7 @@ import {
   pathExists,
   draftPath,
   researchPath,
+  writeText,
 } from "../lib/io.ts";
 import { mapPool } from "../lib/pool.ts";
 import {
@@ -51,12 +52,16 @@ import type { StageContext, StageResult } from "./types.ts";
  * - status：本章 write 的终态（done / failed）。
  * - cmd：最后一条 claude 命令（writer 或 critic 的，便于审计）。
  * - review：对抗评审汇总（done 时挂；failed 时通常 null）。
+ * - exitCode/stderr/error：失败诊断（仅 failed 时有意义，透传到 manifest 供 atlas show 展示）。
  */
 interface ChapterWriteResult {
   slug: string;
   status: "done" | "failed";
   cmd?: string;
   review: ReviewSummary | null;
+  exitCode?: number;
+  stderr?: string;
+  error?: string;
 }
 
 /**
@@ -80,6 +85,7 @@ async function writeChapter(
       status: "failed",
       cmd: `(write 跳过：research.md 缺失)`,
       review: null,
+      error: `research.md 缺失（上游 research 未产出或失败）: ${researchPath(key, slug)}`,
     };
   }
 
@@ -88,6 +94,7 @@ async function writeChapter(
   let final: ReviewSummary["final"] = "accepted-with-warning";
   let failed = false;
   let failedCmd = "";
+  let failedDiag: { exitCode?: number; stderr?: string; error?: string } = {};
 
   // 2) Writer⇄Critic 循环。
   for (let round = 1; round <= maxRounds; round++) {
@@ -97,19 +104,38 @@ async function writeChapter(
     const writerOutcome = await writer({ key, slug, model, spawn, feedback: prevFixes });
     lastCmd = writerOutcome.cmd;
 
-    if (!writerOutcome.ok) {
-      // Writer 失败（claude 非零退出）→ 本章 failed，break。
+    if (!writerOutcome.ok || writerOutcome.draftMd === null) {
+      // Writer 失败（claude 非零退出 / draft 内容提取为 null）→ 本章 failed，break。
       failed = true;
       failedCmd = writerOutcome.cmd;
+      failedDiag = {
+        exitCode: writerOutcome.exitCode,
+        stderr: writerOutcome.stderr,
+        ...(writerOutcome.draftMd === null && writerOutcome.ok
+          ? { error: "writer 退出码 0 但 draft.md 内容提取为 null（产物不符合契约）" }
+          : {}),
+      };
       break;
     }
+
+    // Writer 产物从 stdout 提取，Stage 原子落盘。
+    await writeText(draftPath(key, slug), writerOutcome.draftMd);
 
     const critOutcome = await critic({ key, mode: "chapter", slug, spawn, sourcePath });
 
     if (!critOutcome.ok || critOutcome.verdict === null) {
-      // Critic 自身失败（解析失败等）= 工具异常 → 本章 failed（同 outline stage 取舍）。
-      failed = true;
-      failedCmd = critOutcome.cmd;
+      // Critic 自身失败（claude 非 0 退出 / verdict 解析为 null）。
+      // 同 outline stage 的降级策略：claude headless 对「评审」任务高概率产 markdown 而非 JSON。
+      // 降级：当本轮 critic 工具异常，直接接受当前 draft（Writer 已落盘），
+      // final=accepted-with-warning，记录异常摘要，让流水线继续到 assemble/build。
+      // 理由：draft.md 已由 Writer 写盘，内容可用；critic 只是没给结构化 verdict。
+      trace.push({
+        round,
+        verdict: "reject",
+        fixes: [`(critic 工具异常，降级接受草稿；stdout 摘要: ${critOutcome.stdout.slice(0, 300)})`],
+        cmd: critOutcome.cmd,
+      });
+      final = "accepted-with-warning";
       break;
     }
 
@@ -129,7 +155,7 @@ async function writeChapter(
   }
 
   if (failed) {
-    return { slug, status: "failed", cmd: failedCmd, review: null };
+    return { slug, status: "failed", cmd: failedCmd, review: null, ...failedDiag };
   }
 
   // 3) CAS：校验 draft.md 存在（Writer 已落盘）→ 构造 review 汇总。
@@ -141,6 +167,7 @@ async function writeChapter(
       status: "failed",
       cmd: `(write 完成但 draft.md 未找到)`,
       review: null,
+      error: `Writer 自称 ok 但 draft.md 未找到: ${draftPath(key, slug)}`,
     };
   }
 
@@ -170,8 +197,10 @@ export async function write(ctx: StageContext): Promise<StageResult> {
   try {
     outline = await readJson<Outline>(outlinePath(key));
   } catch (err) {
+    const msg = (err as Error).message ?? String(err);
     const failed = setStageStatus(manifest, "write", "failed", {
-      cmd: `(write 读 outline 失败) ${(err as Error).message}`,
+      cmd: `(write 读 outline 失败) ${msg}`,
+      error: msg,
     });
     await saveManifest(key, failed);
     return failed;
@@ -216,6 +245,7 @@ export async function write(ctx: StageContext): Promise<StageResult> {
       const msg = r.error instanceof Error ? r.error.message : String(r.error);
       m = setChapterStatus(m, slug, "write", "failed", {
         cmd: `(write 异常) ${msg.slice(-500)}`,
+        error: msg.slice(-500),
       });
       continue;
     }
@@ -223,6 +253,9 @@ export async function write(ctx: StageContext): Promise<StageResult> {
     if (res.status === "failed") {
       m = setChapterStatus(m, slug, "write", "failed", {
         ...(res.cmd !== undefined ? { cmd: res.cmd } : {}),
+        ...(res.exitCode !== undefined ? { exitCode: res.exitCode } : {}),
+        ...(res.stderr !== undefined ? { stderr: res.stderr } : {}),
+        ...(res.error !== undefined ? { error: res.error } : {}),
       });
       continue;
     }

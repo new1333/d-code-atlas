@@ -1,0 +1,184 @@
+{
+  "repo": "pinia",
+  "generatedAt": "2026-07-29T00:18:14.288Z",
+  "chapters": [
+    {
+      "slug": "core-types",
+      "title": "核心类型契约与全局声明",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "packages/pinia/src/types.ts",
+        "packages/pinia/src/globalExtensions.ts",
+        "packages/pinia/src/env.ts"
+      ],
+      "summary": "StateTree、MutationType、Store/StoreGeneric/StoreDefinition 等贯穿全库的类型契约，Vue 全局属性 $pinia 的模块声明增强，以及 IS_CLIENT 环境探测。"
+    },
+    {
+      "slug": "subscription-primitive",
+      "title": "发布-订阅原语",
+      "layer": "primitive",
+      "dependsOn": [
+        "core-types"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/subscriptions.ts"
+      ],
+      "summary": "addSubscription/triggerSubscriptions 基于 Set 的回调集合，是 $subscribe、$onAction、$patch 通知的通用基石，并自动随 effectScope 释放。"
+    },
+    {
+      "slug": "diagnostics",
+      "title": "运行时诊断与错误码体系",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "packages/pinia/src/diagnostics.ts"
+      ],
+      "summary": "基于 nostics 的 dev-only 诊断目录（PINIA_R1xxx 等错误码），在各核心模块收集用户误用并产出可 tree-shake 的控制台报告。"
+    },
+    {
+      "slug": "pinia-instance",
+      "title": "Pinia 根实例与活跃上下文",
+      "layer": "composite",
+      "dependsOn": [
+        "core-types"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/createPinia.ts",
+        "packages/pinia/src/rootStore.ts"
+      ],
+      "summary": "createPinia 以 effectScope 持有根 state、store 注册表 _s 与插件管线 _p；Pinia 接口、provide/inject 符号、setActivePinia/getActivePinia 管理全局活跃实例（SSR 隔离关键）。"
+    },
+    {
+      "slug": "store-definition",
+      "title": "store 的定义与实例化",
+      "layer": "composite",
+      "dependsOn": [
+        "pinia-instance",
+        "core-types",
+        "subscription-primitive",
+        "diagnostics"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/store.ts"
+      ],
+      "summary": "defineStore 三种重载与 createOptionsStore/createSetupStore 装配管线：自动归类 state/getter/action、reactive 化、应用插件、SSR hydrate 与 _hotUpdate。"
+    },
+    {
+      "slug": "store-instance-api",
+      "title": "store 实例的变更与订阅 API",
+      "layer": "composite",
+      "dependsOn": [
+        "store-definition",
+        "subscription-primitive"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/store.ts"
+      ],
+      "summary": "实例上的运行时方法：$patch（含 mergeReactiveObjects 深合并）、$reset、$dispose、$subscribe、$onAction（含 action 包装钩子）与 $state 的 getter/setter。"
+    },
+    {
+      "slug": "store-to-refs",
+      "title": "响应式引用提取",
+      "layer": "composite",
+      "dependsOn": [
+        "store-definition"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/storeToRefs.ts"
+      ],
+      "summary": "storeToRefs 将 store 的 state 与 getter 分别转为 ref 和计算属性，使解构后仍保持响应式，而忽略方法与非响应式属性。"
+    },
+    {
+      "slug": "map-helpers",
+      "title": "Options API 映射辅助",
+      "layer": "composite",
+      "dependsOn": [
+        "store-definition"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/mapHelpers.ts"
+      ],
+      "summary": "mapState/mapGetters/mapWritableState/mapActions/mapStores，让非 setup 的 Options API 组件通过 computed/methods 展开使用 store。"
+    },
+    {
+      "slug": "hmr",
+      "title": "模块热更新支持",
+      "layer": "system",
+      "dependsOn": [
+        "store-definition",
+        "pinia-instance",
+        "core-types"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/hmr.ts"
+      ],
+      "summary": "acceptHMRUpdate 接入 Vite import.meta.hot，配合 patchObject 深层状态合并与 isUseStore 守卫，实现开发期 store 的无损热替换。"
+    },
+    {
+      "slug": "devtools",
+      "title": "Vue Devtools 集成",
+      "layer": "system",
+      "dependsOn": [
+        "store-definition",
+        "pinia-instance",
+        "core-types"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/devtools/plugin.ts",
+        "packages/pinia/src/devtools/actions.ts",
+        "packages/pinia/src/devtools/formatting.ts",
+        "packages/pinia/src/devtools/utils.ts",
+        "packages/pinia/src/devtools/index.ts"
+      ],
+      "summary": "作为 Pinia 插件接入 Vue Devtools：注册 mutations 时间线、store inspector，并提供全局状态的导入/导出/复制粘贴。"
+    },
+    {
+      "slug": "nuxt-module",
+      "title": "@pinia/nuxt 模块与 SSR payload",
+      "layer": "system",
+      "dependsOn": [
+        "pinia-instance",
+        "store-definition"
+      ],
+      "sourceFiles": [
+        "packages/nuxt/src/module.ts",
+        "packages/nuxt/src/runtime/plugin.ts",
+        "packages/nuxt/src/runtime/composables.ts",
+        "packages/nuxt/src/runtime/payload-plugin.ts",
+        "packages/nuxt/src/auto-hmr-plugin.ts"
+      ],
+      "summary": "Nuxt 模块自动注入 pinia、按 storesDirs 自动导入 store 并注册 HMR；运行时插件负责在 app:rendered 时序列化 state 到 payload 并于客户端回灌。"
+    },
+    {
+      "slug": "testing",
+      "title": "@pinia/testing 测试夹具",
+      "layer": "system",
+      "dependsOn": [
+        "pinia-instance",
+        "store-definition",
+        "store-instance-api"
+      ],
+      "sourceFiles": [
+        "packages/testing/src/testing.ts",
+        "packages/testing/src/restoreGetters.ts",
+        "packages/testing/src/diagnostics.ts"
+      ],
+      "summary": "createTestingPinia 借插件机制以 spy 桩化 actions/$patch/$reset、注入初始 state 并支持覆写计算属性，专供组件与 store 单元测试。"
+    }
+  ],
+  "topoOrder": [
+    "core-types",
+    "subscription-primitive",
+    "diagnostics",
+    "pinia-instance",
+    "store-definition",
+    "store-instance-api",
+    "store-to-refs",
+    "map-helpers",
+    "hmr",
+    "devtools",
+    "nuxt-module",
+    "testing"
+  ]
+}

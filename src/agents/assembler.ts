@@ -90,6 +90,11 @@ export async function assembler(opts: AssemblerOpts): Promise<AssemblerOutcome> 
   const prompt = [
     "你是 Assembler（站点组装员）。请把各章 draft 搬到 site/，生成自包含的 VitePress 工程。",
     "",
+    "## ⚠️ 产出方式（最重要，违反则本次作废）",
+    "你必须**调用 Write 工具**创建 site/ 下的所有文件（package.json、.vitepress/config.ts、index.md、各章 .md 等）。",
+    "**不要把文件内容输出到 stdout/最终回复**——stdout 只用于简短确认（如「site/ 已组装完成」）。",
+    "如果你只把内容回复给我而不调用 Write 工具，文件不会被创建，本次任务作废。",
+    "",
     "## 本次输入",
     `- Run key: ${key}`,
     `- cwd: ${cwd}（即 atlas/${key}/；下面的相对路径都基于此 cwd）`,
@@ -136,6 +141,9 @@ export async function assembler(opts: AssemblerOpts): Promise<AssemblerOutcome> 
     tools: "write",
     model,
     spawn,
+    // assembler 生成整个 site 骨架（VitePress 配置 + 侧边栏 + 首页），耗时较长；给 25 分钟 + 多重试。
+    timeoutMs: 25 * 60 * 1000,
+    retries: 3,
   });
 
   return {

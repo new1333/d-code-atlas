@@ -50,8 +50,10 @@ export async function research(ctx: StageContext): Promise<StageResult> {
   try {
     outline = await readJson<Outline>(outlinePath(key));
   } catch (err) {
+    const msg = (err as Error).message ?? String(err);
     const failed = setStageStatus(manifest, "research", "failed", {
-      cmd: `(research 读 outline 失败) ${(err as Error).message}`,
+      cmd: `(research 读 outline 失败) ${msg}`,
+      error: msg,
     });
     await saveManifest(key, failed);
     return failed;
@@ -100,13 +102,21 @@ export async function research(ctx: StageContext): Promise<StageResult> {
       const msg = r.error instanceof Error ? r.error.message : String(r.error);
       m = setChapterStatus(m, slug, "research", "failed", {
         cmd: `(reader 异常) ${msg.slice(-500)}`,
+        error: msg.slice(-500),
       });
       continue;
     }
     const outcome = r.value;
     if (!outcome.ok || outcome.researchMd === null) {
       // reader 返回失败（claude 非零退出 / researchMd 解析失败）→ 该章 failed。
-      m = setChapterStatus(m, slug, "research", "failed", { cmd: outcome.cmd });
+      m = setChapterStatus(m, slug, "research", "failed", {
+        cmd: outcome.cmd,
+        exitCode: outcome.exitCode,
+        stderr: outcome.stderr,
+        ...(outcome.researchMd === null && outcome.ok
+          ? { error: "reader 退出码 0 但 research.md 内容提取为 null（产物不符合契约）" }
+          : {}),
+      });
       continue;
     }
     // CAS：先原子写 research.md，再置 chapter done。

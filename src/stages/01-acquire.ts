@@ -46,11 +46,12 @@ export async function acquire(ctx: StageContext): Promise<StageResult> {
       cmd = `resolveLocalSource(${r.absPath})`;
     }
   } catch (err) {
-    // 失败：置 failed（带 cmd 占位 + stderr 摘要），saveManifest，return。
-    // CAS：不置 done。stderr 摘要进 cmd（manifest 无独立 stderr 字段，借 cmd 串诊断）。
+    // 失败：置 failed（带 cmd 占位 + error 诊断），saveManifest，return。
+    // CAS：不置 done。错误摘要同时进 cmd（紧凑诊断）与 error 字段（atlas show 展示用）。
     const msg = (err as Error).message ?? String(err);
     const failed = setStageStatus(manifest, "acquire", "failed", {
       cmd: `(acquire 失败) ${msg.slice(-500)}`,
+      error: msg.slice(-500),
     });
     await saveManifest(key, failed);
     return failed;

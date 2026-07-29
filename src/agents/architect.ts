@@ -105,6 +105,13 @@ export async function architect(opts: ArchitectOpts): Promise<ArchitectOutcome> 
     spawn,
     // 本地源在 cwd 之外，必须 --add-dir 声明（否则 claude 读取源码被拦截）。
     addDirs: agentAddDirs(sourcePath),
+    // architect 是整条流水线的骨架，claude 偶发用 markdown 表格而非 JSON fence 输出（实测）。
+    // 给额外重试机会（3 次 = 共 4 次尝试），靠 validate 兜底重试到产出合法 JSON。
+    retries: 3,
+    validate: (stdout) => {
+      const p = extractJson<ArchitectOutput>(stdout);
+      return p !== null && Array.isArray(p.chapters);
+    },
   });
 
   // 从 stdout 提取 {chapters:[...]}。

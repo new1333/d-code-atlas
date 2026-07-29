@@ -83,6 +83,12 @@ export async function reader(opts: ReaderOpts): Promise<ReaderOutcome> {
     spawn,
     // 本地源在 cwd 之外，必须 --add-dir 声明（否则 claude 读取源码被拦截）。
     addDirs: agentAddDirs(sourcePath),
+    // reader 深度精读大仓库源码（如 pinia）单章可能超 15 分钟；给 25 分钟。
+    timeoutMs: 25 * 60 * 1000,
+    retries: 3,
+    // validate：reader 必须产出 ```markdown fence（4 反引号外层）。
+    // claude 偶发不加 fence 或用 3 反引号（与内层代码块冲突）→ 触发重试。
+    validate: (stdout) => extractFence(stdout, "markdown") !== null,
   });
 
   // 从 stdout 提取 ```markdown fence 内文本（注意：Reader 不用 JSON，用 markdown fence）。

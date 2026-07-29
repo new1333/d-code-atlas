@@ -428,6 +428,51 @@ describe("atlas show", () => {
     expect(joined).toContain(`Run: ${key}`);
   });
 
+  test("show failed stage 行带诊断后缀（exitCode/error/stderr）", async () => {
+    const key = "show-failed";
+    let m = initManifest(key, urlSource());
+    m = setStageStatus(m, "acquire", "done");
+    // survey failed 带诊断（模拟 5ms 启动失败场景落盘的真实诊断）。
+    m = setStageStatus(m, "survey", "failed", {
+      cmd: "claude -p survey",
+      exitCode: 126,
+      stderr: "defaultSpawn: 启动 claude 子进程失败",
+      error: "启动 claude 子进程失败",
+    });
+    await writeManifest(key, m);
+
+    const c = makeDeps();
+    const code = await runCli(["show", key], c.deps);
+
+    expect(code).toBe(0);
+    const surveyLine = c.logs.find((l) => l.includes("survey="));
+    expect(surveyLine).toBeDefined();
+    expect(surveyLine!.includes("survey=failed")).toBe(true);
+    // 诊断后缀：exit/error/stderr 都展示。
+    expect(surveyLine!.includes("exit=126")).toBe(true);
+    expect(surveyLine!.includes("err:")).toBe(true);
+    expect(surveyLine!.includes("stderr:")).toBe(true);
+  });
+
+  test("show 非 failed 行不带诊断后缀（成功路径不污染）", async () => {
+    const key = "show-clean";
+    let m = initManifest(key, urlSource());
+    m = setStageStatus(m, "acquire", "done");
+    m = setStageStatus(m, "survey", "done", { cmd: "claude -p survey" });
+    await writeManifest(key, m);
+
+    const c = makeDeps();
+    const code = await runCli(["show", key], c.deps);
+
+    expect(code).toBe(0);
+    const surveyLine = c.logs.find((l) => l.includes("survey="));
+    expect(surveyLine).toBeDefined();
+    expect(surveyLine!.includes("survey=done")).toBe(true);
+    // done 行不应有诊断后缀。
+    expect(surveyLine!.includes("exit=")).toBe(false);
+    expect(surveyLine!.includes("err:")).toBe(false);
+  });
+
   test("show key 不存在 → 报错 + 退出码 1", async () => {
     const c = makeDeps();
     const code = await runCli(["show", "nope"], c.deps);

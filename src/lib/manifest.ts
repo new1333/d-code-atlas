@@ -156,6 +156,21 @@ export interface StageState {
   cmd?: string;
   /** 对抗评审汇总（仅 outline 与每章 write 有意义；其它为 null/缺省）。 */
   review?: ReviewSummary | null;
+  /**
+   * 失败诊断（仅 status=failed 时有意义）：agent / 子进程的退出码。
+   * 落盘到 manifest，使 `atlas show` 能直接看到失败原因，而非只看到 "failed"。
+   */
+  exitCode?: number;
+  /**
+   * 失败诊断：agent / 子进程的 stderr（可能截断），失败时记录便于排查。
+   * 成功路径不写此字段（undefined，序列化时缺省）。
+   */
+  stderr?: string;
+  /**
+   * 失败诊断：人类可读的错误摘要（如 acquire 的 clone 失败信息、build 的报错）。
+   * 与 stderr 互补——stderr 是原始输出，error 是提炼后的一句话。
+   */
+  error?: string;
 }
 
 /**
@@ -281,22 +296,38 @@ const TERMINAL_STATES: ReadonlySet<StageStatus> = new Set([
  * 规则（design §9 CAS 式语义）：
  * - status 总是覆盖；
  * - opts.cmd 提供则覆盖 cmd（不提供则保留原 cmd）；
- * - 进入 `running` 时记 startedAt（用 opts.now 或默认 nowIso）；
+ * - opts.exitCode/stderr/error 提供则写入对应诊断字段（仅 failed 路径有意义；
+ *   成功路径不传，保留 undefined → 序列化缺省）；
+ * - 进入 `running` 时记 startedAt（用 opts.now 或默认 nowIso），并清掉上一次失败
+ *   残留的诊断字段（exitCode/stderr/error）——新一轮尝试不应带着旧诊断；
  * - 进入终态（done/failed）时记 finishedAt；
  * - 其它状态切换不动 startedAt/finishedAt（保留历史）。
  */
 function applyStatus(
   prev: StageState,
   status: StageStatus,
-  opts: { cmd?: string; now?: () => string } | undefined,
+  opts: { cmd?: string; exitCode?: number; stderr?: string; error?: string; now?: () => string } | undefined,
 ): StageState {
   const now = opts?.now ?? nowIso;
   const next: StageState = { ...prev, status };
   if (opts?.cmd !== undefined) {
     next.cmd = opts.cmd;
   }
+  if (opts?.exitCode !== undefined) {
+    next.exitCode = opts.exitCode;
+  }
+  if (opts?.stderr !== undefined) {
+    next.stderr = opts.stderr;
+  }
+  if (opts?.error !== undefined) {
+    next.error = opts.error;
+  }
   if (status === "running") {
     next.startedAt = now();
+    // 进入新一轮 running：清掉上一次失败的诊断（重跑会产生新的；旧的不再适用）。
+    delete next.exitCode;
+    delete next.stderr;
+    delete next.error;
   }
   if (TERMINAL_STATES.has(status)) {
     next.finishedAt = now();
@@ -318,7 +349,7 @@ export function setStageStatus(
   m: Manifest,
   stage: StageName,
   status: StageStatus,
-  opts?: { cmd?: string; now?: () => string },
+  opts?: { cmd?: string; exitCode?: number; stderr?: string; error?: string; now?: () => string },
 ): Manifest {
   const prevStage = m.stages[stage];
   const nextStage = applyStatus(prevStage, status, opts);
@@ -346,7 +377,7 @@ export function setChapterStatus(
   slug: string,
   kind: "research" | "write",
   status: StageStatus,
-  opts?: { cmd?: string; now?: () => string },
+  opts?: { cmd?: string; exitCode?: number; stderr?: string; error?: string; now?: () => string },
 ): Manifest {
   const prevChapter = m.chapters[slug] ?? {
     research: pendingStage(),
@@ -571,6 +602,8 @@ export function forceReset(m: Manifest, target: ResetTarget): Manifest {
       status: "pending",
       // 保留 cmd（历史记录有用）。
       ...(prev.cmd !== undefined ? { cmd: prev.cmd } : {}),
+      // 清掉上一次失败的诊断（exitCode/stderr/error）：重跑会产生新的，旧的不再适用。
+      // （与 startedAt/finishedAt/review 同样不保留——见下方注释。）
     };
     return {
       ...m,

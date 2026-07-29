@@ -25,7 +25,7 @@ import { critic } from "../src/agents/critic.ts";
 import { reader } from "../src/agents/reader.ts";
 import { writer } from "../src/agents/writer.ts";
 import { assembler } from "../src/agents/assembler.ts";
-import { outlinePath, writeJson, workDir, runDir } from "../src/lib/io.ts";
+import { outlinePath, writeJson, workDir, runDir, chapterDir } from "../src/lib/io.ts";
 import type { Outline } from "../src/lib/types.ts";
 import type { SpawnFn as RealSpawnFn } from "../src/lib/run-claude.ts";
 
@@ -456,34 +456,30 @@ describe("reader", () => {
 // ---------------------------------------------------------------------------
 
 describe("writer", () => {
-  test("tools=write；cmd 含 Write/Edit；cwd=workDir(key)", async () => {
+  test("tools=readonly（stdout fence 提取）；cwd=chapterDir；draftMd 从 fence 提取", async () => {
     const calls: SpawnCall[] = [];
     const spawn = makeFakeSpawn(calls, {
       exitCode: 0,
-      stdout: "已写 draft.md 与 replica/",
+      stdout: "````markdown\n# reactive-primitive 草稿\n正文\n````",
       stderr: "",
     });
 
     const r = await writer({ key: "demo", slug: "reactive-primitive", spawn });
 
     expect(r.ok).toBe(true);
-    // 写入类：cmd 含 Write/Edit（在 --allowedTools Read,Glob,Grep,Write,Edit 里）
-    expect(r.cmd.includes("Write")).toBe(true);
-    expect(r.cmd.includes("Edit")).toBe(true);
-    expect(r.cmd.includes("--allowedTools Read,Glob,Grep,Write,Edit")).toBe(true);
+    // 只读类：cmd 含 readonly 锚点（无 Write/Edit）。
+    expect(r.cmd.includes("--allowedTools Read,Glob,Grep")).toBe(true);
+    expect(r.cmd.includes("--allowedTools Read,Glob,Grep,Write")).toBe(false);
 
-    // cwd = workDir(key)（不是 chapterDir，便于跨读 outline.json）
-    expect(calls[0].cwd).toBe(workDir("demo"));
+    // cwd = chapterDir
+    expect(calls[0].cwd).toBe(chapterDir("demo", "reactive-primitive"));
 
-    // systemPromptPath → writer.md
-    const sysIdx = calls[0].args.indexOf("--append-system-prompt-file");
-    expect(calls[0].args[sysIdx + 1].endsWith("writer.md")).toBe(true);
+    // 不用 system prompt。
+    expect(calls[0].args.includes("--append-system-prompt-file")).toBe(false);
 
-    // user prompt 限定写范围：明确「只能写 chapters/{slug}/」、严禁改 outline
-    const promptArg = calls[0].args[1];
-    expect(promptArg).toContain("chapters/reactive-primitive/");
-    expect(promptArg).toContain("outline.json");
-    expect(promptArg).toContain("严禁");
+    // draftMd 从 fence 提取成功。
+    expect(r.draftMd).not.toBeNull();
+    expect(r.draftMd).toContain("reactive-primitive 草稿");
   });
 });
 

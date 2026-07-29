@@ -265,6 +265,50 @@ describe("setStageStatus 时间戳语义", () => {
 });
 
 // ---------------------------------------------------------------------------
+// setStageStatus：失败诊断字段（exitCode/stderr/error）
+// ---------------------------------------------------------------------------
+
+describe("setStageStatus 失败诊断字段", () => {
+  test("failed 时 exitCode/stderr/error 透传并落位", () => {
+    const m0 = initManifest("r", LOCAL_SOURCE);
+    const m = setStageStatus(m0, "survey", "failed", {
+      cmd: "claude -p survey",
+      exitCode: 126,
+      stderr: "launch fail",
+      error: "启动 claude 子进程失败",
+    });
+    expect(m.stages.survey.status).toBe("failed");
+    expect(m.stages.survey.exitCode).toBe(126);
+    expect(m.stages.survey.stderr).toBe("launch fail");
+    expect(m.stages.survey.error).toBe("启动 claude 子进程失败");
+  });
+
+  test("进入 running 时清掉上一次失败的诊断字段（新一轮尝试不带旧诊断）", () => {
+    const m0 = initManifest("r", LOCAL_SOURCE);
+    // 先 failed 带诊断。
+    let m = setStageStatus(m0, "survey", "failed", {
+      exitCode: 126,
+      stderr: "boom",
+      error: "launch fail",
+    });
+    expect(m.stages.survey.exitCode).toBe(126);
+    // 再 running（重跑）：诊断字段应被清。
+    m = setStageStatus(m, "survey", "running");
+    expect(m.stages.survey.exitCode).toBeUndefined();
+    expect(m.stages.survey.stderr).toBeUndefined();
+    expect(m.stages.survey.error).toBeUndefined();
+  });
+
+  test("不传诊断字段时，原 manifest 无这些字段（成功路径不污染）", () => {
+    const m0 = initManifest("r", LOCAL_SOURCE);
+    const m = setStageStatus(m0, "survey", "done", { cmd: "claude -p x" });
+    expect(m.stages.survey.exitCode).toBeUndefined();
+    expect(m.stages.survey.stderr).toBeUndefined();
+    expect(m.stages.survey.error).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // setChapterStatus
 // ---------------------------------------------------------------------------
 

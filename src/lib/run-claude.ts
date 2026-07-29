@@ -13,7 +13,10 @@
 //
 // 零运行时依赖：仅用 bun 内置。spawn 注入点便于单测 mock（不真调 claude）。
 
+import { existsSync as fsExistsSync, mkdirSync } from "node:fs";
 import { READONLY_TOOLS, WRITE_TOOLS, CLAUDE_BIN } from "./config.ts";
+// re-export resolveClaudeBin，让测试可断言「claude 被解析到真正可执行文件」的核心修复。
+export { resolveClaudeBin } from "./config.ts";
 
 // ---------------------------------------------------------------------------
 // 本机 claude CLI flag 探测结果（claude code cli 2.x，2026-07 实测）
@@ -82,6 +85,13 @@ export interface ClaudeRunOptions {
    * exitCode!=0 或 stdout 疑似「声称被拦截」时重试；产物正常则不重试。
    */
   retries?: number;
+  /**
+   * 产物校验回调（可选）。exitCode=0 时调用，返回 false 表示产出不符合契约
+   * （如 architect 该产 JSON fence 却产了 markdown 表格），触发重试。
+   * 这是治本的重试条件：claude headless 偶发不遵守输出格式契约，单次成功退出≠产出可用。
+   * 不提供时仅按 exitCode + looksBlocked 判定。
+   */
+  validate?: (stdout: string) => boolean;
   /** 额外/覆盖环境变量。可选。 */
   env?: Record<string, string>;
   /**
@@ -131,16 +141,17 @@ export function buildCmd(opts: ClaudeRunOptions): { cmd: string; args: string[] 
 
   // 真实传给 spawn 的参数数组（不经 shell，无需转义）。
   // flag 名与值分作两个 arg（符合 commander 解析惯例：值是独立参数）。
-  // - `--dangerously-skip-permissions`：headless 子进程下，claude 默认对 cwd 外的读取
-  //   会因「工作目录白名单」策略拦截（即便 --add-dir 声明了）。本引擎的只读不变量由
-  //   `--allowedTools` 强制（无 Write/Edit 工具，物理不可写），故跳过 claude 的交互式
-  //   权限提示是安全的——真正的安全边界是工具白名单，不是权限弹窗（ADR-0005）。
+  // - `--permission-mode bypassPermissions`：彻底跳过所有权限检查。
+  //   安全性由 `--allowedTools` 工具白名单保证（readonly 模式无 Write/Edit，物理不可写）。
+  //   注：claude 的启动由 resolveClaudeBin() 解析到真正的 PE 可执行文件（claude.exe），
+  //   不再依赖 shell 解析 sh/.cmd 包装脚本——这是 Windows 上 spawn 稳定性的核心保证。
   const args: string[] = [
     "-p",
     opts.prompt,
     "--allowedTools",
     toolsValue,
-    "--dangerously-skip-permissions",
+    "--permission-mode",
+    "bypassPermissions",
   ];
 
   if (opts.model && opts.model.trim() !== "") {
@@ -208,13 +219,50 @@ export const defaultSpawn: SpawnFn = async (args, opts) => {
   // 合并环境：继承当前进程 env，再用 opts.env 覆盖（如 ATLAS_CLAUDE_BIN 等）。
   const env = { ...process.env, ...(opts.env ?? {}) } as Record<string, string>;
 
-  const proc = Bun.spawn({
-    cmd: [CLAUDE_BIN, ...args],
-    cwd,
-    env,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  // Windows 上 Bun.spawn 若 cwd 目录不存在，libuv 会抛极具误导性的
+  // `ENOENT ... uv_spawn 'claude'`（错误信息把关联可执行名带出来，看似 claude 没装，
+  // 实则是 cwd 缺失）。这里**自动重建**缺失的 cwd（recursive mkdir 幂等），让流水线
+  // 在工作区部分丢失的脏状态下也能自愈继续跑，而不是抛误导性错误。
+  // 常见触发：resume 场景 manifest 标了 acquire=done 但工作目录被外部清除；
+  // 或上游 stage 的 ensureDir 因故未生效。重建空 cwd 后，agent 会因读不到源码而
+  // 在产物层失败（ok=false），给出真实诊断，远好于 ENOENT 'claude' 这种假象。
+  if (!fsExistsSync(cwd)) {
+    try {
+      mkdirSync(cwd, { recursive: true });
+    } catch {
+      // mkdir 失败（权限/磁盘满等）→ 仍让下面的 spawn 去抛，由 try/catch 翻译。
+    }
+  }
+
+  // spawn 本身可能抛错（Windows 上 libuv 的 ENOENT/EINVAL 等）。用 try/catch 包住，
+  // 翻译成结构化 ClaudeResult（ok=false），保持「非 0 退出/超时不抛」契约（design §15）。
+  // 否则未捕获异常冒泡到顶层，给出误导信息（如 `uv_spawn 'claude'`）。
+  // 注：用 `Bun.Subprocess<"pipe","pipe","pipe">` 精确标注（stdout/stderr = ReadableStream），
+  //   而非 `ReturnType<typeof Bun.spawn>`——后者是重载联合，会把 stdout 推为
+  //   `number | ReadableStream | undefined`，导致 `new Response(proc.stdout)` 类型不兼容。
+  let proc: Bun.Subprocess<"pipe", "pipe", "pipe">;
+  try {
+    proc = Bun.spawn({
+      cmd: [CLAUDE_BIN, ...args],
+      cwd,
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+  } catch (spawnErr) {
+    const e = spawnErr as NodeJS.ErrnoException;
+    return {
+      exitCode: 126,
+      stdout: "",
+      stderr:
+        `defaultSpawn: 启动 claude 子进程失败（${e.code ?? "UNKNOWN"}）。\n` +
+        `CLAUDE_BIN=${JSON.stringify(CLAUDE_BIN)} cwd=${JSON.stringify(cwd)}\n` +
+        `原始错误: ${(e.message ?? String(e)).slice(0, 500)}\n` +
+        `排查：① 终端确认 \`claude --version\` 可用；` +
+        `② 若 claude 是 npm/pnpm 全局装的 .cmd 包装，设环境变量 ` +
+        `\`ATLAS_CLAUDE_BIN\` 指向其绝对路径（如 C:/nvm4w/nodejs/claude.cmd）。`,
+    };
+  }
 
   let timedOut = false;
   const timer = setTimeout(() => {
@@ -257,20 +305,25 @@ export async function runClaude(opts: ClaudeRunOptions): Promise<ClaudeResult> {
   const { cmd, args } = buildCmd(opts);
   const spawn = opts.spawn ?? defaultSpawn;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const retries = opts.retries ?? 1; // 默认重试 1 次（应对 claude headless 非确定性「声称被拦截」）
+  // 默认重试 2 次（共 3 次尝试）。应对 claude headless 三类非确定性失败：
+  //   ① 瞬时非 0 退出；② 「声称被拦截」文本；③ exitCode=0 但产出不符合格式契约（validate 返回 false）。
+  // 实测 architect/critic 偶发用 markdown 表格而非 JSON fence 输出，需要更多重试机会。
+  const retries = opts.retries ?? 2;
+  const validate = opts.validate;
 
   let last: { exitCode: number; stdout: string; stderr: string } | null = null;
   for (let attempt = 0; attempt <= retries; attempt++) {
     const r = await spawn(args, { cwd: opts.cwd, env: opts.env, timeoutMs });
     last = r;
-    // claude 正常退出（exitCode=0）但产出「声称被拦截」的文本时，重试一次。
-    // 这是 claude CLI headless 模式对 cwd 外读取的非确定性行为（实测同命令有时成功有时声称被拦）。
-    if (r.exitCode === 0 && !looksBlocked(r.stdout) && attempt < retries) break;
-    if (r.exitCode !== 0 && attempt < retries) {
-      // 非 0 退出也重试一次（瞬时失败）。
-      continue;
-    }
-    break;
+    if (attempt >= retries) break; // 已是最后一次，不再判定重试
+    // 重试条件（任一满足则 continue 重试）：
+    //   ① 非 0 退出（含超时 124）
+    //   ② exitCode=0 但 looksBlocked（声称被拦截）
+    //   ③ exitCode=0 但 validate 返回 false（产出不符合契约，如该 JSON 却产了 markdown）
+    if (r.exitCode !== 0) continue;
+    if (looksBlocked(r.stdout)) continue;
+    if (validate && !validate(r.stdout)) continue;
+    break; // 全部通过 → 产物可用，跳出
   }
   const { exitCode, stdout, stderr } = last!;
 

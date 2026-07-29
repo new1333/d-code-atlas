@@ -55,8 +55,10 @@ export async function assemble(ctx: StageContext): Promise<StageResult> {
   try {
     outline = await readJson<Outline>(outlinePath(key));
   } catch (err) {
+    const msg = (err as Error).message ?? String(err);
     const failed = setStageStatus(manifest, "assemble", "failed", {
-      cmd: `(assemble 读 outline 失败) ${(err as Error).message}`,
+      cmd: `(assemble 读 outline 失败) ${msg}`,
+      error: msg,
     });
     await saveManifest(key, failed);
     return failed;
@@ -71,7 +73,11 @@ export async function assemble(ctx: StageContext): Promise<StageResult> {
 
   if (!outcome.ok) {
     // Assembler 失败 → stage failed（保留已生成的 site/，design §15）。
-    const failed = setStageStatus(m, "assemble", "failed", { cmd: outcome.cmd });
+    const failed = setStageStatus(m, "assemble", "failed", {
+      cmd: outcome.cmd,
+      exitCode: outcome.exitCode,
+      stderr: outcome.stderr,
+    });
     await saveManifest(key, failed);
     return failed;
   }
@@ -106,8 +112,10 @@ export async function assemble(ctx: StageContext): Promise<StageResult> {
 
   if (errors.length > 0) {
     // 校验失败 → stage failed（保留 site/）。
+    const joined = errors.join("; ").slice(-500);
     const failed = setStageStatus(m, "assemble", "failed", {
-      cmd: `(assemble 结构校验失败) ${errors.join("; ").slice(-500)}`,
+      cmd: `(assemble 结构校验失败) ${joined}`,
+      error: joined,
     });
     await saveManifest(key, failed);
     return failed;

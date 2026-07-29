@@ -136,6 +136,8 @@ export async function surveyor(opts: SurveyorOpts): Promise<SurveyorOutcome> {
     // 本地源在 cwd 之外，必须 --add-dir 声明，否则 claude Read/Glob/Grep 被拦截。
     // 同时声明 prompts 目录（角色 prompt 文件在 cwd 外，claude 可能 Read 它）。
     addDirs: agentAddDirs(!isGit ? sourcePath : undefined),
+    // validate：surveyor 必须产出可解析的 repo-map JSON。
+    validate: (stdout) => extractJson<RepoMap>(stdout) !== null,
   });
 
   // 从 stdout 提取 RepoMap（fence 优先，fallback 兜底；失败 null）。

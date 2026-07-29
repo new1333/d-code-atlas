@@ -10,10 +10,11 @@ import { describe, test, expect } from "bun:test";
 import {
   buildCmd,
   runClaude,
+  resolveClaudeBin,
   type ClaudeRunOptions,
   type SpawnFn,
 } from "../src/lib/run-claude.ts";
-import { READONLY_TOOLS, WRITE_TOOLS } from "../src/lib/config.ts";
+import { READONLY_TOOLS, WRITE_TOOLS, CLAUDE_BIN } from "../src/lib/config.ts";
 
 // ---------------------------------------------------------------------------
 // 假 spawn 工厂：记录收到的 args/cwd/env，返回预设 {exitCode,stdout,stderr}
@@ -78,11 +79,17 @@ describe("buildCmd · 只读模式", () => {
       cwd: ".",
       tools: "readonly",
     });
-    // args: flag 名与值分开。--dangerously-skip-permissions 为 headless 必需（见 buildCmd 注释）。
-    expect(args).toEqual(["-p", "hi", "--allowedTools", "Read,Glob,Grep", "--dangerously-skip-permissions"]);
-    // cmd 形态：claude -p "hi" --allowedTools Read,Glob,Grep --dangerously-skip-permissions
-    expect(cmd.startsWith("claude -p \"hi\" --allowedTools Read,Glob,Grep")).toBe(true);
-    expect(cmd.includes("--dangerously-skip-permissions")).toBe(true);
+    // args: flag 名与值分开。--permission-mode bypassPermissions 彻底跳过权限检查。
+    // 安全性由 --allowedTools 工具白名单保证。
+    expect(args).toEqual([
+      "-p", "hi",
+      "--allowedTools", "Read,Glob,Grep",
+      "--permission-mode", "bypassPermissions",
+    ]);
+    // cmd 形态：<CLAUDE_BIN> -p "hi" --allowedTools Read,Glob,Grep --permission-mode bypassPermissions
+    // CLAUDE_BIN 已被 resolveClaudeBin() 解析到真正可执行文件（如 .../claude.exe），不硬编码 "claude"。
+    expect(cmd.startsWith(`${CLAUDE_BIN} -p \"hi\" --allowedTools Read,Glob,Grep`)).toBe(true);
+    expect(cmd.includes("--permission-mode bypassPermissions")).toBe(true);
   });
 });
 
@@ -270,5 +277,35 @@ describe("runClaude · 逃逸口防御（端到端）", () => {
     expect(res.cmd.includes("--allowedTools Read,Glob,Grep")).toBe(true);
     expect(/(^|[\s,])Write([\s,]|$)/.test(res.cmd)).toBe(false);
     expect(/(^|[\s,])Edit([\s,]|$)/.test(res.cmd)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveClaudeBin：把 "claude" 解析到真正可执行文件（核心修复——根除 Windows 上
+// spawn 无扩展名 sh 包装脚本的偶发启动失败）
+// ---------------------------------------------------------------------------
+
+describe("resolveClaudeBin · 解析到真正可执行文件", () => {
+  test("ATLAS_CLAUDE_BIN 显式指定时直接返回（最高优先级）", () => {
+    const old = process.env.ATLAS_CLAUDE_BIN;
+    process.env.ATLAS_CLAUDE_BIN = "/custom/path/claude.exe";
+    try {
+      expect(resolveClaudeBin()).toBe("/custom/path/claude.exe");
+    } finally {
+      if (old === undefined) delete process.env.ATLAS_CLAUDE_BIN;
+      else process.env.ATLAS_CLAUDE_BIN = old;
+    }
+  });
+
+  test("未设 ATLAS_CLAUDE_BIN 时返回非空字符串（解析到 exe 或回退）", () => {
+    const old = process.env.ATLAS_CLAUDE_BIN;
+    delete process.env.ATLAS_CLAUDE_BIN;
+    try {
+      const bin = resolveClaudeBin();
+      expect(typeof bin).toBe("string");
+      expect(bin.length).toBeGreaterThan(0);
+    } finally {
+      if (old !== undefined) process.env.ATLAS_CLAUDE_BIN = old;
+    }
   });
 });

@@ -7,7 +7,7 @@
 // 原子写纪律：写 `{path}.tmp` 再 rename，杜绝半写文件（design §9 CAS 式写入）。
 // 零运行时依赖：仅用 bun/node 内置。
 
-import { mkdir, rename, stat } from "node:fs/promises";
+import { mkdir, rename, stat, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { dirname, resolve } from "node:path";

@@ -1,0 +1,337 @@
+{
+  "root": "work/source",
+  "sourceKind": "git-clone",
+  "languages": [
+    "ts",
+    "js",
+    "vue"
+  ],
+  "frameworks": [
+    "vue",
+    "nuxt",
+    "vitepress",
+    "vitest",
+    "vite"
+  ],
+  "entrypoints": [
+    "packages/pinia/src/index.ts",
+    "packages/nuxt/src/module.ts",
+    "packages/testing/src/index.ts"
+  ],
+  "manifests": [
+    "package.json",
+    "pnpm-workspace.yaml",
+    "tsconfig.json",
+    "vitest.config.ts",
+    "codecov.yml",
+    "netlify.toml",
+    ".oxfmtrc.json",
+    "packages/pinia/package.json",
+    "packages/pinia/tsdown.config.ts",
+    "packages/pinia/test-dts/tsconfig.json",
+    "packages/nuxt/package.json",
+    "packages/nuxt/tsconfig.json",
+    "packages/testing/package.json",
+    "packages/testing/tsdown.config.ts",
+    "packages/testing/tsconfig.build.json",
+    "packages/docs/package.json",
+    "packages/docs/vite.config.ts",
+    "packages/docs/typedoc.tsconfig.json",
+    "packages/playground/package.json",
+    "packages/playground/tsconfig.json",
+    "packages/online-playground/package.json",
+    "packages/online-playground/vite.config.ts",
+    "packages/online-playground/tsconfig.json",
+    "packages/size-check/package.json"
+  ],
+  "packages": [
+    {
+      "name": "pinia",
+      "path": "packages/pinia"
+    },
+    {
+      "name": "@pinia/nuxt",
+      "path": "packages/nuxt"
+    },
+    {
+      "name": "@pinia/testing",
+      "path": "packages/testing"
+    },
+    {
+      "name": "@pinia/docs",
+      "path": "packages/docs"
+    },
+    {
+      "name": "@pinia/private-playground",
+      "path": "packages/playground"
+    },
+    {
+      "name": "@pinia/playground",
+      "path": "packages/online-playground"
+    },
+    {
+      "name": "@pinia/size-check",
+      "path": "packages/size-check"
+    }
+  ],
+  "tree": [
+    {
+      "path": "packages",
+      "type": "dir"
+    },
+    {
+      "path": "scripts",
+      "type": "dir"
+    },
+    {
+      "path": "package.json",
+      "type": "file"
+    },
+    {
+      "path": "pnpm-workspace.yaml",
+      "type": "file"
+    },
+    {
+      "path": "tsconfig.json",
+      "type": "file"
+    },
+    {
+      "path": "vitest.config.ts",
+      "type": "file"
+    },
+    {
+      "path": "README.md",
+      "type": "file"
+    },
+    {
+      "path": "packages/pinia",
+      "type": "dir"
+    },
+    {
+      "path": "packages/pinia/src",
+      "type": "dir"
+    },
+    {
+      "path": "packages/pinia/src/index.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/pinia/src/createPinia.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/pinia/src/rootStore.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/pinia/src/store.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/pinia/src/storeToRefs.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/pinia/src/mapHelpers.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/pinia/src/hmr.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/pinia/src/subscriptions.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/pinia/src/types.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/pinia/src/diagnostics.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/pinia/src/env.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/pinia/src/globalExtensions.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/pinia/src/devtools",
+      "type": "dir"
+    },
+    {
+      "path": "packages/pinia/src/devtools/plugin.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/pinia/__tests__",
+      "type": "dir"
+    },
+    {
+      "path": "packages/pinia/test-dts",
+      "type": "dir"
+    },
+    {
+      "path": "packages/pinia/package.json",
+      "type": "file"
+    },
+    {
+      "path": "packages/pinia/tsdown.config.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/nuxt",
+      "type": "dir"
+    },
+    {
+      "path": "packages/nuxt/src",
+      "type": "dir"
+    },
+    {
+      "path": "packages/nuxt/src/module.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/nuxt/src/auto-hmr-plugin.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/nuxt/src/runtime",
+      "type": "dir"
+    },
+    {
+      "path": "packages/nuxt/src/runtime/plugin.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/nuxt/src/runtime/composables.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/nuxt/src/runtime/payload-plugin.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/nuxt/package.json",
+      "type": "file"
+    },
+    {
+      "path": "packages/testing",
+      "type": "dir"
+    },
+    {
+      "path": "packages/testing/src",
+      "type": "dir"
+    },
+    {
+      "path": "packages/testing/src/index.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/testing/src/testing.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/testing/src/restoreGetters.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/testing/src/diagnostics.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/testing/package.json",
+      "type": "file"
+    },
+    {
+      "path": "packages/docs",
+      "type": "dir"
+    },
+    {
+      "path": "packages/docs/.vitepress",
+      "type": "dir"
+    },
+    {
+      "path": "packages/docs/cookbook",
+      "type": "dir"
+    },
+    {
+      "path": "packages/docs/core-concepts",
+      "type": "dir"
+    },
+    {
+      "path": "packages/docs/ssr",
+      "type": "dir"
+    },
+    {
+      "path": "packages/docs/zh",
+      "type": "dir"
+    },
+    {
+      "path": "packages/docs/package.json",
+      "type": "file"
+    },
+    {
+      "path": "packages/playground",
+      "type": "dir"
+    },
+    {
+      "path": "packages/playground/src",
+      "type": "dir"
+    },
+    {
+      "path": "packages/playground/src/stores",
+      "type": "dir"
+    },
+    {
+      "path": "packages/playground/package.json",
+      "type": "file"
+    },
+    {
+      "path": "packages/online-playground",
+      "type": "dir"
+    },
+    {
+      "path": "packages/online-playground/src",
+      "type": "dir"
+    },
+    {
+      "path": "packages/online-playground/package.json",
+      "type": "file"
+    },
+    {
+      "path": "packages/size-check",
+      "type": "dir"
+    },
+    {
+      "path": "packages/size-check/package.json",
+      "type": "file"
+    }
+  ],
+  "docs": [
+    "README.md",
+    "SECURITY.md",
+    "packages/pinia/README.md",
+    "packages/pinia/CHANGELOG.md",
+    "packages/nuxt/README.md",
+    "packages/nuxt/CHANGELOG.md",
+    "packages/testing/README.md",
+    "packages/testing/CHANGELOG.md",
+    "packages/online-playground/README.md",
+    "packages/docs/index.md",
+    "packages/docs/introduction.md",
+    "packages/docs/getting-started.md",
+    "packages/docs/core-concepts/index.md",
+    "packages/docs/cookbook/index.md",
+    "packages/docs/ssr/index.md",
+    ".github/CONTRIBUTING.md",
+    ".github/CODE_OF_CONDUCT.md"
+  ]
+}
