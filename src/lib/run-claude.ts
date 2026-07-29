@@ -103,7 +103,19 @@ export interface ClaudeRunOptions {
 
 /** 一次 claude agent 调用的结构化结果（成功/失败/超时均返回，不抛）。 */
 export interface ClaudeResult {
-  /** exitCode===0 为 true；否则（含超时 124）为 false。 */
+  /**
+   * **综合成功判定**（不只是 exitCode）：`exitCode===0` **且** 产物校验通过。
+   *
+   * 治本设计（应对 claude headless「假成功」）：
+   *   claude headless 偶发 `exitCode=0` 正常退出，却没真正产出/落盘
+   *   （最典型：Assembler 该用 Write 工具落盘 site/ 却「声称完成」一个字没写；
+   *   或 Writer 该产 fence 却空回复）。重试用尽后，**退出码=0 不等于成功**。
+   *
+   * 当调用方提供 `validate` 时，`ok` 还要求最后一次尝试的 `validate(stdout)` 通过；
+   * 未提供 `validate` 时退化为 `exitCode===0`（兼容只关心退出码的调用方）。
+   *
+   * 同时 `validated` 字段暴露最后一次校验是否通过，便于上层精确诊断。
+   */
   ok: boolean;
   /** 子进程退出码；超时为 124。 */
   exitCode: number;
@@ -113,6 +125,12 @@ export interface ClaudeResult {
   stderr: string;
   /** 规范化命令串（供 manifest 记录 + AC-7 核验扫描）。 */
   cmd: string;
+  /**
+   * 最后一次尝试的产物校验结果（`validate(stdout)`）。
+   * 未提供 `validate` 时恒为 true。退出码=0 但 validated=false 即「假成功」，
+   * 上层可据此把 stderr 补成可诊断信息（而非只剩空 stderr）。
+   */
+  validated: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -312,27 +330,46 @@ export async function runClaude(opts: ClaudeRunOptions): Promise<ClaudeResult> {
   const validate = opts.validate;
 
   let last: { exitCode: number; stdout: string; stderr: string } | null = null;
+  // 记最后一次尝试的产物校验结果（validate 是否通过）。
+  // ok 判定不仅看退出码，还要看 validate——治本：识破 claude headless
+  // 「exitCode=0 但没真正产出/落盘」的假成功（如 Assembler 不调 Write）。
+  let lastValidated = true;
   for (let attempt = 0; attempt <= retries; attempt++) {
     const r = await spawn(args, { cwd: opts.cwd, env: opts.env, timeoutMs });
     last = r;
+    // 本轮产物校验（未提供 validate 则视为通过）。
+    const validated = validate ? validate(r.stdout) : true;
+    lastValidated = validated;
     if (attempt >= retries) break; // 已是最后一次，不再判定重试
     // 重试条件（任一满足则 continue 重试）：
     //   ① 非 0 退出（含超时 124）
     //   ② exitCode=0 但 looksBlocked（声称被拦截）
-    //   ③ exitCode=0 但 validate 返回 false（产出不符合契约，如该 JSON 却产了 markdown）
+    //   ③ exitCode=0 但 validate 返回 false（产出不符合契约，如该 JSON 却产了 markdown，
+    //      或 write 类 agent 该落盘却没落盘——配合调用方在 validate 里检查磁盘产物）
     if (r.exitCode !== 0) continue;
     if (looksBlocked(r.stdout)) continue;
-    if (validate && !validate(r.stdout)) continue;
+    if (!validated) continue;
     break; // 全部通过 → 产物可用，跳出
   }
   const { exitCode, stdout, stderr } = last!;
 
+  // 假成功兜底：退出码=0 但产物校验失败时，stderr 往往是空的，
+  // 上层只靠 stderr 诊断会一脸懵（正是 assemble failed 只剩「site/ 不存在」的根因）。
+  // 这里补一条明确诊断，让 manifest 的 stderr 字段直接说明「假成功」。
+  const finalStderr = exitCode === 0 && !lastValidated
+    ? (stderr && stderr.length > 0
+        ? `${stderr}\n[run-claude] claude 以 exitCode=0 退出，但产物校验（validate）失败——疑似未真正产出/落盘。`
+        : `[run-claude] claude 以 exitCode=0 退出，但产物校验（validate）失败——疑似未真正产出/落盘（stdout 长度 ${stdout.length}）。`)
+    : stderr;
+
   return {
-    ok: exitCode === 0,
+    // ok = 退出码正常 **且** 产物校验通过。二者缺一即失败，交上层处理。
+    ok: exitCode === 0 && lastValidated,
     exitCode,
     stdout,
-    stderr,
+    stderr: finalStderr,
     cmd,
+    validated: lastValidated,
   };
 }
 

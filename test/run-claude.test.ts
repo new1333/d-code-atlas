@@ -263,6 +263,101 @@ describe("runClaude · 结构化结果（不抛）", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// runClaude · validate 兜底（治本：识破 claude headless「假成功」）
+// ---------------------------------------------------------------------------
+// 核心修复回归保护：claude headless 偶发 exitCode=0 正常退出却没真正产出
+// （最典型：write 类 agent 该用 Write 工具落盘却「声称完成」一个字没写）。
+// 历史 bug：ok 仅看 exitCode，导致假成功透传，下游才在校验/落盘时炸
+// （pinia run assemble failed 的根因）。修复后：validate 失败 → 重试用尽 → ok=false。
+// ---------------------------------------------------------------------------
+
+describe("runClaude · validate 兜底（假成功治理）", () => {
+  test("exitCode=0 但 validate 恒失败：ok=false、validated=false、stderr 带诊断", async () => {
+    const calls: SpawnCall[] = [];
+    // 假 spawn：每次都正常退出（模拟 claude「声称完成」），但产物无效。
+    const fake = makeFakeSpawn(calls, {
+      exitCode: 0,
+      stdout: "（声称）site/ 已组装完成",
+      stderr: "",
+    });
+    const res = await runClaude({
+      prompt: "assemble site",
+      cwd: "atlas/x/",
+      tools: "write",
+      spawn: fake,
+      retries: 2, // 共 3 次尝试
+      // validate 恒失败（模拟 site/ 关键文件根本没落盘）。
+      validate: () => false,
+    });
+    // 三次尝试都用完了（每次 validate 都失败 → 都重试）。
+    expect(calls.length).toBe(3);
+    // 治本核心：退出码是 0，但 ok 必须是 false（不再假成功）。
+    expect(res.exitCode).toBe(0);
+    expect(res.ok).toBe(false);
+    expect(res.validated).toBe(false);
+    // stderr 补了可诊断信息（历史 bug 里 stderr 为空，只剩下游「site/ 不存在」）。
+    expect(res.stderr).toContain("validate");
+    expect(res.stderr).toContain("产物校验");
+  });
+
+  test("exitCode=0 且 validate 通过：ok=true、validated=true（正常路径不回归）", async () => {
+    const calls: SpawnCall[] = [];
+    const fake = makeFakeSpawn(calls, {
+      exitCode: 0,
+      stdout: "ok",
+      stderr: "",
+    });
+    const res = await runClaude({
+      prompt: "x",
+      cwd: "atlas/x/",
+      tools: "readonly",
+      spawn: fake,
+      validate: () => true,
+    });
+    expect(res.ok).toBe(true);
+    expect(res.validated).toBe(true);
+    expect(calls.length).toBe(1); // 一次就过，不重试
+  });
+
+  test("第一次 validate 失败、第二次通过：重试一次后成功，ok=true", async () => {
+    const calls: SpawnCall[] = [];
+    let n = 0;
+    const fake = makeFakeSpawn(calls, () => {
+      n++;
+      return {
+        exitCode: 0,
+        stdout: n === 1 ? "空回复" : "````markdown\n正文\n````",
+        stderr: "",
+      };
+    });
+    const res = await runClaude({
+      prompt: "x",
+      cwd: "atlas/x/",
+      tools: "readonly",
+      spawn: fake,
+      retries: 2,
+      // 第一次空回复 → 提取不到 fence → 失败重试；第二次有 fence → 通过。
+      validate: (stdout) => stdout.includes("```"),
+    });
+    expect(res.ok).toBe(true);
+    expect(res.validated).toBe(true);
+    expect(calls.length).toBe(2); // 重试了一次
+  });
+
+  test("未提供 validate：退化为 exitCode 判定（ok=exitCode===0），validated 恒 true", async () => {
+    const fake = makeFakeSpawn([], { exitCode: 0, stdout: "any", stderr: "" });
+    const res = await runClaude({
+      prompt: "x",
+      cwd: "atlas/x/",
+      tools: "readonly",
+      spawn: fake,
+    });
+    expect(res.ok).toBe(true);
+    expect(res.validated).toBe(true);
+  });
+});
+
 describe("runClaude · 逃逸口防御（端到端）", () => {
   test("readonly 全量选项：返回的 cmd 仍无 Write/Edit", async () => {
     const fake = makeFakeSpawn([], { exitCode: 0, stdout: "", stderr: "" });

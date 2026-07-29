@@ -532,10 +532,16 @@ describe("assembler", () => {
       await writeJson(outlinePath("demo"), outline);
 
       const calls: SpawnCall[] = [];
-      const spawn = makeFakeSpawn(calls, {
-        exitCode: 0,
-        stdout: "已组装 site/",
-        stderr: "",
+      // 假 spawn 必须真正创建 site/ 脚手架文件——修复后 assembler 会校验磁盘产物
+      // （历史只看退出码，老测试只回 stdout 即可；现在要模拟 claude 确实 Write 落盘）。
+      const site = `${runDir("demo")}site/`;
+      const { writeFileSync, mkdirSync } = await import("node:fs");
+      const spawn = makeFakeSpawn(calls, (call) => {
+        mkdirSync(`${site}.vitepress`, { recursive: true });
+        writeFileSync(`${site}package.json`, "{}");
+        writeFileSync(`${site}index.md`, "# 首页");
+        writeFileSync(`${site}.vitepress/config.ts`, "export default {}");
+        return { exitCode: 0, stdout: "已组装 site/", stderr: "" };
       });
 
       const r = await assembler({ key: "demo", spawn });
@@ -598,6 +604,77 @@ describe("assembler", () => {
       expect(r.exitCode).toBe(-1);
       expect(calls.length).toBe(0);
       expect(r.stderr).toContain("topoOrder");
+    } finally {
+      process.chdir(origCwd);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // 假成功治理（治本回归保护）：复现 pinia run assemble failed 的根因——
+  // claude headless 「exitCode=0 正常退出却没调 Write 工具」，site/ 根本没被创建。
+  // 历史 bug：runClaude.ok 仅看退出码 → 假成功透传 → stage 校验才发现 site/ 不存在 → halt。
+  // 修复后：assembler 的 validate（检查磁盘脚手架文件）识破假成功 → 重试用尽 → ok=false。
+  // -------------------------------------------------------------------------
+  test("假成功检测：claude exitCode=0 但没落盘 site/ → 重试用尽、ok=false、stderr 可诊断", async () => {
+    const origCwd = process.cwd();
+    process.chdir(tmpRoot);
+    try {
+      await writeJson(outlinePath("demo"), {
+        repo: "demo",
+        generatedAt: "1970-01-01T00:00:00Z",
+        chapters: [
+          { slug: "a", title: "A", layer: "primitive", dependsOn: [], sourceFiles: [], summary: "" },
+        ],
+        topoOrder: ["a"],
+      });
+      const calls: SpawnCall[] = [];
+      // 假 spawn：每次都「声称完成」、正常退出，但【不创建任何 site/ 文件】
+      // （模拟 claude headless 不调 Write 工具）。stdout 含典型措辞但不触发 looksBlocked。
+      const spawn = makeFakeSpawn(calls, {
+        exitCode: 0,
+        stdout: "site/ 已组装完成。",
+        stderr: "",
+      });
+      const r = await assembler({ key: "demo", spawn });
+      // retries=3 → 共 4 次尝试，每次 validate 都发现 site/ 缺失 → 都重试。
+      expect(calls.length).toBe(4);
+      // 治本核心：退出码 0，但 ok 必须 false（不再假成功透传给 stage）。
+      expect(r.exitCode).toBe(0);
+      expect(r.ok).toBe(false);
+      // stderr 有可诊断信息（历史 bug 只剩 stage 层「site/ 不存在」，这里前置暴露）。
+      expect(r.stderr.length).toBeGreaterThan(0);
+    } finally {
+      process.chdir(origCwd);
+    }
+  });
+
+  test("真成功：claude 正常退出且落盘脚手架文件 → ok=true（正常路径不回归）", async () => {
+    const origCwd = process.cwd();
+    process.chdir(tmpRoot);
+    try {
+      await writeJson(outlinePath("demo"), {
+        repo: "demo",
+        generatedAt: "1970-01-01T00:00:00Z",
+        chapters: [
+          { slug: "a", title: "A", layer: "primitive", dependsOn: [], sourceFiles: [], summary: "" },
+        ],
+        topoOrder: ["a"],
+      });
+      const calls: SpawnCall[] = [];
+      const site = `${runDir("demo")}site/`;
+      // 假 spawn 在返回前【真正创建】脚手架文件，模拟 claude 确实用 Write 落盘。
+      const { writeFileSync, mkdirSync } = await import("node:fs");
+      const spawn = makeFakeSpawn(calls, (call) => {
+        mkdirSync(site, { recursive: true });
+        mkdirSync(`${site}.vitepress`, { recursive: true });
+        writeFileSync(`${site}package.json`, "{}");
+        writeFileSync(`${site}index.md`, "# hi");
+        writeFileSync(`${site}.vitepress/config.ts`, "export default {}");
+        return { exitCode: 0, stdout: "done", stderr: "" };
+      });
+      const r = await assembler({ key: "demo", spawn });
+      expect(r.ok).toBe(true);
+      expect(calls.length).toBe(1); // 一次就过，validate 通过不重试
     } finally {
       process.chdir(origCwd);
     }

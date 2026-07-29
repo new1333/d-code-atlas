@@ -879,7 +879,14 @@ describe("06-assemble · site 结构校验", () => {
 
     const next = await assemble(ctxFor(key, m, spawn));
     expect(next.stages.assemble.status).toBe("failed");
-    expect(next.stages.assemble.cmd).toContain("结构校验失败");
+    // 缺 config.ts 现在会被 assembler 的 validate 提前拦截（更早、更可诊断），
+    // 走 assembler 失败分支（cmd = claude 命令串）；而不再走到 stage 的「结构校验失败」分支。
+    // 两条路径最终都是 failed + 保留 site/，核心意图（识别结构不全、保留产物）不变。
+    // 这里接受任一分支：cmd 要么是 claude 命令串（assembler 拦截），要么含「结构校验失败」（stage 拦截）。
+    const cmd = next.stages.assemble.cmd ?? "";
+    const isAssemblerCaught = cmd.startsWith("C:") || cmd.includes("--allowedTools");
+    const isStageCaught = cmd.includes("结构校验失败");
+    expect(isAssemblerCaught || isStageCaught).toBe(true);
     // 保留已生成的 site/。
     expect(await pathExists(joinPath(siteDir(key), "index.md"))).toBe(true);
   });

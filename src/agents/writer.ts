@@ -124,7 +124,10 @@ export async function writer(opts: WriterOpts): Promise<WriterOutcome> {
     // 导致 writer 卡在"等授权读源码"。必须显式声明 sourceDir。
     addDirs: [wdir, sourceDir(key)],
     timeoutMs: 15 * 60 * 1000,
-    retries: 0,
+    // retries：claude headless 偶发「声称被拦」/空回复（不产 fence）→ validate 触发重试。
+    // 历史为 0（无重试），导致偶发失败直接判 fail（pinia run 的 diagnostics/pinia-instance 两章即如此）。
+    // 与其它 agent 对齐给重试机会；validate（fence 提取）保证重试只在产出无效时发生。
+    retries: 2,
     // validate：必须产出 4 反引号 markdown fence。
     validate: (stdout) => extractFence(stdout, "markdown") !== null,
   });

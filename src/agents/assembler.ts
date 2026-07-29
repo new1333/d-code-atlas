@@ -18,7 +18,8 @@
 // 序列化进 user prompt，让 Assembler 直接用（保证严格遵循 topoOrder）。
 
 import { runClaude } from "../lib/run-claude.ts";
-import { runDir, outlinePath, readJson } from "../lib/io.ts";
+import { runDir, outlinePath, readJson, siteDir, joinPath } from "../lib/io.ts";
+import { existsSync } from "node:fs";
 import type { Outline } from "../lib/types.ts";
 import { promptPath, type AgentOutcome, type AgentCommonOpts } from "./types.ts";
 
@@ -134,6 +135,26 @@ export async function assembler(opts: AssemblerOpts): Promise<AssemblerOutcome> 
     "  ⑥ 未越界：未改任何 draft.md 内容、未写 work/、未写 source/。",
   ].join("\n");
 
+  // site/ 关键产物路径（validate 与兜底核验共用）。
+  const site = siteDir(key);
+  const scaffoldFiles = [
+    joinPath(site, "package.json"),
+    joinPath(site, "index.md"),
+    joinPath(site, ".vitepress/config.ts"),
+  ];
+
+  // validate：claude headless「假成功」治理（治本）。
+  // Assembler 的产物在磁盘（不是 stdout），Claude 正常退出（exitCode=0）却没调 Write 工具时，
+  // site/ 根本不会被创建——这正是 pinia run assemble failed 的根因。
+  // 这里在每次 spawn 尝试后**同步检查关键脚手架文件是否落盘**；缺失即让 runClaude 重试，
+  // 重试用尽后 runClaude.ok 会因 validated=false 返回 false（而非历史假成功 true）。
+  const validateScaffold = (): boolean => {
+    for (const f of scaffoldFiles) {
+      if (!existsSync(f)) return false;
+    }
+    return true;
+  };
+
   const result = await runClaude({
     prompt,
     systemPromptPath,
@@ -144,7 +165,25 @@ export async function assembler(opts: AssemblerOpts): Promise<AssemblerOutcome> 
     // assembler 生成整个 site 骨架（VitePress 配置 + 侧边栏 + 首页），耗时较长；给 25 分钟 + 多重试。
     timeoutMs: 25 * 60 * 1000,
     retries: 3,
+    // validate：忽略 stdout（site/ 落盘 claude 只回简短确认），只看磁盘关键文件是否齐备。
+    validate: () => validateScaffold(),
   });
+
+  // 双保险兜底：即便 runClaude 已用 validate 判过，最终再核验一次磁盘最终态。
+  // （理论冗余：runClaude.ok 已含 validated；此处显式再校一遍，让 return 的 ok
+  //   完全立足于磁盘真相，并给出精确缺失清单写入 stderr，便于 manifest 诊断。）
+  if (result.ok) {
+    const missing = scaffoldFiles.filter((f) => !existsSync(f));
+    if (missing.length > 0) {
+      return {
+        ok: false,
+        cmd: result.cmd,
+        stdout: result.stdout,
+        stderr: `assembler: claude 声称完成但 site/ 关键文件缺失: ${missing.join(", ")}`,
+        exitCode: result.exitCode,
+      };
+    }
+  }
 
   return {
     ok: result.ok,
