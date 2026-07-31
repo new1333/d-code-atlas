@@ -232,6 +232,21 @@ bun run docs:build     # 构建到 .vitepress/dist/
 
 构建产物 `site/.vitepress/dist/` 可直接部署到 Vercel / Netlify / GitHub Pages 等任意静态托管。
 
+### 自动化部署（多站点一键发布）
+
+仓库内置多站点发布脚本，遍历 `atlas/*/site/` 逐个构建：
+
+```bash
+bun scripts/publish-sites.mjs   # 全部站点构建到 dist-sites/<key>/
+```
+
+脚本为每个站点注入 `/key/` 子路径 base（仅构建期生效，config.ts 随后还原），并生成根 `index.html` 聚合入口。
+配合 `.github/workflows/deploy-sites.yml`：推送 `dev` 且改动涉及 `atlas/*/site/**` 时自动构建并发布到
+GitHub Pages（`https://<owner>.github.io/d-code-atlas/<key>/`）。
+
+首次使用：仓库 **Settings → Pages** 选择 *Deploy from a branch* → `gh-pages` / `(root)`，
+然后在 Actions 页手动跑一次 *Deploy Atlas Sites*（之后推送站点变更即全自动）。
+
 ---
 
 ## 6. 续跑与中断恢复（核心特性）

@@ -7,6 +7,9 @@ atlas/*/site/node_modules/
 atlas/*/site/.vitepress/dist/
 atlas/*/site/.vitepress/cache/
 
+# multi-site publish output (scripts/publish-sites.mjs)
+dist-sites/
+
 # logs
 *.log
 

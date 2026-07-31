@@ -1,0 +1,38 @@
+name: Deploy Atlas Sites
+
+# dev 分支上任何 atlas/*/site/** 变化（新 Run 生成站点或章节更新）时自动构建全部站点并发布；
+# 也可在 Actions 页手动触发（Run workflow）。
+on:
+  push:
+    branches: [dev]
+    paths:
+      - "atlas/**/site/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: atlas-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Build all atlas sites
+        run: bun scripts/publish-sites.mjs
+
+      - name: Deploy to GitHub Pages (gh-pages branch)
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist-sites
+          publish_branch: gh-pages
+          force_orphan: true
