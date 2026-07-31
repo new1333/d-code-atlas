@@ -1,0 +1,214 @@
+{
+  "repo": "pinia",
+  "generatedAt": "2026-07-29T07:48:08.739Z",
+  "chapters": [
+    {
+      "slug": "active-pinia",
+      "title": "全局活跃指针与 Pinia 实例契约",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "packages/pinia/src/rootStore.ts"
+      ],
+      "summary": "用一个模块级 activePinia 变量配合 setActivePinia/getActivePinia 持有「当前活跃 Pinia」，让 useStore() 能在组件注入上下文之外（store 互引、SSR 的 setup/fetch）拿到实例。关键权衡：全局指针换「无需层层传 pinia」的便利，代价是服务端多请求须显式 setActivePinia 防串污染；getActivePinia 优先 inject(piniaSymbol)、回退 activePinia，兼顾组件内与组件外两条取用路径"
+    },
+    {
+      "slug": "subscription-primitive",
+      "title": "订阅原语：回调集合与作用域自动清理",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "packages/pinia/src/subscriptions.ts"
+      ],
+      "summary": "addSubscription/triggerSubscriptions 是支撑 $subscribe/$onAction 的通用订阅原语：用 Set 持有回调、返回 remove 函数；非 detached 订阅靠 onScopeDispose 随所在 effectScope 自动注销。关键权衡：默认「随作用域自动清理」换防泄漏的便利，代价是需要跨作用域存活时必须显式 detached 并自行管理卸载"
+    },
+    {
+      "slug": "pinia-instance",
+      "title": "createPinia：effectScope 状态根与插件装载",
+      "layer": "composite",
+      "dependsOn": [
+        "active-pinia"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/createPinia.ts"
+      ],
+      "summary": "Pinia 实例 = 一个 Vue 插件 + 一个 effectScope(true) 包住的扁平状态字典 state.value[storeId]，所有 store 的响应式副作用都挂在这个可停止的 scope 下。关键权衡：用扁平字典（而非按 store 嵌套）牺牲结构换 SSR 序列化与 $patch 的统一寻址；use(plugin) 在 install 前暂存、install 后统一入队 _p，换来「插件顺序与注册时机无关」的确定性，disposePinia 则靠 stop(scope) 一键回收"
+    },
+    {
+      "slug": "define-store",
+      "title": "defineStore：useStore 工厂与懒实例化",
+      "layer": "composite",
+      "dependsOn": [
+        "pinia-instance"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/store.ts",
+        "packages/pinia/src/types.ts"
+      ],
+      "summary": "defineStore 不立即建 store，而是返回 useStore 闭包；首次调用时从 inject/activePinia 取到 pinia，仅当 _s 无此 id 才触发装配，由此得到「懒创建 + 单例缓存」。关键权衡：三个重载把 options/setup 双形态统一进同一个 useStore 入口；__TEST__ 模式忽略传入 pinia 以适配 testing pinia 的 activePinia 旁路"
+    },
+    {
+      "slug": "store-assembly",
+      "title": "store 装配机器：双形态归一与属性自动分类",
+      "layer": "composite",
+      "dependsOn": [
+        "define-store",
+        "subscription-primitive"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/store.ts"
+      ],
+      "summary": "createSetupStore 是唯一装配器——options store 经一个 setup() 适配器也归一到它；遍历 setup 返回值按 isRef&&!isComputed(state)/isComputed(getter)/function(action) 三分支自动分类，并把 ref 迁入 pinia.state.value 保持单一真源。关键权衡：「创建中途先 _s.set(id, store) 占位」换 store 间互引不死循环，代价是 getter 内须懒取 pinia._s.get(id)；最终 reactive(partialStore) 把 store 包成响应式对象"
+    },
+    {
+      "slug": "state-patch",
+      "title": "$patch：状态变更与深度合并",
+      "layer": "composite",
+      "dependsOn": [
+        "store-assembly"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/store.ts"
+      ],
+      "summary": "$patch 同时支持函数 mutator 与偏对象两种形态；偏对象经 mergeReactiveObjects 递归合并（处理 Map/Set、整体替换 ref/reactive）而非浅覆盖。关键权衡：变更时先暂停 isListening watcher 再手动 triggerSubscriptions，换「一次 patch = 一个订阅事件」而非每属性一事件；深度合并保旧子树 vs ref/reactive 整体替换保引用语义，nextTick 后再恢复监听"
+    },
+    {
+      "slug": "subscriptions-actions",
+      "title": "$subscribe 与 $onAction：状态及动作订阅",
+      "layer": "composite",
+      "dependsOn": [
+        "store-assembly",
+        "subscription-primitive"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/store.ts"
+      ],
+      "summary": "$subscribe = watch(pinia.state.value[id]) + 同回调去重（只注册一次）；$onAction 靠 action() 包装器在每次调用前后触发 before/after/onError 回调集并兼容 Promise 的 then/catch。关键权衡：action 包装既注入 setActivePinia 又挂载拦截钩子，是 devtools timeline 与 testing spy 的统一挂载点；去重避免重复订阅，detached 选项让订阅脱离组件生命周期"
+    },
+    {
+      "slug": "store-to-refs",
+      "title": "storeToRefs：响应式引用的按型重建",
+      "layer": "composite",
+      "dependsOn": [
+        "store-assembly"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/storeToRefs.ts"
+      ],
+      "summary": "store 是 reactive 对象、直接解构会丢响应性；storeToRefs 遍历 toRaw(store) 按 value.effect(computed) 与 isRef||isReactive(state) 重建 ref/computed 链接，忽略方法与非响应式属性。关键权衡：getter 被重新包成 get/set 委托 store 的可写 computed，而非直接返回原 computed，以此保持新 ref 的生命周期独立于 store 首次创建时机"
+    },
+    {
+      "slug": "plugin-system",
+      "title": "插件系统：store 扩展点与混入",
+      "layer": "composite",
+      "dependsOn": [
+        "store-assembly"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/store.ts",
+        "packages/pinia/src/rootStore.ts",
+        "packages/pinia/src/globalExtensions.ts"
+      ],
+      "summary": "PiniaPlugin 在每个 store 装配末尾按 _p 顺序执行，其返回对象经 assign 混入 store——这是 devtools/testing 共用的唯一扩展点。关键权衡：插件返回的非响应式对象会被 storeToRefs 忽略（diagnostics 警告 PINIA_R1006），迫使用户用 ref/markRaw 表达意图；globalExtensions 用 declare module 让用户以声明合并扩展 PiniaCustomProperties 类型"
+    },
+    {
+      "slug": "hmr",
+      "title": "HMR：保持引用的热迁移",
+      "layer": "composite",
+      "dependsOn": [
+        "state-patch",
+        "store-assembly"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/hmr.ts",
+        "packages/pinia/src/store.ts"
+      ],
+      "summary": "acceptHMRUpdate 先建一个 __hot:id 临时 store，再经 _hotUpdate 把新 state/action/getter 迁移进旧实例——保持组件已持有的 store 引用不变。关键权衡：option store 用 patchObject 深度合并以保留旧值，setup store 则整体转移 ref 以防运行时新增属性丢失；_hotUpdating 标志在迁移期间暂停订阅，避免热更新被当作普通变更重复广播"
+    },
+    {
+      "slug": "map-helpers",
+      "title": "mapHelpers：Options API 适配",
+      "layer": "system",
+      "dependsOn": [
+        "define-store"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/mapHelpers.ts"
+      ],
+      "summary": "mapStores/mapState/mapActions/mapWritableState 为不用 Composition API 的用户生成可展开进 computed/methods 的访问器，每个映射本质是 function(){ return useStore(this.$pinia)[key] }，把 store 取用延迟到组件实例上下文。关键权衡：靠 this.$pinia 绑定换「无需 setup」的便利，代价是须用 mapWritableState 显式区分可写 state 与只读 getter"
+    },
+    {
+      "slug": "devtools",
+      "title": "Vue Devtools 集成",
+      "layer": "system",
+      "dependsOn": [
+        "subscriptions-actions",
+        "plugin-system"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/devtools/plugin.ts",
+        "packages/pinia/src/devtools/actions.ts",
+        "packages/pinia/src/devtools/index.ts"
+      ],
+      "summary": "devtoolsPlugin 作为一个普通 pinia 插件接入，复用 $subscribe/$onAction 把 store 变更桥接为 Vue Devtools 的 inspector 树与 timeline 事件。关键权衡：用 Proxy 包裹 action context（patchActionForGrouping）把状态变更归因到触发它的 action（timeline groupId）；detached+sync 订阅读取可靠事件时序，isTimelineActive 标志防止 devtools 自身编辑触发循环事件"
+    },
+    {
+      "slug": "testing-pinia",
+      "title": "测试替身：作为插件链的 spy 注入",
+      "layer": "system",
+      "dependsOn": [
+        "pinia-instance",
+        "plugin-system"
+      ],
+      "sourceFiles": [
+        "packages/testing/src/testing.ts",
+        "packages/testing/src/restoreGetters.ts"
+      ],
+      "summary": "createTestingPinia 不另起一套实现，而是往 _p 推一组「排在最后」的插件：用 createSpy 替换 action/$patch/$reset，WritableComputed 插件改写 computed 让只读 getter 可被测试覆写，_testing 标志旁路 useStore(pinia)。关键权衡：因插件在 install 时才入队，必须 fakeApp/app.use 才能触发替换；stubActions 支持 boolean/array/predicate 三种粒度以匹配不同测试策略"
+    },
+    {
+      "slug": "nuxt-ssr",
+      "title": "Nuxt SSR：payload 序列化与自动导入",
+      "layer": "system",
+      "dependsOn": [
+        "pinia-instance",
+        "state-patch"
+      ],
+      "sourceFiles": [
+        "packages/nuxt/src/module.ts",
+        "packages/nuxt/src/runtime/plugin.ts",
+        "packages/nuxt/src/runtime/payload-plugin.ts",
+        "packages/nuxt/src/runtime/composables.ts",
+        "packages/nuxt/src/auto-hmr-plugin.ts"
+      ],
+      "summary": "SSR 状态经 Nuxt payload 传递：runtime/plugin 在服务端 app:rendered 把 pinia.state.value 塞进 payload、客户端从 payload 整体恢复，扁平 state 字典天然可序列化。关键权衡：payload-plugin 用 skipHydrate reducer 在序列化时剔除不需 hydrate 的值以减小传输；auto-hmr-plugin 在编译期 AST 扫描 defineStore 调用、自动注入 acceptHMRUpdate，换「零样板 HMR」的开发体验"
+    },
+    {
+      "slug": "diagnostics",
+      "title": "诊断目录：dev-only 可索引警告系统",
+      "layer": "system",
+      "dependsOn": [],
+      "sourceFiles": [
+        "packages/pinia/src/diagnostics.ts"
+      ],
+      "summary": "把散落各处的用户面警告集中成带 why/fix/docs 的诊断目录（PINIA_R1xxx），经可插拔 reporter 输出。关键权衡：集中化换「可索引、可文档化」的错误体验，且所有调用点都在 __DEV__ guard 内、生产构建被 tree-shake 零成本；代价是依赖外部 nostics 库，并允许 error 级上报（如 SSR 跨请求污染 R1004）"
+    }
+  ],
+  "topoOrder": [
+    "active-pinia",
+    "subscription-primitive",
+    "pinia-instance",
+    "define-store",
+    "store-assembly",
+    "state-patch",
+    "subscriptions-actions",
+    "store-to-refs",
+    "plugin-system",
+    "hmr",
+    "map-helpers",
+    "devtools",
+    "testing-pinia",
+    "nuxt-ssr",
+    "diagnostics"
+  ]
+}
