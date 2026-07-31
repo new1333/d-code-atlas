@@ -11,9 +11,9 @@
 - [ ] `surveyor.md` — Surveyor：只读；只如实记录结构不臆测；输出严格符合 `repo-map.json` schema（design §8.1、§5.1）。
 - [ ] `architect.md` — Architect：只读；高屋建瓴拆 8~20 章；每章 `dependsOn` 必须是更底层章；DAG 无环；slug kebab-case 英文；`layer ∈ primitive|composite|system`（design §5.2）。
 - [ ] `critic-outline.md` — Critic（Outline 模式）：只评审不生产；输出结构化 verdict（approve/reject + fixes）；按 design §5.3 四条验收标准：自底向上可验证 / 完整性 / 准确性 / 粒度。
-- [ ] `critic-chapter.md` — Critic（Chapter 模式）：同上不生产；按 design §5.4 四条：准确 / 衔接 / 可运行 / 清晰；可读 `replica/` 判断结构合理性。
+- [ ] `critic-chapter.md` — Critic（Chapter 模式）：同上不生产；按 design §5.4 六条：准确 / 衔接 / 演示自洽 / 清晰 / 教学·非源码导读 / 原理·关键权衡；可读 `replica/` 判断结构合理性。
 - [ ] `reader.md` — Reader：只读；精读指定 `sourceFiles[]`，摘关键调用链与要点，**标注源码位置**（`源码位置: path:line`）（design §8.3 章节产物）。
-- [ ] `writer.md` — Writer：可写 `work/chapters/{slug}/`；自底向上衔接 `dependsOn` 前文；内嵌可运行 ts/js 复刻且与 `replica/` 一致（design §5、AC-5）。
+- [ ] `writer.md` — Writer：自底向上衔接 `dependsOn` 前文；内嵌最小原理演示（载体按仓库语言，"能跑"非硬要求）；与 `replica/` 一致（落盘非硬要求）（design §5、AC-5）。
 - [ ] `assembler.md` — Assembler：可写 `site/`；**仅搬运与脚手架，不改章节内容**；侧边栏严格来自 outline（topo+layer），文件名 `{nn}-{slug}.md`（design §11、ADR-0006）。
 
 ## 每个 prompt 文件应包含

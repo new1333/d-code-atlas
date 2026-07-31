@@ -73,9 +73,9 @@ src/
 ### Stage 5 · Write（Writer ⇄ Critic ×N，写 work/，并发 4，≤2 轮）
 - 输入：`research.md` + `outline.json`。
 - 处理：
-  1. Writer 写 `draft.md`（讲解 + 内嵌最小可运行 ts/js 复刻），并把复刻存到 `replica/`。
-  2. Critic 评审（准确性 vs Source、清晰度、复刻可运行性、自底向上衔接）。reject 则修订，≤2 轮。
-- 输出：`work/chapters/{slug}/draft.md` + `replica/*.ts|js`。
+  1. Writer 写 `draft.md`（讲解 + 内嵌最小原理演示，载体按仓库主语言/类型选择，"能跑"非硬要求）；演示代码以 stdout fence 提取，由 Stage 落盘（`replica/` 落盘在 stdout 模式下非硬要求）。
+  2. Critic 评审（准确性 vs Source、衔接、演示自洽、清晰、教学·非源码导读、原理·关键权衡）。reject 则修订，≤2 轮。
+- 输出：`work/chapters/{slug}/draft.md`（+ 可选 `replica/`）。
 
 ### Stage 6 · Assemble（Assembler，写 site/）
 - 输入：`outline.json` + 各章 `draft.md`。
@@ -95,7 +95,7 @@ src/
 | Architect | Read,Glob,Grep | — | 高屋建瓴拆概念；每章 dependsOn 必须是更底层的章；DAG 无环 |
 | Critic | Read,Glob,Grep | — | 只评审不生产；输出结构化 verdict |
 | Reader | Read,Glob,Grep | — | 精读指定文件，摘关键调用链与要点，标注源码位置 |
-| Writer | +Write/Edit | work/chapters/{slug}/ | 自底向上衔接前文；内嵌可运行复刻；复刻与 replica 一致 |
+| Writer | Read,Glob,Grep（readonly；draft 经 stdout fence 提取，Stage 落盘） | work/chapters/{slug}/ | 自底向上衔接前文；内嵌最小原理演示（载体按仓库语言，"能跑"非硬要求） |
 | Assembler | +Write/Edit | site/ | 仅搬运与脚手架，不改章节内容；侧边栏严格来自 outline |
 
 ### 5.1 Surveyor 输出要点
@@ -116,8 +116,10 @@ src/
 ### 5.4 Critic 验收标准（Chapter）
 1. **准确**：技术陈述与 Source 一致（抽查关键断言能否在源码找到依据）。
 2. **衔接**：用到的前置概念确实在 `dependsOn` 章节中已讲解。
-3. **可运行**：内嵌 ts/js 复刻与 `replica/` 一致且能跑（Critic 可读 replica 文件判断结构合理性）。
-4. **清晰**：有图示/步骤/输入输出，不是流水账。
+3. **演示自洽**：有从零实现的最小演示演透核心思想；载体按仓库语言/类型合理选择（"能跑"非硬要求）；不与源码逐字重合 > 50%、不 import 原仓库。
+4. **清晰**：有动机/核心思想/心智模型/执行轨迹/输入输出之一组，不是流水账。
+5. **教学·非源码导读**：叙事主轴不是文件/函数/行号 walkthrough；**正文零源码对照**（无 `路径:line`/行号/「源码对照·与真源差异」小节）；类型签名罗列篇幅不超原理篇幅。
+6. **原理·关键权衡**：全章讲清"为什么这么设计"，有至少 1 条高质量的「选择 X→换来 Y→代价 Z」关键权衡，且权衡篇幅 ≥ 演示篇幅（机制丰富章通常 2～4 条；机制稀薄章可只 1 条但须讲透）。
 
 ## 6. 对抗评审机制（ADR-0004）
 
@@ -198,8 +200,8 @@ Producer 出草稿 ─▶ Critic 评审 ─┬─ approve ─▶ 接受
 
 ### 8.4 章节产物
 - `work/chapters/{slug}/research.md`：源码摘录、调用链、要点（带 `源码位置:` 标注）。
-- `work/chapters/{slug}/draft.md`：最终章节正文（含内嵌 ```ts```/```js``` 复刻块）。
-- `work/chapters/{slug}/replica/*.ts|js`：复刻的可运行副本。
+- `work/chapters/{slug}/draft.md`：最终章节正文（含内嵌最小原理演示代码块，语言/载体按仓库定，"能跑"非硬要求）。
+- `work/chapters/{slug}/replica/`：演示的独立副本（**可选**；stdout 模式下不强制落盘；存在时与内嵌一致）。
 
 ## 9. 续跑与状态机（ADR-0002）
 

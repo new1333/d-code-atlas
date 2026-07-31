@@ -99,7 +99,7 @@ Surveyor / Architect / Critic / Reader / Writer / Assembler。每个 Agent = 一
 - **AC-2（端到端·本地）**：给定本地路径，生成同样结构；分析前后对该目录做 `git status`（或哈希）无任何改动。
 - **AC-3（续跑）**：在 Research 阶段中断后 `atlas resume <key>`，Survey/Outline 不重跑，从中断处继续。
 - **AC-4（自底向上）**：生成的 `guide/` 章节顺序满足 `outline.json` 的 `dependsOn` 拓扑序（脚本可校验：无环、依赖闭包在前）。
-- **AC-5（复刻代码）**：每章 `draft.md` 含至少一段 ts/js 代码块；`work/chapters/{slug}/replica/` 有对应可运行文件。
+- **AC-5（原理演示）**：每章 `draft.md` 含至少一段从零实现的最小演示代码块（载体按仓库主语言/类型选择，TS/JS/Go/Rust/Python 等均可；"能跑"非硬要求，VSCode扩展/插件/需宿主的机制可演机制骨架）；`work/chapters/{slug}/replica/` 若存在则与内嵌一致（stdout 模式下 replica 落盘非硬要求）。
 - **AC-6（对抗评审）**：manifest 中 Outline 与每章 Write 的评审记录可查；存在 reject 时 draft 有对应修订。
 - **AC-7（只读）**：所有分析 Agent 的 `claude -p` 命令均带 `--allowedTools Read,Glob,Grep`（manifest 可核验）。
 

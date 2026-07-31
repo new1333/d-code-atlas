@@ -90,9 +90,9 @@ ls atlas/repo/site/guide/   # 期望：01-xxx.md, 02-yyy.md, ... 按 topo 顺序
 
 ---
 
-## AC-5（复刻代码）
+## AC-5（原理演示）
 
-> 每章 `draft.md` 含至少一段 ts/js 代码块；`work/chapters/{slug}/replica/` 有对应可运行文件。
+> 每章 `draft.md` 含至少一段从零实现的最小演示代码块（语言不限，"能跑"非硬要求）；`work/chapters/{slug}/replica/` 若存在则与内嵌一致（落盘非硬要求）。
 
 ```bash
 for slug in $(bun -e 'const o=await Bun.file("atlas/repo/work/outline.json").json();console.log(o.chapters.map(c=>c.slug).join(" "))'); do
@@ -101,7 +101,7 @@ for slug in $(bun -e 'const o=await Bun.file("atlas/repo/work/outline.json").jso
   codeblocks=$(grep -c '```' "$draft" 2>/dev/null || echo 0)
   replicas=$(ls "$replica" 2>/dev/null | wc -l)
   echo "$slug: code-fence-markers=$codeblocks, replica-files=$replicas"
-  # 期望：code-fence-markers ≥ 2（至少一个完整代码块），replica-files ≥ 1
+  # 期望：code-fence-markers ≥ 2（至少一个完整演示代码块）。replica-files 仅在落盘模式下期望 ≥ 1。
 done
 ```
 

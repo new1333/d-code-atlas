@@ -276,7 +276,7 @@ bash scripts/selfcheck.sh <key> --no-build
 | AC-2 | 本地源只读不变（kind=local + 无克隆副本）                                  |
 | AC-3 | done 的 stage 有时间戳（续跑不重置）                                       |
 | AC-4 | outline 无环/无悬空/topoOrder 复算一致/依赖闭包满足/文件名编号==topo 序号  |
-| AC-5 | 每章 draft 有代码块 + `replica/` 有可运行文件                              |
+| AC-5 | 每章 draft 有演示代码块（语言不限，"能跑"非硬要求）；`replica/` 落盘非硬要求 |
 | AC-6 | outline + 每章 write 有对抗评审 trace（rounds/final/trace）                |
 | AC-7 | 所有分析类 agent 的 cmd 含 `--allowedTools Read,Glob,Grep`（只读无逃生口） |
 

@@ -1,20 +1,19 @@
 // agents/writer.ts：Writer（章节撰写员）的 agent 封装。
 // 对应 design §4 Stage 5（Write）、§5（输出要点）、§8.3/§8.4（章节产物）、
-// §7/ADR-0003（自底向上）、AC-5（复刻一致）、ADR-0006（replica 可独立运行）。
+// §7/ADR-0003（自底向上）。
 //
 // 契约（design §5 / §10 / AC-7）：
-//   - tools = "write"（Read/Glob/Grep + Write/Edit）：Writer 自己用 Write/Edit 落盘。
-//   - **cwd 取舍**：cwd = workDir(key)（`atlas/{key}/work/`），**不是** chapterDir。
-//     原因：Writer 需要跨读 work/outline.json（取全部章节 + 本章依赖）与
-//     work/chapters/{slug}/research.md（Reader 事实摘录），还要写
-//     work/chapters/{slug}/draft.md + replica/。若 cwd 限定在 chapterDir，物理上
-//     读不到 outline.json（在 chapterDir 之外）。
-//     决策：cwd = workDir，user prompt 明确「**只能写** chapters/{slug}/ 下，
-//     **禁止**改 outline.json/repo-map.json/其它章节/site/」。写范围靠 prompt 约束 +
-//     tools 白名单（AC-7 不核验 Writer 的 cwd，只核验分析类工具集）。
-//   - **自己落盘** draft.md + replica/（产物在磁盘），Stage 后续校验存在性。
+//   - tools = "readonly"（Read/Glob/Grep）：Writer **不自己落盘**。
+//     draft.md 全文以 4 反引号 markdown fence 输出到 stdout，agent 层用 extractFence
+//     提取后由 Stage 原子落盘（见下方"设计变更"）。Writer 不调 Write/Edit。
+//   - **cwd = chapterDir(key, slug)**（chapters/{slug}/）：research.md 就在当前目录，
+//     outline.json/source/ 在 cwd 之外，通过 --add-dir 声明可读（见 addDirs）。
+//   - **不注入 system prompt**：实测 writer.md 内的 Write/replica 落盘指令会让 claude
+//     顽固尝试 Write 工具（即便 user prompt 说"不要 Write"）。故写作要求全部写进下方
+//     user prompt（含通俗化文风、关键权衡硬要求等），不读 writer.md。
+//     ⇒ 若改 writer.md，必须同步把改动落到本文件的 user prompt，否则不生效。
 //
-// 注：相对 cwd（work/）的路径用 `chapters/{slug}/...`、`outline.json`。
+// 注：相对 cwd（chapterDir）的路径用 research.md（当前目录）、../outline.json、../../../source/。
 
 import { runClaude } from "../lib/run-claude.ts";
 import { workDir, chapterDir, sourceDir } from "../lib/io.ts";
@@ -103,12 +102,40 @@ export async function writer(opts: WriterOpts): Promise<WriterOutcome> {
     "- 需要时读 `../../../source/` 核对技术准确性。",
     "",
     "## 正文写作要求",
-    "- **markdown 格式**，中文。",
-    "- **自底向上**：先讲底层原语，再讲组合机制；前置概念来自 dependsOn 章节。",
+    "- **markdown 格式**，中文；代码/标识符/字段名用英文。",
+    "",
+    "### 文体：通俗、像人说话（最高优先级文风要求）",
+    "- **这是教学文，不是论文摘要，不是源码导读。** 读者是「想搞懂原理的人」，不是「想背源码结构的人」。",
+    "- **每节正文必须以人话开头**：用一个具体场景、一句读者会说的话、或「想象一下」起手；",
+    "  **禁止**用「一句话概括底层原语……」「核心思想可以表述为……」这种定义式开场。",
+    "- **禁用生硬抽象词**（出现即换成日常说法或删掉）：原语、载体、归一/归一点、收口、",
+    "  载荷、地基层、占位(作动词)、汇成、叠在一起、确立、递送、归一化。",
+    "  （例：不写「以 pinia=指针收口」，写「最后都落到读指针」；不写「底层原语」，写「最底层的那块」或直接不提。）",
+    "- **抽象概念第一次出现时配一个类比**：全局指针 = 一块谁都能看到的公共留言板；",
+    "  依赖注入 = 按地址精准投递。类比只用一次点透，不滥用、不每段都打比方。",
+    "- **允许并鼓励过渡人话**：「说人话就是……」「换句话说……」「这个设计说白了是为了……」",
+    "  这类句子不算水，是教学必需，每节可有 1～2 句。",
+    "- **不要反复念叨同一句抽象概括**：核心思想点透一次即可，其余地方用具体例子或人话重述，",
+    "  不要每段都以「核心思想是……」「一句话概括……」起手。",
+    "",
+    "### 结构：自底向上、原理驱动",
+    "- **自底向上**：先讲底层基本件，再讲组合机制；前置概念来自 dependsOn 章节。",
+    "- **必须有关键权衡（硬要求）**：**至少 1 条**高质量的「做了 X 选择 → 换来了 Y → 代价是 Z」，且权衡总篇幅 ≥ 演示篇幅。这是「学原理」的核心交付。",
+    "  权衡要具体可复述，不要泛泛说「做了合理权衡」「性能与可读性的平衡」。",
+    "  机制丰富的章通常有 2～4 条；但**机制稀薄的章（如薄包装、纯配置）可只写 1 条**——前提是这 1 条真讲清了「为什么这么设计」，",
+    "  且你须在文中点明「本章机制集中，只展开这 1 条核心权衡」。**宁可 1 条讲透，不要为凑数硬编。**",
     "- 配流程图（文字版 A → B → C）、步骤、输入输出示例。",
-    "- 内嵌关键代码片段（```ts 代码块），标注源码位置（如 store.ts:L52）。",
+    "- 内嵌最小演示代码演透原理——用你**自己写的、从零实现的演示**，**不要**贴大段原仓库源码逐行注释。",
+    "  **演示载体按 research.md 教学钩子里的「演示载体建议」选**：被分析仓库是什么语言/类型，就用合理的载体——",
+    "  TS/JS 可写成能 `bun run`/`node` 跑的脚本（能跑最好，**非硬要求**）；Go/Rust/Python 用各自惯用法；",
+    "  VSCode 扩展/IDE 插件/需要宿主或图形界面的机制，演**机制骨架**（激活时序、消息流转）+ 文字执行轨迹即可，不强求真跑。",
+    "  一句话：**载体服务于「演透原理」，不是服务于「能跑」。** 别把 JS 的 bun 工具链套到非 JS 仓库上。",
+    "- **正文禁绝任何源码对照**：不写 `文件名:行号`、不写「源码位置」「见 xxx.ts」、不设「与真源差异 / 源码对照」小节。",
+    "  这是原理教学文，不是源码导读——读者学的是「为什么这么设计」，不需要被引去翻源码。",
     "- 聚焦一个核心概念，不流水账。篇幅 100-300 行。",
-    "- **再次强调：只输出 4 反引号 markdown fence，不要写任何 fence 外的文字。**",
+    "",
+    "### 再次强调输出方式",
+    "- **只输出 4 反引号 markdown fence，不要写任何 fence 外的文字。**",
   ].join("\n") + feedbackBlock;
 
   const result = await runClaude({
