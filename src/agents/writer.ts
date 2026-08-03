@@ -18,6 +18,7 @@
 import { runClaude } from "../lib/run-claude.ts";
 import { workDir, chapterDir, sourceDir } from "../lib/io.ts";
 import { extractFence } from "../lib/extract.ts";
+import { type ChapterContext } from "../lib/chapter-context.ts";
 import { type AgentOutcome, type AgentCommonOpts } from "./types.ts";
 
 /** Writer 入参。 */
@@ -34,12 +35,46 @@ export interface WriterOpts extends AgentCommonOpts {
    * 这是 M08 的非破坏性扩展（新增可选参数，不改既有签名），由 M09 stage 透传。
    */
   feedback?: string[];
+  /**
+   * 章节上下文（可选，write stage 透传）。
+   * 含本章在 topoOrder 的位置、前后驱标题、dependsOn 各章的 title/summary。
+   * 供 Writer 做跨章去重（避免重复讲透前置章已讲过的原理）与章末预告对齐
+   * （只点名紧邻下一章，而非凭印象罗列）。stage 算不出时省略，Writer 不受影响。
+   *
+   * 非破坏性扩展（与 feedback 同模式），向后兼容。
+   */
+  chapterContext?: ChapterContext;
 }
 
 /** Writer 返回：AgentOutcome + 从 stdout 提取的 draft.md 全文（提取失败为 null）。 */
 export interface WriterOutcome extends AgentOutcome {
   /** 从 stdout 4 反引号 markdown fence 提取的 draft.md 全文；提取失败为 null（同时 ok=false）。 */
   draftMd: string | null;
+}
+
+/**
+ * 把章节上下文拼成 user prompt 的一节（含前导空行，便于拼到主 prompt 末尾）。
+ * 供「跨章去重」「章末预告对齐」两条硬规则消费——让 Writer 知道前置章讲了什么、紧邻下一章是谁。
+ *
+ * @returns 以 "\n" 起首的字符串块；context 缺失时返回空串（调用方无需判空）。
+ */
+function buildChapterContextBlock(ctx: ChapterContext): string {
+  const lines: string[] = [
+    "",
+    "## 章节上下文（stage 已算好，请据此做跨章去重与章末预告对齐）",
+    `- 你是全书第 ${ctx.position + 1}/${ctx.total} 章。`,
+    `- 紧邻下一章：${ctx.nextTitle ?? "（末章，无后继）"}`,
+    "- 本章 dependsOn 的前置章及核心主题（写关键权衡前先比对，避免重演前置章已讲透的原理）：",
+  ];
+  if (ctx.depTitles.length === 0) {
+    lines.push("  · （本章无 dependsOn，是全书地基章之一）");
+  } else {
+    ctx.depTitles.forEach((title, i) => {
+      const summary = ctx.depSummaries[i] ?? "";
+      lines.push(`  · 「${title}」：${summary}`);
+    });
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -55,7 +90,7 @@ export interface WriterOutcome extends AgentOutcome {
  *   代价：不产 replica/ 可运行副本（原 ADR-0006）。Critic·Chapter 已降级，不强制可运行。
  */
 export async function writer(opts: WriterOpts): Promise<WriterOutcome> {
-  const { key, slug, model, spawn, feedback } = opts;
+  const { key, slug, model, spawn, feedback, chapterContext } = opts;
 
   // cwd = chapterDir（chapters/{slug}/），让 claude 在自己的章节目录里写 draft.md 最自然。
   // 实测 cwd=workDir 时 claude 对"写 chapters/{slug}/ 子目录"产生权限幻觉（声称被拦但不真尝试）；
@@ -63,6 +98,13 @@ export async function writer(opts: WriterOpts): Promise<WriterOutcome> {
   // outline.json/research.md 在 workDir（cwd 之外），通过 --add-dir 声明可读。
   const cwd = chapterDir(key, slug);
   const wdir = workDir(key);
+
+  // 章节上下文块：stage 已算好（位置 + 前后驱 + dependsOn 各章主题），插进 user prompt。
+  // 省略时（stage 算不出）不插，Writer 不受影响——向后兼容。
+  const contextBlock =
+    chapterContext && chapterContext.position >= 0
+      ? buildChapterContextBlock(chapterContext)
+      : "";
 
   // 若 stage 透传了 critic 上一轮的 fixes，拼到 prompt 末尾让 Writer 据反馈修订。
   const feedbackBlock =
@@ -120,6 +162,15 @@ export async function writer(opts: WriterOpts): Promise<WriterOutcome> {
     "",
     "### 结构：自底向上、原理驱动",
     "- **自底向上**：先讲底层基本件，再讲组合机制；前置概念来自 dependsOn 章节。",
+    "- **跨章去重（硬要求）**：写「关键权衡/核心思想」前，先比对上面「章节上下文」里",
+    "  dependsOn 各章的主题。如果某个机制在前置章已被作为该章的**核心思想或关键权衡**讲透",
+    "  （典型信号：它出现在前置章的 summary 里、或它的「选择→换来→代价」已被前置章展开），",
+    "  本章提到它时**只用一句话回指**（如「这个时序第 N 章已展开，这里不重复」），**禁止重新演示",
+    "  同一原理**。你可以讲该机制「在本章语境下」的新侧面，但不能复述同一原理的同一面。",
+    "  这是为了避免读者连读相邻章时，同一原理被完整讲好几遍。",
+    "- **章末小结如要预告后续，只点名紧邻下一章**：用上面「章节上下文」里的 nextTitle，",
+    "  且**只点这一章**。禁止罗列多个后续章名（容易与真实 topoOrder 顺序错位、误导读者按图索骥）。",
+    "  末章（nextTitle 为空）则不预告，只收束本章原理。",
     "- **必须有关键权衡（硬要求）**：**至少 1 条**高质量的「做了 X 选择 → 换来了 Y → 代价是 Z」，且权衡总篇幅 ≥ 演示篇幅。这是「学原理」的核心交付。",
     "  权衡要具体可复述，不要泛泛说「做了合理权衡」「性能与可读性的平衡」。",
     "  机制丰富的章通常有 2～4 条；但**机制稀薄的章（如薄包装、纯配置）可只写 1 条**——前提是这 1 条真讲清了「为什么这么设计」，",
@@ -136,7 +187,7 @@ export async function writer(opts: WriterOpts): Promise<WriterOutcome> {
     "",
     "### 再次强调输出方式",
     "- **只输出 4 反引号 markdown fence，不要写任何 fence 外的文字。**",
-  ].join("\n") + feedbackBlock;
+  ].join("\n") + contextBlock + feedbackBlock;
 
   const result = await runClaude({
     prompt,

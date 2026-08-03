@@ -44,6 +44,7 @@ import {
   type ReviewTrace,
 } from "../lib/manifest.ts";
 import { DEFAULT_CONCURRENCY, REVIEW_ROUNDS } from "../lib/config.ts";
+import { buildChapterContext, type ChapterContext } from "../lib/chapter-context.ts";
 import type { Outline } from "../lib/types.ts";
 import type { StageContext, StageResult } from "./types.ts";
 
@@ -76,6 +77,7 @@ async function writeChapter(
   model: string | undefined,
   maxRounds: number,
   sourcePath?: string,
+  chapterContext?: ChapterContext | null,
 ): Promise<ChapterWriteResult> {
   // 1) 确认 research.md 存在（缺料 → write failed）。
   const hasResearch = await pathExists(researchPath(key, slug));
@@ -101,7 +103,14 @@ async function writeChapter(
     // 把上一轮 critic 的 fixes 透传给 writer（首轮 undefined）。
     const prevFixes = round === 1 ? undefined : trace[trace.length - 1]?.fixes;
 
-    const writerOutcome = await writer({ key, slug, model, spawn, feedback: prevFixes });
+    const writerOutcome = await writer({
+      key,
+      slug,
+      model,
+      spawn,
+      feedback: prevFixes,
+      chapterContext: chapterContext ?? undefined,
+    });
     lastCmd = writerOutcome.cmd;
 
     if (!writerOutcome.ok || writerOutcome.draftMd === null) {
@@ -230,9 +239,12 @@ export async function write(ctx: StageContext): Promise<StageResult> {
   }
 
   // 并发跑每章 write 子流程（mapPool：单点失败隔离）。
+  // 每章算出章节上下文（位置 + 前后驱 + dependsOn 各章主题）透传给 Writer，
+  // 供其做跨章去重与章末预告对齐（见 writer.ts buildChapterContextBlock）。
   const results = await mapPool(
     slugs,
-    async (slug) => writeChapter(key, slug, spawn, model, maxRounds, sourcePath),
+    async (slug) =>
+      writeChapter(key, slug, spawn, model, maxRounds, sourcePath, buildChapterContext(outline, slug)),
     concurrency,
   );
 

@@ -79,6 +79,8 @@ export async function architect(opts: ArchitectOpts): Promise<ArchitectOutcome> 
     "",
     "## 任务",
     "1. 高屋建瓴拆概念：每章聚焦**一个可理解概念**（不是按文件/目录分章）。",
+    "   （注意：章的 layer/顺序依「读者理解它需要的前置知识」决定，单文件章也可能因概念依赖",
+    "   而排在中后段、升层 composite/system，不必然是 primitive 层——别用「单文件=primitive」机械归类。）",
     "2. 自底向上分层：primitive（原子）/ composite（复合）/ system（系统）；dependsOn 必须是更底层的章。",
     "3. dependsOn 形成有向无环图（DAG）：禁止自环、禁止成环、禁止引用未定义 slug。",
     "4. 章数 8~20（绝对上限 24，超量必须合并）；无「杂物箱」章节（如「其它」「杂项」）。",

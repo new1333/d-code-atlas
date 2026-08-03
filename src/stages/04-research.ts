@@ -29,6 +29,7 @@ import { outlinePath, readJson, writeText, researchPath } from "../lib/io.ts";
 import { mapPool } from "../lib/pool.ts";
 import { setStageStatus, setChapterStatus, saveManifest } from "../lib/manifest.ts";
 import { DEFAULT_CONCURRENCY } from "../lib/config.ts";
+import { buildChapterContext } from "../lib/chapter-context.ts";
 import type { Outline } from "../lib/types.ts";
 import type { StageContext, StageResult } from "./types.ts";
 
@@ -85,9 +86,19 @@ export async function research(ctx: StageContext): Promise<StageResult> {
   }
 
   // 并发跑 reader（mapPool：单点失败隔离，结果按原序回填）。
+  // 每章算出章节上下文（位置 + 前后驱 + dependsOn 各章主题）透传给 Reader，
+  // 让其在 research.md 的「设计动机」钩子里标注与前置章的复用关系，供 Writer 做跨章去重。
   const results = await mapPool(
     slugs,
-    async (slug) => reader({ key, slug, model, spawn, sourcePath }),
+    async (slug) =>
+      reader({
+        key,
+        slug,
+        model,
+        spawn,
+        sourcePath,
+        chapterContext: buildChapterContext(outline, slug) ?? undefined,
+      }),
     concurrency,
   );
 

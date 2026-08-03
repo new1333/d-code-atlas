@@ -15,6 +15,7 @@
 import { runClaude } from "../lib/run-claude.ts";
 import { runDir } from "../lib/io.ts";
 import { extractFence } from "../lib/extract.ts";
+import { type ChapterContext } from "../lib/chapter-context.ts";
 import { promptPath, agentAddDirs, type AgentOutcome, type AgentCommonOpts } from "./types.ts";
 
 /** Reader 入参。 */
@@ -23,6 +24,15 @@ export interface ReaderOpts extends AgentCommonOpts {
   key: string;
   /** 本章 slug（精读对象）。 */
   slug: string;
+  /**
+   * 章节上下文（可选，research stage 透传）。
+   * 含本章在 topoOrder 的位置、前后驱标题、dependsOn 各章的 title/summary。
+   * 供 Reader 在 research.md 的「设计动机」钩子里标注「本章哪些机制是前置章核心权衡的复用」，
+   * 给下游 Writer 做跨章去重提供信号。stage 算不出时省略，Reader 不受影响。
+   *
+   * 非破坏性扩展，向后兼容。
+   */
+  chapterContext?: ChapterContext;
 }
 
 /** Reader 返回：AgentOutcome + 提取出的 researchMd（提取失败为 null）。 */
@@ -41,10 +51,34 @@ export interface ReaderOutcome extends AgentOutcome {
  * 不落盘（Stage 负责）。返回 cmd 供 manifest 记录 + AC-7 核验。
  */
 export async function reader(opts: ReaderOpts): Promise<ReaderOutcome> {
-  const { key, slug, model, spawn, sourcePath } = opts;
+  const { key, slug, model, spawn, sourcePath, chapterContext } = opts;
 
   const cwd = runDir(key);
   const systemPromptPath = promptPath("reader");
+
+  // 章节上下文块：stage 已算好（位置 + 前后驱 + dependsOn 各章主题），插进 user prompt。
+  // 让 Reader 在「设计动机」钩子里标注本章与前置章的复用关系，供 Writer 做跨章去重。
+  // 省略时（stage 算不出）不插，Reader 不受影响——向后兼容。
+  const contextLines: string[] =
+    chapterContext && chapterContext.position >= 0
+      ? [
+          "5. **标注与前置章的复用关系（跨章去重信号）**：下面「章节上下文」列出了 dependsOn 各章的主题。",
+          "   如果本章某个机制已在某前置章的 summary 里作为核心权衡出现，请在「给 Writer 的教学钩子」",
+          "   的「设计动机」子项里标注「（已在第 N 章『Y』讲透，本章只看它的新侧面 Z）」，",
+          "   提醒 Writer 不要重演同一原理。",
+          "",
+          "## 章节上下文（stage 已算好）",
+          `- 你是全书第 ${chapterContext.position + 1}/${chapterContext.total} 章。`,
+          `- 紧邻下一章：${chapterContext.nextTitle ?? "（末章，无后继）"}`,
+          "- 本章 dependsOn 的前置章及核心主题：",
+          ...(chapterContext.depTitles.length === 0
+            ? ["  · （本章无 dependsOn，是全书地基章之一）"]
+            : chapterContext.depTitles.map(
+                (title, i) => `  · 「${title}」：${chapterContext.depSummaries[i] ?? ""}`,
+              )),
+          "",
+        ]
+      : [];
 
   const prompt = [
     "你是 Reader（源码精读员）。请针对指定章节的 sourceFiles 做精读，产出事实摘录 research.md。",
@@ -65,7 +99,7 @@ export async function reader(opts: ReaderOpts): Promise<ReaderOutcome> {
     "2. 事实抽取：源码里**实际有什么**、**怎么连接**、**为什么这么写**（从代码与注释推断，不臆测）。",
     "3. 每条关键论断后标注 `源码位置: <相对路径>:<行号或范围>`（相对 root，POSIX 风格）。",
     "4. 全程**只读**：禁止 Write/Edit；不修改源仓库、不写 draft.md/replica（ADR-0005、AC-7）。",
-    "",
+    ...contextLines,
     "## 输出契约（严格）",
     "你的最终回复**只**包含一个被 fence 包裹的 markdown 文本块（research.md 的完整内容）。",
     "fence 外**不写**任何正文/解释。agent 层会从 stdout 提取 fence 内文本后原子落盘。",
