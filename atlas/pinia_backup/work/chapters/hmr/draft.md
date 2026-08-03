@@ -1,319 +1,230 @@
-# 模块热更新支持
+# HMR：保留状态下的 store 热更新
 
-## 一个核心问题
+## 一个你一定踩过的坑
 
-在 Vite 开发服务器里，改一个普通模块会被「整块替换」——旧模块丢弃，新模块重新执行。但 Pinia 的 store 不能这么做：一个 store 实例里通常已经装着用户操作产生的运行时状态（已登录的用户、已展开的菜单、已填的表单）。如果模块热更新时把 store 推倒重来，这些状态就全没了。
+想象这个场景：你正在调一个登录流程，`useUserStore` 里写了一个 `login` action，刚刚点登录、token 写进 state、跳到首页——一切正常。然后你发现 `login` 里少打了一行日志，顺手加回去保存。
 
-所以 Pinia 的 HMR 要解决的是一个**调和（reconcile）问题**：
+Vite 默认走整页刷新。`pinia.state.value.user` 整个被重置，token 没了，路由因为没了登录态又把你踢回登录页。你重新登录、再调一次、再回到首页——就为了加那一行 `console.log`。
 
-> 代码改了，store 的「形状」(state/getters/actions 定义) 变了，但要保留用户已经产生的运行时状态，把新定义「无损地」移植进**同一个现存实例**。
+更阴险的是另一种情况：Vite 没刷页，但你的组件已经 `import` 了旧的 `useUserStore`，组件拿到的还是旧版 `login`，那一行日志永远打不出来。你得手动刷一次浏览器——又丢了状态。
 
-本章自底向上拆解这条链路。它依赖前置三章：[`store-definition`](../store-definition/) 里的 `defineStore` / `useStore` / `createSetupStore` / `createOptionsStore`，[`pinia-instance`](../pinia-instance/) 里的 store 注册表 `pinia._s` 与 `hot.data`，以及 [`core-types`](../core-types/) 里的 `StoreDefinition` 类型与 `isPlainObject`。
+Pinia 的 HMR 就是为消灭这两种痛点而生的。说人话就是：**你改你的代码，登录态、表单、订阅回调我帮你留住**。
 
----
+## 为什么不能简单「重建 store」
 
-## 一、底层原语：hmr.ts 的三件套
+要做热更新，最朴素的思路是：拿到新代码，重新 `defineStore` 一遍，把 `pinia._s` 里那个老 store 替换掉。但这套思路在 Pinia 里行不通，根本原因在于 **store 是一个被无数组件持有的 reactive 代理对象**。
 
-整条 HMR 链路的「发动机」是一个仅 122 行的文件 `packages/pinia/src/hmr.ts`，它导出三样东西：
+- 组件 A 在 `setup` 里写过 `const userStore = useUserStore()`——这个引用指向老对象。
+- 模板里有 `<div>{{ userStore.token }}</div>`——依赖追踪挂在老对象上。
+- 某处写了 `userStore.$subscribe(cb)`——cb 注册在老对象的订阅列表里。
+- devtools 监听着老对象上的 mutation 事件——可视化靠的就是这个。
 
-| 导出 | 作用 | 是否对外 |
-|---|---|---|
-| `isUseStore(fn)` | 类型守卫：判定一个值是否为 `StoreDefinition` | 否（内部） |
-| `patchObject(newState, oldState)` | 递归深合并，state 调和用 | 否（内部） |
-| `acceptHMRUpdate(initialUseStore, hot)` | 唯一的 HMR 公共 API | **是** |
+如果你"重建 store"，老对象还活着、还被人指着，但注册表里已经不认它了。新对象是新的内存地址，所有指向老对象的引用都成了孤儿——它们读的是旧字段、订阅的是旧事件、新代码改动根本影响不到它们。这是最难调的 bug：「看起来还能用，但行为反常」。
 
-对外公开的只有一条：`packages/pinia/src/index.ts:77` 只 re-export 了 `acceptHMRUpdate``；另外两个是供 `store.ts` 内部调用的符号。我们先看这三个原语本身。
+## 思路：影子 store + 器官捐献
 
-### 1.1 `isUseStore`：从模块导出里认出 store
+既然不能换"壳"，那就只换"零件"。Pinia 的方案可以类比为器官捐献：
 
-一个文件里可能同时导出多个东西（多个 store、几个工具函数）。HMR 需要从中挑出「真正需要热替换的 store」。判据是「既是函数、又带字符串 `$id`」：
+1. 用新代码造一个**完全独立的影子 store**——给它一个临时 id `'__hot:user'`，跑一遍正常的 setup 流水线，把新代码的状态、getter、action 全部解析出来，挂在一个叫 `_hmrPayload` 的"零件清单"上。
+2. 调用老 store 的 `_hotUpdate(shadow)`——把零件逐个移植到老对象上：actions 赋新函数、getters 重新 computed、state 按规则搬运、删掉被移除的字段。
+3. 影子 store 完成使命，从注册表里删掉。
 
-```ts
-// packages/pinia/src/hmr.ts:20-22
-export const isUseStore = (fn: any): fn is StoreDefinition => {
-  return typeof fn === 'function' && typeof fn.$id === 'string'
-}
-```
+老对象的内存地址从头到尾没变。组件持有的引用、模板的依赖追踪、订阅回调——全部不动。它们看到的是"这个对象长出了新方法、改了 getter 算法、但状态还在"。
 
-`$id` 是 `defineStore` 返回值上的标记——`useStore.$id = id`（见 `store.ts:951`）。只有 `defineStore` 的产物才会同时满足「是函数」和「带 `$id`」，工具函数不会。
+## 完整流程：从 Vite 推送到旧 store 复活
 
-### 1.2 `patchObject`：用「旧 state」填「新结构」
-
-这是最容易读反的一个函数，必须先讲清方向。它的 JSDoc 原文是 *"Mutates in place `newState` with `oldState`"*——**就地修改 `newState`，依据是 `oldState`**。换句话说，遍历的是旧值、写入的是新结构，目的是「把用户已产生的旧值搬进新代码定义的形状里」：
+Pinia 本身不监听文件变化——HMR 的触发权在用户代码里。开发者必须显式写：
 
 ```ts
-// packages/pinia/src/hmr.ts:33-62
-export function patchObject(newState, oldState): Record<string, any> {
-  // no need to go through symbols because they cannot be serialized anyway
-  for (const key in oldState) {           // ← 遍历的是 oldState
-    const subPatch = oldState[key]
-    if (!(key in newState)) {             // 新结构里没有的旧键 → 视为已删除，丢弃
-      continue
-    }
-    const targetValue = newState[key]
-    if (
-      isPlainObject(targetValue) &&
-      isPlainObject(subPatch) &&
-      !isRef(subPatch) &&
-      !isReactive(subPatch)
-    ) {
-      newState[key] = patchObject(targetValue, subPatch)  // 双方都是纯对象 → 递归深合并
-    } else {
-      newState[key] = subPatch            // ref / reactive / 基本类型 → 整体替换
-    }
-  }
-  return newState
-}
+import { acceptHMRUpdate } from 'pinia'
+import.meta.hot.accept(acceptHMRUpdate(useUserStore, import.meta.hot))
 ```
 
-三条规则记牢：
+`acceptHMRUpdate(useStore, hot)` 返回一个回调，Vite 在每次热更新这个模块时调用它。这个回调做的事，可以拆成 7 步：
 
-1. **遍历 `oldState`，写入 `newState`**——「旧 → 新」，不是「新覆盖旧」。这点反直觉，是全章最易踩的坑。
-2. `for...in` 只走**可枚举字符串键**，注释明说 symbol 不走（symbol 无法序列化）。
-3. 三选一策略：双方都是纯对象（且非 ref/reactive）→ 递归；否则整体替换。
+```
+Vite 检测到 store 文件改动
+        │
+        ▼
+[1] 触发 import.meta.hot.accept 回调
+        │
+        ▼
+[2] 遍历新模块的所有命名导出
+    用「是函数 + 有 $id 字符串字段」识别哪些是 store 定义
+        │
+        ▼
+[3] 从 hot.data 拿上次缓存的 pinia 实例（首次从 useStore._pinia 兜底）
+        │  拿不到？说明这个 store 从来没被用过 → 直接 return
+        ▼
+[4] 调 useStore(pinia, existingStore)
+    把老 store 作为第二个参数 hot 传进去——这是进入 HMR 模式的暗号
+        │
+        ▼
+[5] useStore 见到 hot 入参 → 进入 HMR 模式
+    用 '__hot:' + id 作为临时 id 跑一遍 createSetupStore
+    得到一个影子 store，零件挂在 _hmrPayload 上
+        │
+        ▼
+[6] 调 existingStore._hotUpdate(影子 store)
+    逐字段做手术：actions 赋新、getters 重包、state 搬运、删字段
+    老 store 这个 reactive 对象的身份始终不变
+        │
+        ▼
+[7] 清理：从 pinia._s 和 pinia.state.value 里删掉 '__hot:' 临时条目
+    影子 store 离场，零件已植入老对象
+```
 
-其中「纯对象」的判定来自 `types.ts:16-29` 的 `isPlainObject`——真值 + `typeof === 'object'` + `toString === '[object Object]'` + 无 `toJSON` 方法。这意味着 `Map`/`Set`/`Date`/类实例都不会被判为纯对象，会走整体替换分支。
+有几个细节值得注意：
 
-> 注意：`patchObject` 只做「一层结构的递归合并」这一件事。真正决定「该深合并还是整体搬运」的分发逻辑并不在 hmr.ts，而在调用方 `_hotUpdate`（见第四节）。
+- **第 2 步的鸭子类型识别**：模块导出可能包含工具函数、类型、常量。识别 store 的唯一标准是 `typeof fn === 'function' && typeof fn.$id === 'string'`——`defineStore` 返回的 `useStore` 函数上挂了字符串 `$id` 字段。这是个非常宽松的判据，但在 Pinia 的生态里够用。
+- **第 3 步的 `hot.data`**：Vite 在多次热更新之间持久的对象，专门用来跨次保存上下文。pinia 实例放这里，保证第二次、第三次热更新还能拿到同一个 pinia。
+- **第 4 步的 `hot` 参数**：API 复用得非常彻底——`useStore` 的第二个参数本来是给测试和 SSR 用的"指定 store 实例"参数，HMR 直接借过来当暗号。同一个函数，调用方式不同就走不同分支。
 
-### 1.3 `acceptHMRUpdate`：唯一对外入口
+## 最小演示：换零件不换壳
 
-它本身**不执行任何替换**，而是返回一个回调交给 Vite。入口处第一件事是判 `__DEV__`：
+下面这段代码不接 Vite、不依赖任何打包器，单文件 `npx tsx demo.ts` 就能跑。它把"换零件不换壳"这个核心思想抽到最简：一个 `makeStore` 工厂、一个 `_hotUpdate` 方法。
 
 ```ts
-// packages/pinia/src/hmr.ts:78-87
-export function acceptHMRUpdate<...>(initialUseStore, hot) {
-  // strip as much as possible from iife.prod
-  if (!__DEV__) {
-    return () => {}
-  }
-  // ... 返回真正的回调
-}
-```
+// @ts-nocheck
+import { reactive, computed, effect } from 'vue'
 
-`__DEV__` 是**编译期注入的常量**（`tsdown.config.ts:12`：`const __DEV__ = '(process.env.NODE_ENV !== "production")'`）。生产构建里它被替换成 `'false'`，于是 `if (!__DEV__)` 恒成立，整个 HMR 回调被 tree-shake 掉。这也是 HMR 对线上包体积零负担的原因——相关代码在生产产物里物理消失。
+// 极简 store：一个 reactive 对象 + _hotUpdate 手术
+function makeStore(id, factory) {
+  const store = reactive({ $id: id })
+  const initial = factory(store)
+  for (const k in initial.state) store[k] = initial.state[k]
+  for (const k in initial.getters) store[k] = computed(initial.getters[k])
+  for (const k in initial.actions) store[k] = initial.actions[k].bind(store)
 
----
-
-## 二、对外契约：acceptHMRUpdate 返回的是「给 Vite 的回调」
-
-用户侧的标准用法（hmr.ts JSDoc 示例）：
-
-```js
-const useUser = defineStore('user', { /* ... */ })
-if (import.meta.hot) {
-  import.meta.hot.accept(acceptHMRUpdate(useUser, import.meta.hot))
-}
-```
-
-`acceptHMRUpdate(useUser, import.meta.hot)` 立即返回一个 `(newModule) => {...}`。Vite 在模块热更新时调用它，并把**新模块对象**作为 `newModule` 传进来：
-
-```ts
-// packages/pinia/src/hmr.ts:88-121
-return (newModule: any) => {
-  const pinia = hot.data.pinia || initialUseStore._pinia   // ① 取 pinia 实例
-  if (!pinia) {
-    return                                                  // ② store 从未被 useStore() 过，跳过
-  }
-  hot.data.pinia = pinia                                    // ③ 跨次加载保留 pinia
-
-  for (const exportName in newModule) {                     // ④ 遍历新模块所有导出
-    const useStore = newModule[exportName]
-    if (isUseStore(useStore) && pinia._s.has(useStore.$id)) { // ⑤ 是 store 且已实例化过
-      const id = useStore.$id
-      if (id !== initialUseStore.$id) {                      // ⑥ id 变了
-        diagnostics.PINIA_R1005({ from: initialUseStore.$id, to: id })
-        return hot.invalidate()                              //   → 放弃 HMR，整页 reload
-      }
-      const existingStore = pinia._s.get(id)!                 // ⑦ 取现存实例
-      useStore(pinia, existingStore)                          // ⑧ 触发替换
+  store._hotUpdate = function (newFactory) {
+    const fresh = newFactory(this)
+    // (a) actions / getters：新值覆盖老字段
+    //     reactive 代理保证组件侧的引用无需任何改动
+    for (const k in fresh.actions) this[k] = fresh.actions[k].bind(this)
+    for (const k in fresh.getters) this[k] = computed(fresh.getters[k])
+    // (b) state：旧值优先，新增 key 才用新值
+    //     这就是「保留登录态」的关键
+    for (const k in fresh.state) if (!(k in this)) this[k] = fresh.state[k]
+    // (c) 被删除的字段：从老对象上抹掉
+    const live = { ...fresh.state, ...fresh.getters, ...fresh.actions }
+    for (const k of Object.keys(this)) {
+      if (k !== '$id' && k !== '_hotUpdate' && !(k in live)) delete this[k]
     }
   }
+  return store
 }
-```
 
-逐段语义：
-
-- **① 取 pinia**：优先用 `hot.data.pinia`（Vite 在多次热更新间持久化的 `hot.data`），回退到 `initialUseStore._pinia`。`_pinia` 是 dev-only 字段，在 store 首次创建时挂到 `useStore` 上（`store.ts:913`，类型定义 `types.ts:517` 标注 *"Dev only pinia for HMR"*）。
-- **③ 写回 `hot.data.pinia`**：因为 Vite 的 `hot.data` 在 accept 回调之间被保留，写回去后下一次热更新还能取到同一个 pinia 实例。
-- **④⑤ 遍历整个新模块**：注意是对 `newModule` 做 `for...in`，而非只看单个 store。**一个文件里定义多个 store 时，HMR 会逐一替换**——这点常被忽略。
-- **⑥ id 一致性校验**：若新 store 的 `$id` 与最初注册的不同，报 `PINIA_R1005`（文案：*The store id changed from "..." to "...", forcing a reload.*，见 `diagnostics.ts:33-37`），并调用 `hot.invalidate()`。invalidate 会让 Vite 放弃 HMR、回退到**整页 reload**——因为 store 的 id 是 `pinia._s` 注册表的 key，改名无法就地完成。
-- **⑧ `useStore(pinia, existingStore)`**：这是真正触发替换的一行，详见下一节。
-
----
-
-## 三、核心机关：`useStore` 的第二个参数 `hot`
-
-这是整套 HMR 设计最巧妙、也最易被忽略的一点。`defineStore` 闭包返回的 `useStore`，签名是：
-
-```ts
-// packages/pinia/src/store.ts:883
-function useStore(pinia?: Pinia | null, hot?: StoreGeneric): StoreGeneric
-```
-
-第二个参数 `hot` 平时（组件里 `useStore()` 调用）永远不会被传。但 `acceptHMRUpdate` 故意把**现存的 store 实例**当作 `hot` 传了进去（`hmr.ts:118`）。于是 `useStore` 内部据此分流：
-
-```ts
-// packages/pinia/src/store.ts:902-930
-if (!pinia._s.has(id)) {            // 注册表里还没有该 store → 创建并注册
-  // createSetupStore(...) / createOptionsStore(...) —— 创建并写入 pinia._s
-  if (__DEV__) useStore._pinia = pinia
-}
-const store = pinia._s.get(id)!      // 拿到现存实例
-
-if (__DEV__ && hot) {                 // hot 传入 → 进入 HMR 分支
-  const hotId = '__hot:' + id
-  const newStore = isSetupStore
-    ? createSetupStore(hotId, setup, options, pinia, true)      // 第 5 个参数 true = HMR 模式
-    : createOptionsStore(hotId, assign({}, options), pinia, true)
-  hot._hotUpdate(newStore)            // ← 把新 store 灌进现存实例
-  delete pinia.state.value[hotId]     // 清理临时态，避免污染注册表
-  pinia._s.delete(hotId)
-}
-```
-
-务必看清第一个 `if` 的条件方向：`!pinia._s.has(id)` 为真，说的是「注册表里**还没有**这个 store」，块内（`store.ts:904-908`）执行的是 `createSetupStore`/`createOptionsStore` 的**创建**逻辑。而在 HMR 路径下，store 早已存在、`has(id)` 为真，**根本不会进入这个创建块**——这恰恰是「跳过创建、复用现有实例」的情形。两种情形千万别搞混。
-
-这段揭示了 Pinia HMR 的设计哲学——**最小入侵**：
-
-1. HMR 路径下 `pinia._s.has(id)` 为真，**不进入**上面的创建块，直接复用现有实例（`store.ts:917` 的 `pinia._s.get(id)`）。
-2. `hot` 为真值时，以 `'__hot:' + id` 为**临时 id** 重新跑一遍 `createSetupStore`/`createOptionsStore`（第 5 个参数 `true` 即 HMR 模式标志，对应 `createSetupStore`/`createOptionsStore` 的 `hot?: boolean` 形参）。这一步用**新代码**造出一个全新的「影子 store」`newStore`，它带着新的 state/getters/actions 定义。
-3. 调用 `hot._hotUpdate(newStore)`——这里的 `hot` 就是 `existingStore`，即把新 store 的定义**灌进旧实例**。
-4. 灌完后删除临时 id 对应的 state 与 `_s` 注册项，避免影子 store 污染。
-
-也就是说，Pinia **没有为 HMR 单独写一套替换引擎**，而是复用了 `useStore(pinia, hot)` 这个本属内部的参数，借 store.ts:919 的 HMR 分支完成替换。这是「最小入侵」的精髓。
-
----
-
-## 四、逐类调和：`_hotUpdate` 内部
-
-`_hotUpdate` 挂在 store 上（`store.ts:600`，且在插件应用**之前**挂上，以便插件可覆盖）。它对 state、getters、actions 分门别类地调和。新 store 的「热更清单」由一个 `markRaw` 化的 `_hmrPayload` 承载：
-
-```ts
-// packages/pinia/src/store.ts:424-429
-const _hmrPayload = /*#__PURE__*/ markRaw({
-  actions: {} as Record<string, any>,
-  getters: {} as Record<string, Ref>,
-  state: [] as string[],
-  hotState,
+// ---- v1：登录 + 计数器，doubled = count * 2 ----
+const v1 = (s) => ({
+  state: { token: '', count: 0 },
+  getters: { doubled: () => s.count * 2 },
+  actions: {
+    login(t) { this.token = t },
+    inc() { this.count++ },
+  },
 })
-```
+const store = makeStore('user', v1)
 
-其中 `hotState` 是一个独立的 `ref({})`（`store.ts:280`），专供 HMR 期间 `store.$state` 的读取兜底——`$state` 的 getter 在热更期间会重定向到它（`store.ts:584`：`get: () => (__DEV__ && hot ? hotState.value : pinia.state.value[$id])`）。
+// 模拟组件订阅：注册一次，之后再也不重新订阅
+effect(() => console.log('[组件]', 'count =', store.count, 'doubled =', store.doubled))
+store.login('abc')
+store.inc()
 
-### (a) state 调和（store.ts:602-636）
-
-遍历 `newStore._hmrPayload.state`，**按 store 类型二选一**（这是全章的关键差异）：
-
-```ts
-// packages/pinia/src/store.ts:602-628
-newStore._hmrPayload.state.forEach((stateKey) => {
-  if (stateKey in store.$state) {
-    const newStateTarget = newStore.$state[stateKey]
-    const oldStateSource = store.$state[stateKey]
-    if (
-      isOptionsStore &&
-      typeof newStateTarget === 'object' &&
-      isPlainObject(newStateTarget) &&
-      isPlainObject(oldStateSource)
-    ) {
-      patchObject(newStateTarget, oldStateSource)   // option store → 深合并
-    } else {
-      newStore.$state[stateKey] = oldStateSource    // setup store → 整体搬运
-    }
-  }
-  store[stateKey] = toRef(newStore.$state, stateKey) // 重新挂接，保持 store.x 与 $state.x 同步
+// ---- v2：HMR 推送——doubled 改成 *3、删 login、加 logout ----
+const v2 = (s) => ({
+  state: { token: '', count: 0 },
+  getters: { doubled: () => s.count * 3 },
+  actions: {
+    logout() { this.token = '' },
+    inc() { this.count++ },
+  },
 })
-// 之后：删除新 state 里已不存在的旧键（store.ts:631-636）
+store._hotUpdate(v2)
+
+console.log('[验证] token 仍在 / login 已删 / logout 新增:',
+  store.token === 'abc', typeof store.login === 'undefined', typeof store.logout === 'function')
+store.inc()  // 同一个 effect 还在工作 = 对象身份没变
 ```
 
-注意条件里 `typeof newStateTarget === 'object'` 与 `isPlainObject(newStateTarget)` 是**并列两项**：前者先排除 `null`/非对象，后者再用 `toString` 判定纯对象，二者缺一不可。
-
-为什么不能统一用 `patchObject` 深合并？源码注释（store.ts:606-613，对应 issue #2611）解释得很清楚：
-
-- **option store** 在定义时就声明了完整的 state 形状，缺一个 key 意味着开发者有意删除了它，`patchObject` 能把旧值精确调和进新形状。
-- **setup store** 的 state 是命令式创建的（如 `ref({})`），运行时可能动态新增属性，深合并会丢失这些动态属性。所以必须**整体搬运**旧值。
-
-这正是第一节里 `patchObject`「只管一层递归合并、不负责分发」的原因——分发逻辑在这里。
-
-### (b) 屏蔽 devtools 误报（store.ts:638-645）
-
-热更期间把 `pinia.state.value[$id]` 重指到 `toRef(newStore._hmrPayload, 'hotState')`，会让 Vue Devtools 把这次状态迁移误记成一次 mutation。为避免噪音，Pinia 临时关掉两个监听标志，**且两个标志的恢复时机并不相同**：
-
-```ts
-// packages/pinia/src/store.ts:638-645
-isListening = false
-isSyncListening = false
-pinia.state.value[$id] = toRef(newStore._hmrPayload, 'hotState')
-isSyncListening = true                       // 重指之后，同步立即恢复
-nextTick().then(() => {
-  isListening = true                         // 仅这一个延后到下一 tick
-})
-```
-
-即：`isSyncListening` 在重指之后**同步**置回 `true`（`store.ts:642`，紧跟 `store.ts:641` 的重指），而 `isListening` 要延后到 `nextTick` 才恢复（`store.ts:643-644`）。于是同步监听能立刻重新生效，异步监听则跳过本次 tick 的瞬时波动。
-
-### (c) actions 替换（store.ts:647-654）
-
-遍历 `newStore._hmrPayload.actions`，用 `action(actionFn, actionName)` 重新包装（重新包上 `$onAction` 钩子）后赋给 `store[actionName]`。
-
-### (d) getters 替换（store.ts:657-671）
-
-```ts
-// packages/pinia/src/store.ts:657-671
-for (const getterName in newStore._hmrPayload.getters) {
-  const getter = newStore._hmrPayload.getters[getterName]
-  const getterValue = isOptionsStore
-    ? computed(() => { setActivePinia(pinia); return getter.call(store, store) })  // option → computed 包裹
-    : getter                                                                        // setup → 直接用
-  store[getterName] = getterValue
-}
-```
-
-option store 的 getter 是「函数」，需要用 `computed` 重新包裹并绑定 `setActivePinia`；setup store 的 getter 本身已经是 computed，直接拿来用。
-
-### (e)(f) 清理与收尾（store.ts:673-692）
-
-删除新代码里已不存在的旧 getters / actions，最后把 `store._hmrPayload`、`store._getters` 指向新 store 的，复位 `store._hotUpdating = false`。
-
----
-
-## 五、完整调用链（一图流）
+预期输出：
 
 ```
-用户注册：import.meta.hot.accept(acceptHMRUpdate(useUser, import.meta.hot))
-   │
-   └─ Vite 触发 → (newModule) => {
-        pinia = hot.data.pinia || initialUseStore._pinia            // hmr.ts:89
-        for (exportName in newModule):
-          if isUseStore(useStore) && pinia._s.has($id):             // hmr.ts:103
-            if id !== initialUseStore.$id → PINIA_R1005 + hot.invalidate()  // hmr.ts:107
-            existingStore = pinia._s.get(id)                        // hmr.ts:113
-            useStore(pinia, existingStore)                          // hmr.ts:118 ★
-                │
-                └─ useStore 内 __DEV__ && hot 分支                   // store.ts:919
-                     newStore = createSetupStore('__hot:'+id, …, true)  // store.ts:921
-                     existingStore._hotUpdate(newStore)             // store.ts:925 ★★
-                        ├─ state: patchObject 深合并(option) / 整体搬运(setup) // 602-628
-                        ├─ 屏蔽 devtools mutation 监听             // 638-645
-                        ├─ actions: action(…) 重新包装             // 647-654
-                        ├─ getters: computed 包裹 / 直用           // 657-671
-                        ├─ 删除已移除的 state/getters/actions       // 631-687
-                        └─ store._hmrPayload/_getters 指向 newStore // 690-692
-                     清理 '__hot:'+id 的 state 与 _s 注册项         // store.ts:928-929
-      }
+[组件] count = 0 doubled = 0
+[组件] count = 1 doubled = 2
+[组件] count = 1 doubled = 3
+[验证] token 仍在 / login 已删 / logout 新增: true true true
+[组件] count = 2 doubled = 6
 ```
 
----
+第三行 `count = 1 doubled = 3` 是整套机制的灵魂时刻：`count` 还是 `1`（旧值保留），但 `doubled` 已经是新算法（`*3`）了。最后一行 `count = 2 doubled = 6` 是身份保留的活证据——那个 `effect` 是 HMR 之前注册的，它捕获的 `store` 引用还能继续响应字段变化，说明对象身份没换、依赖追踪没断。
 
-## 六、为什么叫「无损」
+演示里故意省略了什么：Vite 的 `import.meta.hot` 接线、option store 与 setup store 的合并分支、`isListening` 关闭、devtools 集成、`'__hot:'` 临时 id——这些都是为了让"换零件不换壳"这个核心思想裸露出来。下面讲权衡时会逐一补回真实机制。
 
-回看全链路，HMR 的「无损」体现在三处设计收敛：
+## 五条权衡
 
-1. **实例不变**：始终是 `existingStore = pinia._s.get(id)` 这个同一个实例，组件里持有的引用不会失效。替换只是把内部 state/getters/actions 换掉。
-2. **状态保留**：state 调和时遍历旧值、写进新结构（option store 深合并 / setup store 整体搬运），用户操作产生的运行时状态被搬进新代码定义的形状里。
-3. **形状同步**：新结构里删掉的 key 被清理，新增的 key 被挂接，`store.x` 与 `store.$state.x` 通过 `toRef` 保持同步。
+下面五条权衡是这套设计真正"咬合"的地方。每一条都是「做了 X 选择 → 换来了 Y → 代价是 Z」的具体交换。
 
-而当 store 的 `$id` 变了（结构无法就地迁移），Pinia 也不硬撑，直接 `hot.invalidate()` 让 Vite 整页刷新——这是「宁可刷新也不丢状态一致性」的兜底。
+### 权衡 1（核心）：就地属性替换 vs 重建 store 对象
 
-最后再强调一次生产期剥离：`__DEV__` 为假时 `acceptHMRUpdate` 返回 `() => {}`（hmr.ts:85-87），`_hotUpdate`、`_hmrPayload`、`_pinia`、`hotState` 等基础设施全部在 `__DEV__`/`hot` 守卫之后。这些代码在构建期被判定为死代码并 tree-shake，**线上产物里 HMR 既无体积成本，也无运行时成本**——这是一条「只在开发期存在」的能力。
+**做了什么**：HMR 时不 `pinia._s.set(id, newStore)` 整体替换，而是在老 store 的 reactive 代理对象上逐字段改：actions 赋新函数、getters 重新 computed、state 按"旧值优先"搬运、删掉被移除的字段。老 store 这个对象本身——它的内存地址、它在 Vue 响应式系统里的代理身份——从头到尾没变。
+
+**换来什么**：组件侧零成本。组件 1 在 `setup` 里 `const store = useUserStore()` 拿到的引用，HMR 之后还是同一个；模板里的 `{{ store.user }}`、`@click="store.logout"`、`watch(() => store.count, ...)`、`store.$subscribe(...)` 全部继续工作。不需要重新挂载、不需要重新 inject、也不需要触发任何"重新建立依赖"的逻辑——只有真正读了被改字段的组件才会因响应式通知而重渲。
+
+**代价**：`_hotUpdate` 必须自己逐字段处理，且必须区分 option store 和 setup store 两种合并语义（详见权衡 3）。整个函数对 Vue 响应式内部细节（`toRef`、`isPlainObject`、`patchObject`）依赖很重，它必须懂"什么是 state、什么是 getter、什么是被删掉的字段"。
+
+**反过来如果不这么做——选重建 store——会发生什么**：
+
+- 组件 A 持有的 `useUserStore()` 引用瞬间变成对老对象的引用，老对象还在内存里活着，但已经不在注册表里——成了孤儿。
+- 模板里的 `{{ store.user }}` 读的还是老对象的 user 字段，新代码里改了 user 也不会反映过去——「看起来 store 还在，但行为反常」是最难调的 bug。
+- `store.$subscribe(cb)` 注册的 cb 不会再被新 store 触发，但旧 cb 闭包还挂着——内存泄漏 + 静默失效。
+- devtools 的时间线会断——它订阅的是老 store，新 store 上的 mutation 它根本看不到。
+- `pinia.state.value[id]` 里那个老 ref 被换掉后，所有 `toRef(pinia.state.value[id], 'xxx')` 派生出来的引用全部失效。
+- 如果有插件在 store 上注入了属性（router、i18n、persisted state 等），全部要重跑一遍插件初始化——而插件副作用往往不是幂等的。
+
+这就是为什么 Pinia 选了"逐字段改老对象"这条更复杂的路——它把复杂性集中在 `_hotUpdate` 一个函数里，换来了所有下游消费者零感知。其他四条权衡讨论的机制（影子 store、临时 id、isListening 关闭、id 漂移保护……）都是为了支持这一条而存在的配套设施。
+
+### 权衡 2：新建影子 store 复用 setup 管线 vs 直接读新模块导出
+
+**做了什么**：拿到新代码后，不是手写一套"解析新代码、提取 state/getter/action"的 HMR 专用逻辑，而是直接用 `'__hot:' + id` 作为临时 id 调一遍正常的 `createSetupStore`，得到一份完整的影子 store。
+
+**换来什么**：复用全部 setup 管线——state 分类、getter 标记、action 包装的逻辑一行都不用重写。HMR 路径和生产路径共享同一段核心代码，bug 修一处就好。
+
+**代价**：临时往 `pinia._s` 和 `pinia.state.value` 里塞了个 `'__hot:user'` 条目，必须记得在 `_hotUpdate` 之后手动清理。如果清理失败（理论上不会，但万一），注册表里会留下垃圾条目，下一次正常创建 store 时可能命中错误缓存。
+
+### 权衡 3：option store 走 deep merge、setup store 走整值转移
+
+**做了什么**：state 合并分两条路走——option store 对 plain object 子节点用 `patchObject` 做 deep merge；setup store 直接整值转移。注意这里 setup store 的转移方向是 **旧值 → 新结构**：先把老 store 上那份 state 的值整体赋给新结构里对应的槽位（`newStore.$state[stateKey] = oldStateSource`，源码注释里就一句"transfer the ref"），再让老 store 的这个属性重新指向新结构里的同一个槽位（`store[stateKey] = toRef(newStore.$state, stateKey)`）。最终 `store.count` 读到的还是旧值——因为新结构里那个槽位装的就是旧值。
+
+两条路殊途同归：**旧值 wins，新结构保留**。差异只在"如何把新旧两份 state 揉到一起"——option store 因为声明了完整形状，可以按 key 细粒度 deep merge；setup store 因为运行时可能动态新增字段，必须整值转移避免丢字段。
+
+**换来什么**：两种 store 类型各取最合适的合并策略——option store 享受细粒度保留（即使子对象某个嵌套字段被改了也能保留），setup store 享受运行时新增属性的安全性（issue #2611 报的就是这个 bug）。
+
+**代价**：同一份 `_hotUpdate` 内嵌两条分支，理解成本翻倍。读到这段代码的人必须知道"为什么这两种 store 不一样"才能理解逻辑——而这个知识只能通过看注释或踩过坑获得。
+
+### 权衡 4：HMR 期间临时关掉 isListening
+
+**做了什么**：`_hotUpdate` 在搬运 state 之前，把 `isListening` 和 `isSyncListening` 两个全局监听标志关掉，搬运完再恢复（同步立即恢复、异步在 `nextTick` 恢复）。
+
+**换来什么**：state 搬运不会被 `$subscribe` 误报为一次 mutation。如果不关，组件里那些 `store.$subscribe(cb)` 注册的 cb 会以为"用户改了一堆 state"，触发一堆错误的副作用——而实际上这只是 HMR 在搬运。
+
+**代价**：这套 `isListening` 机制和 `$patch` 共用——同一个 flag 承担了两种语义：「批量 patch 时不要逐次通知」和「HMR 搬运时不要误报」。读源码的人看到 `isListening = false` 必须结合上下文判断到底属于哪种情形。同时，HMR 期间新增了一个 `_hotUpdating` 标志位来防止 watcher 事件被错误归集到 patch 的批量事件里——标志位又多了一个。
+
+### 权衡 5：id 漂移强制 hot.invalidate() 整页重载
+
+**做了什么**：`acceptHMRUpdate` 在遍历新模块导出时，会检查每个 store 的 `$id` 是否和初始 `useStore.$id` 一致。不一致，立即调 `hot.invalidate()`——Vite 收到这个信号会放弃 HMR、改走整页刷新。
+
+**换来什么**：store 的身份稳定可追踪。devtools 永远知道 user store 就是 user store；缓存逻辑、订阅、状态序列化都建立在 id 稳定这个前提上。如果允许热更新里偷偷改 id，整个生态的可观测性都会被绕晕。
+
+**代价**：这次编辑彻底失去 HMR 收益——开发者会注意到这是少数会触发整刷的情形。但这其实是合理的：改 `$id` 通常意味着你在做结构性重构（拆分 store、合并 store），这种情况下"保留状态"反而是错的——你正在重新定义状态结构。
+
+## 综合回到那个登录场景
+
+回到开头那个加 `console.log` 的场景。配上 HMR 之后：
+
+1. 你保存文件，Vite 推送新模块。
+2. `acceptHMRUpdate` 识别出 `useUserStore`，找到老 store。
+3. 用 `'__hot:user'` 跑一遍新 setup，得到影子 store（含新版 `login`、带 `console.log`）。
+4. 调 `userStore._hotUpdate(shadow)`：`login` 字段被替换成新版函数，token 和其他 state 原封不动。
+5. 影子清理，老 store 复活。
+
+你再点登录按钮——组件里 `userStore.login(...)` 调的是新版 action，`console.log` 打出来了，token 也写进 state 了——但上次的登录态、首页的滚动位置、表单里那半截输入，全都在。这就是 Pinia HMR 想给你的开发体验：**改代码这件事，跟用户态无关**。

@@ -10,25 +10,24 @@
     "vue",
     "nuxt",
     "vitepress",
-    "vitest",
-    "vite"
+    "vitest"
   ],
   "entrypoints": [
     "packages/pinia/src/index.ts",
     "packages/nuxt/src/module.ts",
-    "packages/testing/src/index.ts"
+    "packages/testing/src/index.ts",
+    "packages/playground/src/main.ts",
+    "packages/online-playground/src/main.ts",
+    "packages/size-check/src/pinia.js"
   ],
   "manifests": [
     "package.json",
-    "pnpm-workspace.yaml",
     "tsconfig.json",
     "vitest.config.ts",
-    "codecov.yml",
-    "netlify.toml",
     ".oxfmtrc.json",
+    "pnpm-workspace.yaml",
     "packages/pinia/package.json",
     "packages/pinia/tsdown.config.ts",
-    "packages/pinia/test-dts/tsconfig.json",
     "packages/nuxt/package.json",
     "packages/nuxt/tsconfig.json",
     "packages/testing/package.json",
@@ -39,10 +38,12 @@
     "packages/docs/typedoc.tsconfig.json",
     "packages/playground/package.json",
     "packages/playground/tsconfig.json",
+    "packages/playground/vite.config.ts",
     "packages/online-playground/package.json",
-    "packages/online-playground/vite.config.ts",
     "packages/online-playground/tsconfig.json",
-    "packages/size-check/package.json"
+    "packages/online-playground/vite.config.ts",
+    "packages/size-check/package.json",
+    "packages/size-check/rollup.config.mjs"
   ],
   "packages": [
     {
@@ -84,11 +85,47 @@
       "type": "dir"
     },
     {
+      "path": "scripts/release.ts",
+      "type": "file"
+    },
+    {
+      "path": "scripts/verifyCommit.mjs",
+      "type": "file"
+    },
+    {
+      "path": "scripts/docs-check.sh",
+      "type": "file"
+    },
+    {
+      "path": ".github",
+      "type": "dir"
+    },
+    {
+      "path": ".github/workflows",
+      "type": "dir"
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "type": "file"
+    },
+    {
+      "path": ".github/workflows/release.yml",
+      "type": "file"
+    },
+    {
+      "path": ".vscode",
+      "type": "dir"
+    },
+    {
       "path": "package.json",
       "type": "file"
     },
     {
       "path": "pnpm-workspace.yaml",
+      "type": "file"
+    },
+    {
+      "path": "pnpm-lock.yaml",
       "type": "file"
     },
     {
@@ -100,7 +137,19 @@
       "type": "file"
     },
     {
-      "path": "README.md",
+      "path": "renovate.json",
+      "type": "file"
+    },
+    {
+      "path": "codecov.yml",
+      "type": "file"
+    },
+    {
+      "path": "netlify.toml",
+      "type": "file"
+    },
+    {
+      "path": ".oxfmtrc.json",
       "type": "file"
     },
     {
@@ -137,15 +186,15 @@
       "type": "file"
     },
     {
-      "path": "packages/pinia/src/hmr.ts",
-      "type": "file"
-    },
-    {
       "path": "packages/pinia/src/subscriptions.ts",
       "type": "file"
     },
     {
-      "path": "packages/pinia/src/types.ts",
+      "path": "packages/pinia/src/hmr.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/pinia/src/devtools.ts",
       "type": "file"
     },
     {
@@ -157,7 +206,15 @@
       "type": "file"
     },
     {
+      "path": "packages/pinia/src/types.ts",
+      "type": "file"
+    },
+    {
       "path": "packages/pinia/src/globalExtensions.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/pinia/src/global.d.ts",
       "type": "file"
     },
     {
@@ -165,7 +222,7 @@
       "type": "dir"
     },
     {
-      "path": "packages/pinia/src/devtools/plugin.ts",
+      "path": "packages/pinia/src/devtools/index.ts",
       "type": "file"
     },
     {
@@ -175,10 +232,6 @@
     {
       "path": "packages/pinia/test-dts",
       "type": "dir"
-    },
-    {
-      "path": "packages/pinia/package.json",
-      "type": "file"
     },
     {
       "path": "packages/pinia/tsdown.config.ts",
@@ -218,7 +271,19 @@
       "type": "file"
     },
     {
-      "path": "packages/nuxt/package.json",
+      "path": "packages/nuxt/playground",
+      "type": "dir"
+    },
+    {
+      "path": "packages/nuxt/test",
+      "type": "dir"
+    },
+    {
+      "path": "packages/nuxt/shims.d.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/nuxt/tsconfig.json",
       "type": "file"
     },
     {
@@ -247,7 +312,11 @@
       "type": "file"
     },
     {
-      "path": "packages/testing/package.json",
+      "path": "packages/testing/tsdown.config.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/testing/tsconfig.build.json",
       "type": "file"
     },
     {
@@ -256,6 +325,18 @@
     },
     {
       "path": "packages/docs/.vitepress",
+      "type": "dir"
+    },
+    {
+      "path": "packages/docs/.vitepress/config",
+      "type": "dir"
+    },
+    {
+      "path": "packages/docs/.vitepress/config/index.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/docs/.vitepress/theme",
       "type": "dir"
     },
     {
@@ -275,7 +356,23 @@
       "type": "dir"
     },
     {
-      "path": "packages/docs/package.json",
+      "path": "packages/docs/run-typedoc.mjs",
+      "type": "file"
+    },
+    {
+      "path": "packages/docs/typedoc-markdown.mjs",
+      "type": "file"
+    },
+    {
+      "path": "packages/docs/vite-typedoc-plugin.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/docs/vite.config.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/docs/typedoc.tsconfig.json",
       "type": "file"
     },
     {
@@ -287,11 +384,44 @@
       "type": "dir"
     },
     {
+      "path": "packages/playground/src/main.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/playground/src/App.vue",
+      "type": "file"
+    },
+    {
+      "path": "packages/playground/src/router.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/playground/src/api",
+      "type": "dir"
+    },
+    {
+      "path": "packages/playground/src/composables",
+      "type": "dir"
+    },
+    {
       "path": "packages/playground/src/stores",
       "type": "dir"
     },
     {
-      "path": "packages/playground/package.json",
+      "path": "packages/playground/src/views",
+      "type": "dir"
+    },
+    {
+      "path": "packages/playground/index.html",
+      "type": "file"
+    },
+    {
+      "path": "packages/playground/vite.config.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/playground/tsconfig.json",
       "type": "file"
     },
     {
@@ -303,7 +433,52 @@
       "type": "dir"
     },
     {
-      "path": "packages/online-playground/package.json",
+      "path": "packages/online-playground/src/main.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/online-playground/src/App.vue",
+      "type": "file"
+    },
+    {
+      "path": "packages/online-playground/src/Header.vue",
+      "type": "file"
+    },
+    {
+      "path": "packages/online-playground/src/VersionSelect.vue",
+      "type": "file"
+    },
+    {
+      "path": "packages/online-playground/src/defaults.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/online-playground/src/download",
+      "type": "dir"
+    },
+    {
+      "path": "packages/online-playground/src/icons",
+      "type": "dir"
+    },
+    {
+      "path": "packages/online-playground/index.html",
+      "type": "file"
+    },
+    {
+      "path": "packages/online-playground/vite.config.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/online-playground/tsconfig.json",
+      "type": "file"
+    },
+    {
+      "path": "packages/online-playground/shims-vue.d.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/online-playground/netlify.toml",
       "type": "file"
     },
     {
@@ -311,27 +486,55 @@
       "type": "dir"
     },
     {
-      "path": "packages/size-check/package.json",
+      "path": "packages/size-check/src",
+      "type": "dir"
+    },
+    {
+      "path": "packages/size-check/src/pinia.js",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/size-check/scripts",
+      "type": "dir"
+    },
+    {
+      "path": "packages/size-check/rollup.config.mjs",
       "type": "file"
     }
   ],
   "docs": [
     "README.md",
     "SECURITY.md",
+    "LICENSE",
+    ".github/CODE_OF_CONDUCT.md",
+    ".github/CONTRIBUTING.md",
+    ".github/commit-convention.md",
+    ".github/PULL_REQUEST_TEMPLATE.md",
+    ".github/ISSUE_TEMPLATE.md",
     "packages/pinia/README.md",
-    "packages/pinia/CHANGELOG.md",
     "packages/nuxt/README.md",
-    "packages/nuxt/CHANGELOG.md",
     "packages/testing/README.md",
-    "packages/testing/CHANGELOG.md",
     "packages/online-playground/README.md",
     "packages/docs/index.md",
     "packages/docs/introduction.md",
     "packages/docs/getting-started.md",
     "packages/docs/core-concepts/index.md",
+    "packages/docs/core-concepts/state.md",
+    "packages/docs/core-concepts/getters.md",
+    "packages/docs/core-concepts/actions.md",
+    "packages/docs/core-concepts/plugins.md",
+    "packages/docs/core-concepts/outside-component-usage.md",
     "packages/docs/cookbook/index.md",
+    "packages/docs/cookbook/composables.md",
+    "packages/docs/cookbook/composing-stores.md",
+    "packages/docs/cookbook/hot-module-replacement.md",
+    "packages/docs/cookbook/testing.md",
+    "packages/docs/cookbook/migration-v1-v2.md",
+    "packages/docs/cookbook/migration-v2-v3.md",
+    "packages/docs/cookbook/migration-vuex.md",
+    "packages/docs/cookbook/options-api.md",
     "packages/docs/ssr/index.md",
-    ".github/CONTRIBUTING.md",
-    ".github/CODE_OF_CONDUCT.md"
+    "packages/docs/ssr/nuxt.md"
   ]
 }

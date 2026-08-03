@@ -1,244 +1,160 @@
-# 响应式引用提取：`storeToRefs`
+# storeToRefs：从 reactive store 解构出 refs
 
-> **核心问题**：直接解构一个 store 会丢失响应式——`const { count, double } = useStore()` 之后，`count` 和 `double` 变成了**脱离 store 的普通值**，store 再变化它们也不会更新。`storeToRefs(store)` 就是为了解决这一件事：把 state 转成 ref、把 getter 转成计算属性，**忽略** action 与一切非响应式属性，让解构后的每个字段仍然「连着」store。
+## 一个让你踩坑的瞬间
 
-本章只聚焦一个目标文件 `storeToRefs.ts`（共 ~116 行），它依赖前置章节「store 的定义与实例化」给出的一个事实：**store 本身是一个 Vue `reactive` 代理**。理解了这一点，本章的一切都顺理成章。
-
----
-
-## 1. 要解决的问题：解构为什么会丢响应式
-
-store 的构建链是这样的（来自 store-definition）：
-
-```
-defineStore(...) → createSetupStore / createOptionsStore
-  store = reactive(partialStore)          // store.ts:478
-```
-
-也就是说 `useStore()` 拿到的 `store` 是一个 **reactive proxy**。Vue 的响应式建立在「属性访问触发依赖收集」之上：你读 `store.count` 时，这个 get 被 proxy 拦截、登记依赖；但一旦你写 `const { count } = store`，就等于**复制了那一瞬间的值**，复制出的 `count` 不再经过 proxy，依赖链就断了。
+你刚写完一个 setup store：
 
 ```ts
-const store = useStore()
-const { count } = store       // ❌ count 现在是快照值，store.count 变了它不感知
-const refs = storeToRefs(store)
-const { count: countRef } = refs  // ✅ countRef 是个 ref，store.count 变它就变
-```
-
-所以 `storeToRefs` 的本质是：**逐键地把「经代理访问」的行为，重新打包成一个个独立的 ref / computed**。
-
----
-
-## 2. 前置原语：来自 Vue 的五块积木
-
-`storeToRefs` 只从 `vue` 引入了 5 个运行时工具，整段逻辑就是它们的组合：
-
-| 积木 | 作用 | 在本章的角色 |
-|------|------|--------------|
-| `toRaw(proxy)` | 取 reactive 代理背后的原始 target | 遍历键用（拿到「干净的」对象去 `for...in`） |
-| `isRef(x)` | 判断是否为 ref | state 分支判据 |
-| `isReactive(x)` | 判断是否为 reactive 对象 | state 分支判据 |
-| `toRef(proxy, key)` | 把「某代理的某属性」包成一个属性 ref | **构造** state 引用 |
-| `computed({get,set})` | 计算属性 | **构造** getter 引用 |
-
-注意缺了一块：**Vue 没有公开的 `isComputed`**。下一节会看到 storeToRefs 是怎么「绕」出 computed 的。
-
----
-
-## 3. 自底向上：读 `storeToRefs` 的主循环
-
-完整主体只有 10 行有效逻辑（`storeToRefs.ts:87-116`）：
-
-```ts
-export function storeToRefs<SS extends StoreGeneric>(store: SS): StoreToRefs<SS> {
-  const rawStore = toRaw(store)                    // storeToRefs.ts:90
-
-  const refs = {} as StoreToRefs<SS>
-  for (const key in rawStore) {                    // storeToRefs.ts:93
-    const value = rawStore[key]                    // storeToRefs.ts:94  原始值，仅用于分类
-    if (value?.effect) {                           // storeToRefs.ts:97  → getter
-      refs[key] = computed({                       // storeToRefs.ts:99-106
-        get: () => store[key],
-        set(value) { store[key] = value },
-      })
-    } else if (isRef(value) || isReactive(value)) { // storeToRefs.ts:107 → state
-      refs[key] = toRef(store, key)                // storeToRefs.ts:109-111
-    }
-    // 隐式 else：action / 原始值 / null / markRaw 值 → 直接跳过，不写入 refs
-  }
-  return refs
-}
-```
-
-可以把它看成一台**三分支分类器**：
-
-```
-for (key in rawStore):
-  value = rawStore[key]
-   │
-   ├─ value?.effect 为真？  ──是──▶ getter 分支：包一层 computed
-   │       (ComputedRefImpl 才有 .effect)
-   │
-   ├─ isRef(value)||isReactive(value)？ ──是──▶ state 分支：toRef(store,key)
-   │
-   └─ 否 ──▶ 跳过（函数 action、null、原始值、markRaw 包装的值）
-```
-
-### 3.1 为什么先 `toRaw` 再遍历？
-
-`store` 是 reactive 代理。对代理做 `for...in` 会被 get trap 拦截、可能触发依赖收集与一些副作用；`toRaw(store)` 返回代理背后的原始 target，对它遍历既干净又确定能枚举到 store 的全部**自有可枚举属性**（含插件注入的属性，见第 5 节）。这是循环基座。
-
-### 3.2 getter 识别：用 `value?.effect` 代替不存在的 `isComputed`
-
-Vue 的 `ComputedRefImpl` 内部持有一个 `effect: ReactiveEffect` 字段，而普通 `RefImpl`、reactive 对象、函数都**没有** `.effect`。源码注释直说「没有原生方法判断 computed」，并指向 vuejs/core#4165：
-
-```ts
-// storeToRefs.ts:95-97
-// There is no native method to check for a computed
-// https://github.com/vuejs/core/pull/4165
-if (value?.effect) { ... }
-```
-
-同一手法在前置章节的 `store.ts` 里也有，只是多加了一道 `isRef` 前置：
-
-```ts
-// store.ts:144-147
-function isComputed(o: any): o is ComputedRef {
-  return !!(isRef(o) && (o as any).effect)
-}
-```
-
-**这里有个分支顺序的关键点**：computed 本身也是一种 ref。storeToRefs 必须把 `.effect` 判断**放在** `isRef||isReactive` **之前**，否则一个 getter 会先命中 state 分支被 `toRef` 处理，类型就错了。store.ts 里因为有 `isRef(o) &&` 兜底可以不在意顺序，但 storeToRefs 删掉了 `isRef` 前置，于是「先 getter、后 state」的次序就成了正确性的一部分。
-
-可选链 `value?.effect` 同时提供了 **null 安全**：当 `value` 是 `null` 或原始值时不会抛错，直接走 else 被跳过——这正是测试 `does not crash on a non-reactive null value`（`storeToRefs.spec.ts:206-222`）所验证的。
-
----
-
-## 4. getter 分支：为什么不直接返回原 computed，而要「重新包一层」？
-
-这是全章最反直觉、也最关键的设计。分类已经识别出 `value` 是个 computed，却**不**把它原样放进 `refs`，而是重新包一层：
-
-```ts
-// storeToRefs.ts:99-106
-refs[key] = computed({
-  get: () => store[key],            // 通过代理读，而非捕获原 computed
-  set(value) { store[key] = value },// 通过代理写
+const useCounter = defineStore('counter', () => {
+  const count = ref(0)
+  const double = computed(() => count.value * 2)
+  function inc() { count.value++ }
+  return { count, double, inc }
 })
 ```
 
-注意 getter 闭包里读的是**代理** `store[key]`，而不是被分类出来的那个 `value`。三者缺一不可：
-
-**① HMR 热替换后仍指向最新值。** 开发期热更新会把 `store.double` 替换成一个全新的 computed（`storeToRefs.spec.ts:175-191` 的 `keep reactivity` 用例）。如果当初捕获的是旧 computed 对象，`double.value` 会永远读到旧值；而读代理 `store[key]` 永远拿到「当前」这个键上的值——替换了也跟着走。
-
-```
-HMR：store.double = computed(() => 1)
-  refs.double.get() → store.double  → 新 computed.value = 1   ✅
-  （若当初存的是旧 value：refs.double.get → 旧值 ✗）
-```
-
-**② 构造期零副作用（惰性）。** `computed` 的 `get` 闭包 `() => store[key]` 在**构造 `storeToRefs` 时根本没被调用**，要等谁读 `refs[k].value` 才求值。`does not trigger getters`（`storeToRefs.spec.ts:193-204`）断言：构造期间 spy 调用次数为 0。这也意味着对一个有大量 getter 的 store 调 `storeToRefs` 是廉价的。
-
-**③ 保留可写 getter 的 setter。** setup store 允许用 `computed({get,set})` 定义可写 getter。包装体固定的 `set(value){ store[key] = value }` 把写操作经代理转发给底层可写 computed，再触发其 setter（`storeToRefs.spec.ts:156-173` 的 `preserve setters in getters`：`refs.double.value = 4` → `n` 变 2）。**即便 options store 的 getter 实质只读，包装体也恒带 `set`**——类型层（第 6 节）会单独把「只读 vs 可写」传达给消费方。
-
----
-
-## 5. state 分支：用 `rawStore` 分类，用 `store` 构造
+在组件里你想拍平成多个 ref 直接用：
 
 ```ts
-// storeToRefs.ts:94 与 107-111
-const value = rawStore[key]          // ← 用 rawStore 判断类型
-...
-else if (isRef(value) || isReactive(value)) {
-  refs[key] = toRef(store, key)      // ← 用 store（代理）构造引用
+const store = useCounter()
+const { count, double, inc } = storeToRefs(store)
+```
+
+为什么非得写 `storeToRefs`，而不能直接 `toRefs(store)`？毕竟 store 看起来就是个 reactive 对象。
+
+试一下你就会发现两件怪事：解构出来的 `double` 不会随 `count` 变（它被钉死在 `toRefs` 调用那一刻的求值结果），而 `inc` 被包成了 `Ref<function>`——你要写 `inc.value()` 才能调用，类型和心智全乱。
+
+为什么？因为 store **不只是一个 reactive 对象**。它内部混着三种性质完全不同的字段：
+
+- **state**：原始的 `ref` 或 `reactive`
+- **getter**：`computed` 出来的对象
+- **action**：普通函数
+
+Vue 的 reactive 代理在 `get` 时会**自动解包 ref**——你从代理上读 `store.count` 拿到的是裸值 `0`，读 `store.double` 拿到的是 computed 当次求值的结果，而不是 computed 对象本身。朴素 `toRefs` 在代理上工作，看到的都是「已经解包过的快照」，根本没法区分三种字段。Pinia 需要一个**懂这套语义**的解构器，这就是 `storeToRefs`。
+
+## 怎么解决：先脱代理，再三路分发
+
+说人话就是：**绕过代理看真相，按字段真实身份分别打包，故意丢掉不要的**。
+
+一个类比：reactive 代理就像一个会自动拆快递的前台，你递给它什么它都先拆开给你看内容物。但你现在想做的是「按包裹类型分拣」，必须绕过前台直接看货架上的原始包裹——这就是 `toRaw` 干的事。
+
+```
+storeToRefs(store)
+  → toRaw(store)               # 脱掉代理，拿到原始字段表
+  → for key in rawStore:       # 遍历真实字段
+      value = rawStore[key]    # 取「未经解包」的真值
+      ├─ value?.effect         # 分支 A：computed（鸭子类型）
+      ├─ isRef||isReactive     # 分支 B：state
+      └─ 其它（函数/null/原始值）# 分支 C：跳过
+  → 返回 refs
+```
+
+判断顺序硬性规定为「先 computed、再 ref/reactive」。为什么？因为 Vue 的 `ComputedRefImpl` 同样实现了 ref 协议（`__v_isRef = true`），先做 `isRef` 会把所有 getter 错误地塞进 state 分支，丢失 computed 该有的 laziness 与可写性。这个顺序是后面权衡 2 的核心。
+
+## 最小演示：手撸一个 storeToRefs
+
+下面这段脚本可以直接 `bun storeToRefs.ts`（或 `npx tsx storeToRefs.ts`）跑。它构造一个含 state/getter/action/null 的「假 store」，实现迷你 `storeToRefs`，并和朴素 `toRefs` 对比。
+
+```ts
+import {
+  ref, computed, reactive,
+  toRaw, toRef, toRefs, isRef, isReactive,
+} from 'vue'
+
+// 迷你 storeToRefs：三路分发
+function storeToRefs(store: any) {
+  const rawStore = toRaw(store)        // ① 脱代理
+  const refs: any = {}
+  for (const key in rawStore) {
+    const value = rawStore[key]        // ② 取未经解包的真值
+    if (value?.effect) {               // ③ 分支 A：computed
+      refs[key] = computed({
+        get: () => store[key],         //    读经代理
+        set: (v) => { store[key] = v },//    写经代理
+      })
+    } else if (isRef(value) || isReactive(value)) { // ④ 分支 B：state
+      refs[key] = toRef(store, key)
+    }
+    // ⑤ 分支 C：函数 / null / 原始值 → 隐式跳过
+  }
+  return refs
 }
+
+// 假 store：state、getter、action、null 各一种
+const store = reactive({
+  count: ref(0),
+  double: computed({
+    get: () => store.count * 2,
+    set: (v: number) => { store.count = v / 2 },
+  }),
+  inc() { store.count++ },
+  nullable: null,
+})
+
+const refs = storeToRefs(store)
+const naive = toRefs(store)
+
+console.log('storeToRefs keys:', Object.keys(refs))
+// → ['count', 'double']   inc 和 nullable 不见了
+console.log('naive toRefs keys:', Object.keys(naive))
+// → ['count', 'double', 'inc', 'nullable']
+
+// getters 仍然「按需重算」
+store.count = 10
+console.log(refs.double.value)   // → 20，跟随 count
+console.log(naive.double.value)  // 行为不稳：可能拿到 toRefs 那一刻的快照
+
+// setter 经代理转发，原 computed 的 set 被触发
+refs.double.value = 30
+console.log(store.count)         // → 15
 ```
 
-这是全章最容易被误读的一处。两个对象名相近、但承担相反的职责：
+跑完你会看到三个关键现象：
 
-- **`rawStore[key]` 只用来判断「这条该不该进 state 分支」**——`isRef`/`isReactive` 检测的是原始值本身。
-- **构造 ref 用的是代理 `store`**。`toRef(reactiveProxy, key)` 返回一个「属性 ref」：读它就等于读 `store[key]`、写它就等于 `store[key] = v`，**读写全程穿透代理**。只有这样，依赖追踪才能正确建立、解构后才能双向同步。
+1. `storeToRefs` 的结果只有 `count` 和 `double`，action 和 null 被丢；
+2. `double` 仍然是 lazily 重算的 computed，跟随 `count` 变化；
+3. 给 `refs.double.value` 赋值会经代理转发到原 computed 的 set，把 `count` 改成 15。
 
-setup store 的 reactive 子对象最直观地体现这种双向性（`storeToRefs.spec.ts:51-88`）：
+## 关键权衡
 
-```
-读 refs.r.value  → store.r（代理，返回同一个 reactive 对象）
-写 refs.r.value.n++  ⇄  store.r.n++   互相可见
-```
+> 本章机制集中在前述三个分支的判断与重打包上。下面四条权衡解释「为什么这样设计」，是这一章真正的交付。
 
-判据 `isRef(value) || isReactive(value)` 还顺带把**插件注入的响应式 state** 纳入：`for...in rawStore` 会枚举到插件经 `pinia.use()` 写进来的属性；是 ref/reactive 的（如 `pluginN: ref(20)`）就进，是普通值（如 `shared: 10`）就被同一道过滤跳过（`storeToRefs.spec.ts:129-154`）。
+### 权衡 1：绕过 reactive 代理读 raw store
 
----
+**做了**：所有字段判断都以 `toRaw(store)` 为起点，不复用代理给的现成读取。
 
-## 6. 一条隐藏前置链路：issue #799
+**换来**：对字段真实身份的判断能力——能区分 computed、ref/reactive、函数、原始值。没有这一步，分支逻辑根本无从谈起。
 
-第 3 节说 `for (const key in rawStore)` 要能枚举到 state/getter，是有前提的——这些键必须真的存在于 raw target 上。这个前提由前置章节 `store.ts` 末尾**专门为 `storeToRefs` 加的一行**保证：
+**代价**：每条字段都得在 raw store 上单独取值；computed 检测靠的是 `value?.effect` 这种**鸭子类型**——直接探 Vue `ComputedRefImpl` 的内部字段名 `effect`。Vue 长期没有公开的 `isComputed` API（社区提过相关 PR 一直没合并），Pinia 只能临时碰内部字段。这是个**隐藏耦合点**：Vue 大版本一旦把 `effect` 字段改名，这里就会断。可选链 `value?.` 同时承担了「value 为 null/undefined 时短路」的作用——这就是为什么 store 里塞个 null 也不会崩。
 
-```ts
-// store.ts:573-578
-// add the state, getters, and action properties
-assign(store, setupStore)
-// allows retrieving reactive objects with `storeToRefs()`. Must be called after
-// assigning to the reactive object.  Make `storeToRefs()` work with `reactive()` #799
-assign(toRaw(store), setupStore)
-```
+### 权衡 2：computed 检测必须放在 isRef 之前
 
-setup 函数返回的对象 `setupStore` 先 `assign` 到代理 `store`（让组件里 `store.xxx` 能用），再 `assign` 到 `toRaw(store)`（让 raw target 也持有这些自有可枚举属性）。没有第二行，`toRaw(store)` 上就只有 `partialStore` 的东西，`storeToRefs` 的循环会枚举不到任何 setup store 的字段——这就是 issue #799 的修复点，也是本章能成立的地基。
+**做了**：分支顺序硬性规定为「先 `value?.effect`、再 `isRef||isReactive`」。
 
----
+**换来**：对「computed 也是 ref」这一 Vue 设计的正确分流。先做 `isRef` 会把所有 getter 错误地塞进 state 分支，丢失 laziness 与可写性——`double` 会变成一个普通的 `toRef(store, 'double')`，每次读都强制重算且没法 set 回去。
 
-## 7. 类型层：`StoreToRefs` 的三段交集
+**代价**：读源码时必须理解三路分发的优先级，不能简单按 Vue 文档照搬——你看不到一个标准的「`isRef(x) ? ... : ...`」二分。这也是为什么文档承诺「methods and non reactive properties are completely ignored」能成立：computed 被先挑走后，剩下的函数/null/原始值自然落入「跳过」桶。
 
-返回值的类型 `StoreToRefs<SS>` 是三个部分的交集（`storeToRefs.ts:70-77`）：
+### 权衡 3：computed 重打包一层，而不是直接复用
 
-```ts
-export type StoreToRefs<SS extends StoreGeneric> =
-  SS extends unknown
-    ? _ToStateRefs<SS> &                                  // ① state
-        ToRefs<PiniaCustomStateProperties<StoreState<SS>>> & // ② 插件 state
-        _ToComputedRefs<StoreGetters<SS>>                 // ③ getter
-    : never
-```
+**做了**：对每个 getter 不直接返回原 `ComputedRefImpl`，而是再包一个 `computed({ get: () => store[key], set: v => store[key] = v })`。
 
-分别对应运行时的三条来源。其中两处细节值得点明：
+**换来**：两件事。一是 **HMR 友好**——热更新时 `store[key]` 会被替换成新 computed；如果直接复用旧对象，解构出来的 ref 就永远指向被替换前的旧 computed，新代码改不动了。外层包装的 `get` 每次都重新读 `store[key]`，热更新后自然能拿到新对象，解构出来的 ref 仍然有效。二是**写经代理的一致性**——`set` 把值写回代理 `store[key]`，所有 trigger 都走同一条响应式路径，devtools、`$subscribe`、`$patch` 都能感知到这次写。
 
-- **外层 `SS extends unknown` 恒真**，注释明说「总是 true，但这个条件类型让类型对联合做**分布式展开**」。写法上看似多余，实则是为了在 store 是联合类型时逐成员拆开。
-- **getter 的只读 / 可写被区分**（`storeToRefs.ts:32-46`）：`_IsReadonly` 通过对比「去掉 `readonly` 前后类型是否相同」来判定——**两者相同 → 非只读 → `WritableComputedRef`；两者不同 → 只读 → `ComputedRef`**（方向别记反，注释里 `false`/`true` 标得很清楚）。
+**代价**：每个 getter 多一层 computed 嵌套（多一次 effect 串联），需要依赖 Vue computed 的依赖追踪正确把外层标记为 dirty。这是个**为可维护性付的性能税**，但 store 里 getter 通常不多，开销可以忽略。
 
-这恰好和运行时「包装体恒带 `set`」呼应：运行时统一可写，**类型层**负责把可写性如实传达给消费方。
+### 权衡 4：故意丢弃函数与非响应式原始值
 
----
+**做了**：函数（actions）、null/undefined、原始值（数字、字符串、布尔）、`markRaw` 标记的对象——既无 `effect`、也不是 ref/reactive——统统不进结果对象。
 
-## 8. 端到端数据流
+**换来**：解构结果**只含响应式数据**的干净 API。你拿到的对象上每一个字段都是 ref/computed，不会有 `Ref<function>` 这种尴尬类型，也不会有 `nullable: null` 这种无意义条目。
 
-把构造期与使用期串起来，完整的图景如下：
+**代价**：用户在解构后拿不到 action，必须保留 store 引用——`const { inc } = storeToRefs(store)` 行不通，得写 `const { inc } = store` 或单独保留 store。但这是**特性而非缺陷**：actions 本来就不是响应式数据，应该用 `store.method()` 调用；把它们包成 ref 既不符合语义，也会让 TS 类型变成不可用的 `Ref<(...args) => any>`。Pinia 文档明确推荐这种用法。
 
-```
-【构造期】storeToRefs(store)
-  toRaw(store) → rawStore
-  for key in rawStore:
-       getter  → computed({get:()=>store[key], set})   闭包此刻不执行（惰性）
-       state   → toRef(store, key)                     绑定代理
-       其余    → 跳过
-  返回 refs
+## 类型层的三段拼接（侧栏）
 
-【使用期·getter】refs.double.value
-  读 → 包装 computed.get → store.double（代理解包）→ 底层 getter computed.value
-  写 → 包装 computed.set → store.double = v → 底层可写 computed 的 setter
-
-【使用期·state】refs.count.value
-  读 → store.count（代理，自动解包 ref）
-  写 → store.count = v（代理，回写到底层 ref/reactive）
-```
-
----
+类型签名 `StoreToRefs<SS>` 把 getters / state / 插件注入字段 拆成三段不同的 ref 形态——state 给出 `ToRef`、插件注入字段给出对应 ref 形态、getters 给出 `ComputedRef` 或 `WritableComputedRef`。运行时返回的对象**不区分这三段**，是同一个 plain object；类型层的拆分只是为了让 setter / readonliness 表达到 TS 类型上——比如有 setter 的 getter 类型会是 `WritableComputedRef`，没 setter 的是 `ComputedRef`。这套靠条件类型的协变/双变技巧探测 readonly 实现，理解运行时原理用不上，留给 API 参考。
 
 ## 小结
 
-`storeToRefs` 是一台极简的分类器，但它每一个看似随意的选择都有理由：
-
-- **`toRaw` + `for...in`** → 干净枚举，连插件 state 都收（地基是 store.ts:578 的双写）；
-- **`value?.effect` 先行** → 用 ComputedRefImpl 的内部字段代替不存在的 `isComputed`，顺带 null 安全；
-- **getter 重新包 computed 且读代理 `store[key]`** → HMR 不失效、构造期零副作用、可写 setter 保留；
-- **state 用 `toRef(store,key)`** → 「rawStore 分类、store 构造」，读写穿透代理，解构后双向同步；
-- **action / null / 原始值 / markRaw** → 静默跳过，不报警告。
-
-记住一句话：**它没有复制任何值，而是为每个响应式字段重新建立了一条「经代理访问」的引用通道**——这就是解构后响应式不丢的全部秘密。
+`storeToRefs` 看起来只是一行 `toRefs` 的等价替换，背后是 Pinia 对「store 不是普通 reactive 对象」这一事实的承认：state、getter、action 三种字段性质不同，得分别对待。它做的事可以浓缩成一句——**绕过代理看真相，按身份分别打包，故意丢掉不要的**。

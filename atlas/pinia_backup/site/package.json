@@ -1,5 +1,6 @@
 {
-  "name": "atlas-site",
+  "name": "atlas-site-pinia",
+  "version": "0.1.0",
   "type": "module",
   "private": true,
   "scripts": {
@@ -8,6 +9,6 @@
     "docs:preview": "vitepress preview"
   },
   "devDependencies": {
-    "vitepress": "^1.6.3"
+    "vitepress": "^1.5.0"
   }
 }

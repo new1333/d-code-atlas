@@ -1,286 +1,294 @@
-# @pinia/nuxt 模块与 SSR payload
+# @pinia/nuxt：搭便车搭出四个零样板
 
-把 Pinia 用进一个纯 SPA，只要两行：`const pinia = createPinia()` 再 `app.use(pinia)`。但把 Pinia 搬进 Nuxt 的同构应用，这「两行」远远不够——服务端每个请求需要独立的 Pinia 实例、用户希望 `defineStore` 等符号自动可用、渲染出来的 store 状态要安全地送到客户端水合（hydrate），而敏感或无用数据又不该跟着外泄。
+你刚把 `@pinia/nuxt` 装上，在 `stores/counter.ts` 里随手写了个 `defineStore`，回车刷新页面，发现四件事居然都自动到位了：
 
-本章拆解 `@pinia/nuxt` 这五个文件如何一次性解决这些问题。前置概念来自 [[pinia-instance]]（`createPinia` / `setActivePinia` / `$pinia`）与 [[store-definition]]（`defineStore` / setup store 水合 / `skipHydrate`）。
+- 组件里 `useCounter()` 没写 `import` 也认得；
+- 服务端算出来的 `count = 1`，客户端首次渲染就是 1，不用再发请求；
+- dev 模式下改 store 文件，组件里那份状态没被清空；
+- 给某个字段套 `skipHydrate(...)`，网络响应里那个字段真的就消失了。
 
-> 贯穿全章的一个核心概念是 **「状态的往返」**：store 的 state 如何在服务端被收集、序列化进 Nuxt payload、随 HTML 下发，再在客户端原样回灌——同时保证整条链路只引用**同一份 Pinia**。
+四件事，零配置。这章要拆的就是 `@pinia/nuxt` 怎么把这四件事全部搭到 Nuxt 已经造好的车上——payload 序列化通道、自动导入系统、Vite 插件机制——而不是自己再造一份。说人话就是：**Nuxt 已经在跑一趟从服务端到客户端的货车，Pinia 把自己的 state 装箱贴标签塞上去就行了**。
 
-## 全景：构建线与运行时线
+下面按从下到上拆：先看模块挂载期埋了哪些钩子，再看一次 SSR 请求里 state 怎么上车上车下车，然后看 `skipHydrate` 怎么从 payload 里把字段抹掉，最后看 HMR 是怎么在编译期往你的源码里贴东西的。
 
-这五个文件可归为两条线，正文沿此展开：
+## 一、模块挂载期：趁 Nuxt 还在拼装，往各处贴钩子
+
+Nuxt 模块的本质是：在 Nuxt 自己还没拼完的时候，提前埋好一批「等会儿要触发的钩子」。`@pinia/nuxt` 的 `setup` 函数按这个顺序贴：
+
+1. 把 runtime 目录加进 `build.transpile`，让运行时文件被正确编译；
+2. 把 `pinia` 加进 `vite.optimizeDeps.exclude`，dev 模式下不让 Vite 单独预构建出第二份 pinia——避免页面上同时存在两个 pinia 实例；
+3. 注册四个核心 API 的自动导入：`defineStore`、`acceptHMRUpdate`、`usePinia`、`storeToRefs`，全部从一个本地 `composables` 入口转发到真正的 pinia；
+4. 把用户 stores 目录（默认 `<srcDir>/stores`）加进自动导入，多层 layers 项目会按每层的 `app` 目录分别 add；
+5. 在 `modules:done` 钩子里 `addPlugin(main)` + `addPlugin(payload-plugin)`；
+6. dev 模式再追加一个 Vite 插件用来注入 HMR 接受代码。
+
+第 5 步的时机是有讲究的——**主 plugin 必须在路由等核心模块都注册完之后才挂**，否则可能拿到一个还没装好 router 的 vueApp。`modules:done` 这个钩子就是 Nuxt 给的「所有模块都就位」信号。
+
+第 3 步那个 `composables` 文件本身只有 5 行：`export * from 'pinia'` 加一个自定义的 `usePinia = () => useNuxtApp().$pinia`。让自动导入路径只指向这一个本地入口、再由它转发到真正的 pinia——避免「自动导入路径与运行时模块路径不一致」的尴尬。
+
+## 二、SSR：渲染完成后，把 state 拷进 payload
+
+服务端渲染走完一整圈后，Nuxt 会广播一个 `app:rendered` 钩子。`@pinia/nuxt` 的主 runtime plugin 就在这个钩子里把当前 pinia 的全部 state 拷贝到 `nuxt.payload.pinia`。
+
+主 plugin 的 setup 流程是：
 
 ```
-构建 / 装配线（模块 setup 期，仅一次）
-  module.ts ──┬─► composables.ts（单一 pinia 来源）
-              ├─► 注册运行时插件 plugin / payload-plugin
-              ├─► 自动导入 defineStore / acceptHMRUpdate / usePinia / storeToRefs
-              ├─► storesDirs × layers 自动导入 store
-              └─► dev 下挂 auto-hmr-plugin（自动注入 HMR）
-
-运行时 SSR 数据线（每次请求 / 首屏）
-  plugin.ts        ── createPinia → 序列化 state → payload.pinia → 客户端回灌
-  payload-plugin.ts── 序列化时剔除被 skipHydrate() 标记的值
+createPinia()
+   ↓
+vueApp.use(pinia)        ← 把 pinia 装进 Vue app（同时触发 pinia 自身的 toBeInstalled 队列）
+   ↓
+setActivePinia(pinia)    ← 设全局活动指针，让「组件外的 useStore」也能拿到当前实例
+   ↓
+若 payload 已有 pinia 字段 → pinia.state.value = payload.pinia   ← 客户端首屏走这里
+   ↓
+provide({ pinia })       ← 暴露成 nuxtApp.$pinia
 ```
 
-下面自底向上：先看「单一 pinia 来源」这个最底层的原语，再叠出装配线，最后落到运行时往返。
+到了 `app:rendered` 钩子，做两件事：
 
-## 一、单一 Pinia 来源：composables.ts
+```
+nuxtApp.payload.pinia = toRaw($pinia).state.value   ← 拷一份集中 state 进 payload
+setActivePinia(undefined)                            ← 立刻清空全局活动指针
+```
 
-整个文件只有两行业务逻辑：
+第二行是关键。为什么要在渲染完才清？因为渲染期间组件外（server-only 派生逻辑、插件间相互调用）可能仍需要 active pinia；只有等整次渲染完成才能安全清理。**不清的后果很严重**：同一个 Node 进程会连续处理多个请求，全局 active pinia 是个单例，第二个请求进来时若残留第一个请求的实例，store 数据就串了。这是「Pinia 实例」章里「全局 activePinia 单例」的代价在 SSR 场景的显性化。
+
+## 三、客户端：拿到 payload 直接灌进 state
+
+客户端的 setup 流程跟服务端几乎一样，区别只在于：服务端那次 `payload.pinia` 还没填，所以走的是「创建空 state」分支；客户端那次 `payload.pinia` 已经被 Nuxt 反序列化好了，于是 `if (nuxtApp.payload.pinia) pinia.state.value = payload.pinia` 这行命中，把整份 state 一次性灌进新 pinia。
+
+接着 `vueApp.use(pinia)` 触发 pinia 内部的 hydration 钩子，让每个 store 把对应字段搬运到自己的 ref 上。这部分的细节（按值类型分支、`skipHydrate` 标记、Map/Set 重建）已经在「State 集中化与 SSR hydration」章讲过，这里只点一句：**Nuxt 这一层只负责把整份 state 安全运到客户端，剩下交给 pinia 核心**。
+
+## 四、skipHydrate：用「打标 + 替换」从 payload 里剔字段
+
+你的 store 里可能有这种字段：服务端从某处抓了个 router 实例、或者一个 Vue 组件实例、或者一个 WebSocket 连接塞进 store。这种对象**不该被序列化进 HTML**——它太大、它只在客户端才有意义、或者它根本不能序列化。
+
+Pinia 给的 API 是 `skipHydrate(obj)`，它会用 `Object.defineProperty` 在对象上贴一个 Symbol 标记。`shouldHydrate(obj)` 检查这个标记决定要不要参与 hydration。
+
+`@pinia/nuxt` 在 `payload-plugin.ts` 里把这套标记接到 Nuxt 的 payload 序列化协议上：
 
 ```ts
-// packages/nuxt/src/runtime/composables.ts:3-5
-export * from 'pinia'
-export const usePinia = () => useNuxtApp().$pinia as Pinia
+definePayloadReducer('skipHydrate', (data) => !shouldHydrate(data) && 1)
+definePayloadReviver('skipHydrate', (_data: 1) => undefined)
 ```
 
-`export * from 'pinia'` 把 pinia 的全部导出（`defineStore`、`storeToRefs`、`acceptHMRUpdate`…）原样转手；`usePinia` 则从 Nuxt 注入的 `$pinia` 取回运行时实例。
+两行就够了。reducer 在序列化时检查「这个对象是不是被标记了不要 hydrate」，是的话返回占位值 `1`（Nuxt 协议要求返回 truthy 才算匹配）；reviver 在反序列化时把占位值还原成 `undefined`。
 
-为什么这点是全章根基？因为后面 `module.ts` 注册的自动导入符号都 `from: composables`（即此文件），意味着应用里用到的 `defineStore` 最终都经它从 pinia 转出。结合下文 `optimizeDeps.exclude('pinia')`，两者共同保证「全应用只引用一份 pinia」——这是 [[pinia-instance]] 中「单一 store 注册表」前提在 Nuxt 下的兑现。
+注意这里有个微妙的细节：**reducer 必须返回 truthy**。如果写成 `!shouldHydrate(data)` 单独返回，遇到 `false` 时 Nuxt 会认为没匹配，字段会按原样序列化。所以源码里写成 `&& 1`——`!shouldHydrate(data)` 为 `true` 时返回数字 `1`，为 `false` 时整个表达式就是 `false`。
 
-## 二、构建期装配：module.ts
+这套机制本质是「半绕过」——字段名还在 payload 里，但值被替换成了一个 1 字节的占位。它没真正从 payload 字段集中移除，而是把值抹掉了。为什么不做「真删除」？因为 Nuxt 的 payload 协议是「类型化序列化」的——每个被替换的值都带一个类型标签，整个 payload 在客户端是按规则逐字段还原的。要让「字段消失」就得在更上层动 schema，那就不在 reducer 这一层能办的事了。
 
-### 2.1 模块定义
+## 五、HMR：扫源码、首尾各贴一段
+
+改一行 store 代码，浏览器里组件的本地状态居然没被清空。这件事看起来像魔法，其实是**编译期**做的——Vite transform 阶段往你的源码里贴东西。
+
+`@pinia/nuxt` 在 dev 模式注册了一个 Vite 插件，每个被请求的模块都会过一遍它的 `transform`。流程是这样的：
+
+```
+transform(code, id)
+   ↓
+id 以 \x00 开头？           → 跳过（Vite virtual module）
+   ↓
+id 不以 rootDir 开头？      → 跳过（node_modules / nuxt 内部文件都不扫）
+   ↓
+code 不含 'defineStore'？    → 跳过（粗筛）
+   ↓ 已含 'acceptHMRUpdate'？ → 跳过（用户手写过 HMR，避免重复）
+   ↓
+this.parse(code) 拿 AST
+   ↓
+遍历顶层节点：VariableDeclaration 或 ExportNamedDeclaration
+   ↓
+在 declarations 里找：init.callee.name === 'defineStore'
+   ↓
+取 declarator.id.name（比如 'useCounter'）
+   ↓
+产出新代码
+```
+
+最后产出的代码长这样——**注意是首尾各贴一段，原文件居中不动**：
 
 ```ts
-// packages/nuxt/src/module.ts:29-37
-const module = defineNuxtModule<ModuleOptions>({
-  meta: {
-    name: 'pinia',
-    configKey: 'pinia',
-    compatibility: { nuxt: '^3.15.0 || ^4.0.0 || ^5.0.0' },
-  },
-  defaults: {},
-  setup(options, nuxt) { /* … */ },
+import { acceptHMRUpdate } from 'pinia'   ← 顶部新增一行 import
+// ↓↓↓ 原文件完整内容 ↓↓↓
+import { ref } from 'vue'
+export const useCounter = defineStore('counter', () => {
+  const count = ref(0)
+  return { count }
 })
+// ↑↑↑ 原文件完整内容 ↑↑↑
+if (import.meta.hot) {                    ← 末尾追加一个 if 块
+  import.meta.hot.accept(acceptHMRUpdate(useCounter, import.meta.hot))
+}
 ```
 
-`ModuleOptions` 只暴露一个可选项 `storesDirs?: string[]`。注意 JSDoc 写 `@default ['stores']`，但 `defaults: {}` 其实是空的——真正的默认值在 `setup` 内延迟赋值（见 §2.3）。
+也就是说，插件**没有重写 AST、没有包裹原代码**，只是在文件最前面贴一行 import、最后面贴一段 if 块，原文件一字不动夹在中间。这是「最小侵入」策略的体现——能文本拼接就绝不走 AST 重写，重写一次就有一次出错风险。
 
-### 2.2 四处构建副作用
+到了浏览器收到 HMR 信号时，Vite 触发新模块的 `import.meta.hot.accept` 回调，回调里调 `acceptHMRUpdate(useCounter, import.meta.hot)`，剩下的就地替换逻辑由 pinia 核心的 HMR 系统接管（详见「HMR」章）。
 
-`setup` 一开始解析出运行时目录，随后产生四项影响构建结果的副作用：
+**这个机制有边界**，得知道什么情况下不会被自动注入：
+
+- `export default defineStore(...)`——`id` 不是 Identifier，不会被识别；
+- `defineStore('foo', {...})` 作为表达式语句单独调用——它不是 VariableDeclaration，扫不到；
+- `import { defineStore as ds }` 然后用 `ds(...)`——`callee.name` 写死比较的是字符串 `'defineStore'`，所以**别名调用一定不会被识别**；
+- 文件在 `node_modules`、Nuxt 内部目录、以 `\x00` 开头的 virtual module——`rootDir` 限定把它们全部排除在外。
+
+这四条边界里，前三条都因为同一个原因：扫描器只认**顶层 VariableDeclaration / ExportNamedDeclaration 形式**里 `callee.name === 'defineStore'` 的字面调用。其他形式（默认导出、表达式语句、别名）都不在识别范围内。这是「最小实现」的代价——一份二十来行的扫描器覆盖了 90% 的写法，剩下 10% 用户自己手写一行 `import.meta.hot.accept` 也并不困难。
+
+## 六、最小演示：手写 payload 往返 + AST 注入
+
+下面两段演示脱离 Nuxt 完全能跑，演透上面两套机制。
+
+### 演示一：payload 往返
 
 ```ts
-// packages/nuxt/src/module.ts:40-55
-const { resolve } = createResolver(import.meta.url)
-const runtimeDir = fileURLToPath(new URL('./runtime', import.meta.url))
+// 模拟 Nuxt payload 的 reducer/reviver + pinia state 往返
+const SKIP = Symbol('skipHydrate')
 
-// (a) 转译运行时目录
-nuxt.options.build.transpile.push(resolve(runtimeDir))
-
-// (b) 避免「多份 pinia」
-nuxt.options.vite.optimizeDeps ??= {}
-nuxt.options.vite.optimizeDeps.exclude ??= []
-if (!nuxt.options.vite.optimizeDeps.exclude.includes('pinia')) {
-  nuxt.options.vite.optimizeDeps.exclude.push('pinia')
+function skipHydrate<T>(obj: T): T {
+  if (obj && typeof obj === 'object') {
+    Object.defineProperty(obj, SKIP, {})
+  }
+  return obj
 }
 
-// (c) 把本包类型纳入生成的类型引用
-nuxt.hook('prepare:types', ({ references }) => {
-  references.push({ types: '@pinia/nuxt' })
-})
-```
-
-(b) 是与 §一呼应的关键：注释原文 "avoids having multiple copies of pinia"。若不排除，SSR 与客户端会各自预打包出一份 pinia，导致 store 注册表 `_s` 分裂、状态对不上。这不是泛泛的「性能优化」，而是「单一实例」的具体动机。
-
-第四处在 `modules:done` 钩子内注册两个运行时插件：
-
-```ts
-// packages/nuxt/src/module.ts:57-62
-// Add runtime plugin before the router plugin
-nuxt.hook('modules:done', () => {
-  addPlugin(resolve(runtimeDir, 'plugin'))
-  addPlugin(resolve(runtimeDir, 'payload-plugin'))
-})
-```
-
-刻意在 router 插件之前注册（注释链接 nuxt/framework#9130），保证 pinia 实例先于路由就绪。
-
-### 2.3 自动导入：符号 + store 目录
-
-```ts
-// packages/nuxt/src/module.ts:66-71
-addImports([
-  { from: composables, name: 'defineStore' },
-  { from: composables, name: 'acceptHMRUpdate' },
-  { from: composables, name: 'usePinia' },
-  { from: composables, name: 'storeToRefs' },
-])
-```
-
-四个符号都来自 §一的 `composables`。接着是 `storesDirs` 的真实默认值与 layer 展开：
-
-```ts
-// packages/nuxt/src/module.ts:73-86
-if (!options.storesDirs) {
-  // resolve it against the src dir which is the root by default
-  options.storesDirs = [resolve(nuxt.options.srcDir, 'stores')]
+function shouldHydrate(obj: unknown): boolean {
+  return !(obj && typeof obj === 'object' && Object.hasOwn(obj as object, SKIP))
 }
-if (options.storesDirs) {
-  const layers = getLayerDirectories(nuxt)
-  for (const storeDir of options.storesDirs) {
-    for (const layer of layers) {
-      addImportsDir(resolve(layer.app, storeDir))
-    }
+
+// 服务端：建一份集中 state，给 router 字段打上「不要序列化」标记
+const serverState = {
+  counter: { count: 1, router: skipHydrate({ path: '/secret' }) },
+}
+
+// 渲染完成后，整份 state 拷进 payload（对应 plugin.ts 的 app:rendered 钩子）
+const payload = { pinia: serverState }
+
+// reducer：把被标记的对象替换成占位值 1（注意必须返回 truthy）
+function reduce(data: unknown): unknown {
+  if (data && typeof data === 'object' && !shouldHydrate(data)) return 1
+  if (Array.isArray(data)) return data.map(reduce)
+  if (data && typeof data === 'object') {
+    return Object.fromEntries(
+      Object.entries(data as Record<string, unknown>).map(([k, v]) => [k, reduce(v)])
+    )
+  }
+  return data
+}
+
+const serialized = JSON.stringify(reduce(payload))
+console.log(serialized)
+// {"pinia":{"counter":{"count":1,"router":1}}}
+//                                              ↑ 占位
+
+// reviver：把占位 1 还原成 undefined
+function revive(data: unknown): unknown {
+  if (data === 1) return undefined
+  if (Array.isArray(data)) return data.map(revive)
+  if (data && typeof data === 'object') {
+    return Object.fromEntries(
+      Object.entries(data as Record<string, unknown>).map(([k, v]) => [k, revive(v)])
+    )
+  }
+  return data
+}
+
+// 客户端：建空 state，把 payload 灌回（对应客户端 plugin 的 setup）
+const revived = revive(JSON.parse(serialized)) as any
+const clientState: any = {}
+clientState.pinia = revived.pinia
+
+console.log(clientState.pinia.counter.count)   // 1   ← state 安全抵达客户端
+console.log(clientState.pinia.counter.router)  // undefined  ← 标记字段被剔除
+```
+
+跑一下输出：`count` 安全过网，`router` 在客户端被还原成 `undefined`，store 内部代码会用一个客户端新建的 router 实例顶上。
+
+### 演示二：AST 扫描 + 首尾各贴一段
+
+```ts
+// 用 acorn 解析源码，识别顶层 `const useX = defineStore(...)`，
+// 然后前贴 import、后贴 if 块、原文件居中——跟 auto-hmr-plugin 行为一致
+import { parse } from 'acorn'
+
+const source = `
+import { ref } from 'vue'
+export const useCounter = defineStore('counter', () => {
+  const count = ref(0)
+  return { count }
+})
+`
+
+const ast: any = parse(source, { ecmaVersion: 'latest', sourceType: 'module' })
+
+let storeName: string | undefined
+for (const node of ast.body) {
+  if (node.type !== 'VariableDeclaration' && node.type !== 'ExportNamedDeclaration') continue
+  const decls = node.type === 'VariableDeclaration'
+    ? node.declarations
+    : node.declaration?.type === 'VariableDeclaration'
+      ? node.declaration.declarations
+      : []
+  const hit = decls.find((d: any) =>
+    d.init?.type === 'CallExpression' &&
+    d.init.callee.type === 'Identifier' &&
+    d.init.callee.name === 'defineStore'   // ← 写死比较字符串
+  )
+  if (hit?.id.type === 'Identifier') {
+    storeName = hit.id.name
+    break
   }
 }
-```
 
-可见默认值是基于 `srcDir` 解析的 `[srcDir/stores]`；而 `getLayerDirectories` 让「每个 storeDir × 每个 layer」都被纳入自动导入——多层（layer）项目里每一层的 `stores/` 都会生效。
-
-### 2.4 dev 期挂 HMR 插件
-
-```ts
-// packages/nuxt/src/module.ts:88-91
-if (nuxt.options.dev) {
-  addVitePlugin(autoRegisterHMRPlugin(resolve(nuxt.options.rootDir)))
-}
-```
-
-仅开发模式，把项目 `rootDir` 传给 §三的 Vite 插件。
-
-## 三、开发期增强：auto-hmr-plugin.ts
-
-[[hmr]] 章讲过 `acceptHMRUpdate` 需要 store 文件手写一段 `import.meta.hot.accept(...)` 样板。本插件做的就是把这段样板**自动追加**，免去手写。
-
-`transform(code, id)` 前置四道守卫，任一命中即原样返回：
-
-```ts
-// packages/nuxt/src/auto-hmr-plugin.ts:21-26
-transform(code, id) {
-  if (id.startsWith('\x00')) return              // 跳过虚拟模块
-  if (!id.startsWith(rootDir)) return            // 只处理 rootDir 内的文件
-  if (!code.includes('defineStore') || code.includes('acceptHMRUpdate')) {
-    return                                       // 无 store 定义 / 已有 HMR → 跳过
-  }
-```
-
-通过守卫后，`this.parse(code)` 解析 AST，遍历**顶层**节点（仅 `VariableDeclaration` 与 `ExportNamedDeclaration`），用 `getStoreDeclaration` 找到 `callee.name === 'defineStore'` 的声明，取变量名后拼接代码：
-
-```ts
-// packages/nuxt/src/auto-hmr-plugin.ts:49-57
-return {
-  code: [
+if (storeName) {
+  const injected = [
     `import { acceptHMRUpdate } from 'pinia'`,
-    code,
+    source,
     'if (import.meta.hot) {',
     `  import.meta.hot.accept(acceptHMRUpdate(${storeName}, import.meta.hot))`,
     '}',
-  ].join('\n'),
+  ].join('\n')
+  console.log(injected)
 }
 ```
 
-设计上有两个安全边界值得记住：**只追加、不改写**原代码；**只看顶层声明**，不递归进函数体——所以写在函数内部的 `defineStore` 不会被处理。
+把 `source` 换成 `export default defineStore(...)` 试试——`storeName` 会是 `undefined`，什么都不会注入。换成 `import { defineStore as ds }` 然后调 `ds(...)`，同样不识别。这两个边界都是演示里 `d.init.callee.name === 'defineStore'` 这行直接决定的。
 
-## 四、运行时数据线（1）：plugin.ts 建实例与整体序列化
+## 七、关键权衡
 
-现在进入「状态往返」的主线。`plugin.ts` 是运行时核心插件（`defineNuxtPlugin`），它**真的创建 pinia 实例**：
+这一章的机制比较丰富，下面四条都值得讲透。
 
-```ts
-// packages/nuxt/src/runtime/plugin.ts:8-15
-setup(nuxtApp) {
-  const pinia = createPinia()
-  nuxtApp.vueApp.use(pinia)
-  setActivePinia(pinia)
+### 权衡一：复用 Nuxt payload 通道运输 state
 
-  if (nuxtApp.payload && nuxtApp.payload.pinia) {
-    pinia.state.value = nuxtApp.payload.pinia as any
-  }
-  // … return { provide: { pinia } }
-}
-```
+**选择**：不自己造一套「序列化 store state 到 HTML」的机制，直接把 `pinia.state.value` 整体拷进 `nuxtApp.payload.pinia`，让 Nuxt 的 payload 系统负责序列化、注入 HTML、客户端反序列化。
 
-三步建实例后（`createPinia → use → setActivePinia`），紧接着判断 `payload.pinia`：
+**换来**：零自研序列化代码；payload 自动随请求往返，无需关心「怎么把数据塞进 HTML 又怎么取出来」；和 Nuxt 其他生态（数据预取、`useFetch` 缓存等）走同一条运输管道，序列化行为统一。
 
-- **服务端首次渲染**：payload 尚未写入，此分支跳过。
-- **客户端首屏**：payload 里已有服务端序列化好的 state，直接整棵赋给 `pinia.state.value` 完成水合——这就是「回灌」。
+**代价**：必须遵守 Nuxt 的类型化序列化协议——`payload-plugin` 里那一对 reducer/reviver 就是给这个协议打工；受 payload 大小限制（一个 SSR 响应能塞多少数据有上限）；想剔除字段只能「半绕过」——`skipHydrate` 把对象替换成占位 `1`、客户端还原成 `undefined`，字段名还在 payload 里、只是值没了。如果想真删除字段，得在更高层动 schema，不在 reducer 这一层能办。
 
-随后通过 `provide: { pinia }` 注入 `$pinia`，供 §一的 `usePinia()` 取用。
+### 权衡二：拆成「主 plugin + payload plugin」两个文件，且都在 `modules:done` 才挂载
 
-服务端这一侧的序列化发生在 `app:rendered` 钩子：
+**选择**：runtime 不写成一个插件，而是拆成 `plugin.ts`（建 pinia、装到 vueApp、provide、`app:rendered` 钩子）和 `payload-plugin.ts`（注册 reducer/reviver）两个文件，且都在 `modules:done` 钩子里才 `addPlugin`。
 
-```ts
-// packages/nuxt/src/runtime/plugin.ts:24-31
-hooks: {
-  'app:rendered'() {
-    const nuxtApp = useNuxtApp()
-    nuxtApp.payload.pinia = toRaw(nuxtApp.$pinia as Pinia).state.value
-    // clear up the reference to pinia on server to avoid holding onto the variable
-    setActivePinia(undefined)
-  },
-},
-```
+**换来**：让路由等核心模块先于 pinia 插件就绪（早期 Nuxt 版本里 pinia 装太早会拿到没装 router 的 vueApp）；让序列化钩子在 Nuxt payload 系统的合适时序注册；两个文件关注点清晰分离，runtime 路径与类型生成路径解耦。
 
-两件事：用 `toRaw` 取原始（非代理）state 写入 payload；再 `setActivePinia(undefined)` 清理活跃实例引用。这第二行正是 [[pinia-instance]] 里 `getActivePinia/setActivePinia` 在 SSR 的关键用途——**防止服务端跨请求持有同一个 pinia 实例造成状态串味**。
+**代价**：文件分散，初次读源码的人需要找两处；插件挂载顺序成了「需要维护的约定」——以后改这一段必须记得两个都要在 `modules:done` 内、且顺序不能反。
 
-## 五、运行时数据线（2）：payload-plugin.ts 按 skipHydrate 剔除
+### 权衡三：渲染完成后立刻清空全局 active pinia
 
-[[store-definition]] 里，setup store 常有「有状态外壳但非真正 state」的对象（如 `router` 实例），可用 `skipHydrate(obj)` 给它挂一个 Symbol 标记，让 pinia 水合时跳过它（`shouldHydrate(prop)` 为假则不回灌）。但那只是「客户端不回灌」，数据仍会出现在 payload 里被下发。
+**选择**：`app:rendered` 钩子末尾调 `setActivePinia(undefined)`。
 
-`payload-plugin.ts` 把这道防线前移到**序列化阶段**——让被标记的值压根不发给客户端：
+**换来**：避免全局单例跨请求污染——同一个 Node 进程连续处理多个请求时，第二个请求不会被前一个请求残留的 active pinia 影响。这是 SSR 场景下的「内存安全保险」。
 
-```ts
-// packages/nuxt/src/runtime/payload-plugin.ts:13-20
-const payloadPlugin = definePayloadPlugin(() => {
-  definePayloadReducer(
-    'skipHydrate',
-    // We need to return something truthy to be treated as a match
-    (data: unknown) => !shouldHydrate(data) && 1
-  )
-  definePayloadReviver('skipHydrate', (_data: 1) => undefined)
-})
-```
+**代价**：渲染完成后再调用任何依赖「当前活动 pinia」的代码会失效。比如某个 server-only 的派生任务在 `app:rendered` 之后才跑、又通过组件外 `useStore()` 取 store，会取不到——这是「Pinia 实例」章全局单例代价的显性化。换句话说，**单例换便利的代价在请求边界处必须用显式清理来兑现**。
 
-- **reducer**（序列化时）：`!shouldHydrate(data) && 1`。当值被 `skipHydrate` 标记（`shouldHydrate` 返回 `false`），表达式为 `1`（truthy，声明「这个值归我这种 payload 类型管」）；否则返回 `false` 不匹配。
-- **reviver**（反序列化时）：直接还原成 `undefined`。
+### 权衡四：AST 扫描 + 文本拼接自动注入 HMR 接受代码
 
-净效果：被 `skipHydrate()` 标记的 state 属性，在 payload 序列化传输时被替换成轻量标记、客户端恢复成 `undefined`，从而「不把无用数据发给客户端」（文件头注释原话）。
+**选择**：dev 模式注册一个 Vite 插件，对每个项目内的模块用 `this.parse` 拿 AST，扫顶层 `VariableDeclaration` / `ExportNamedDeclaration` 里 `callee.name === 'defineStore'` 的调用，拿到 store 名字后**前贴一行 import、原文件居中、后贴一段 if 块**——文本拼接产出新代码，不重写 AST、不包裹原代码。
 
-> 注意它与 `plugin.ts` 的协作：`plugin.ts` 负责**整棵** state 塞进 `payload.pinia`，`payload-plugin.ts` 负责**按标记剔除**部分值。这是「先整体序列化、再按标记剔除」的配合，而非两套独立机制——见 §六。
+**换来**：用户写 store 时零样板，一行 `import.meta.hot.accept(...)` 都不用手写；最小侵入降低出错概率；只对真正含 `defineStore` 的文件做事，其他文件零成本跳过。
 
-## 六、完整往返：两条线如何协同
+**代价**：仅识别**顶层声明形式**的 store 定义——`const useX = defineStore(...)` 与 `export const useX = defineStore(...)`，其他形式（默认导出、表达式语句、嵌套声明）不会自动注入；扫描范围限定在 `rootDir` 以下，`node_modules`、Nuxt 内部文件、以 `\x00` 开头的 virtual module 全部排除；`callee.name` 写死比较的是字符串 `'defineStore'`，所以**别名 import（如 `import { defineStore as ds }` 后用 `ds(...)`）也不会被识别**——这是用户重命名 import 时最容易踩的坑。
 
-把 §四、§五拼起来，就是一次完整的 SSR 状态往返：
+## 小结
 
-```
-【服务端】plugin.setup
-   createPinia() → use(pinia) → setActivePinia(pinia)
-   运行业务 → store.state 被填充
-   app:rendered:
-     payload.pinia = toRaw($pinia).state.value     # 整棵塞入 payload
-     setActivePinia(undefined)                      # 请求隔离
-【序列化】Nuxt 序列化 payload
-   skipHydrate reducer: 被标记值 → 标记(1)          # 剔除
-【下发】payload 随 HTML 注入到客户端
-【客户端】plugin.setup
-   skipHydrate reviver: 标记 → undefined            # 还原成空
-   payload.pinia 存在 → pinia.state.value = payload.pinia   # 回灌水合
-```
-
-一个端到端示例。假设 store 定义如下（`token` 不想下发到浏览器）：
-
-```ts
-export const useUserStore = defineStore('user', () => {
-  const token = ref('secret-xxx')
-  const profile = ref({ name: 'Ada' })
-  return { token: skipHydrate(token), profile }
-})
-```
-
-| 阶段 | `payload.pinia.user` |
-|---|---|
-| 服务端 `app:rendered` 写入 | `{ token: <被标记的 ref>, profile: { name: 'Ada' } }` |
-| 序列化经 reducer 处理 | `token` 命中 `!shouldHydrate` → 替换为标记 |
-| 客户端经 reviver 还原 | `token` 变为 `undefined`，`profile` 正常水合 |
-
-于是浏览器拿到的 `token` 是空的，既省了传输、也避免泄露；而服务端渲染该 store 时仍可用完整 `token`。
-
-## 小结与易混淆点
-
-1. **三个 "plugin" 职责不同，勿混**：① `module.ts` 是 `defineNuxtModule`（构建期装配）；② `runtime/plugin.ts` 是 `defineNuxtPlugin`（建 pinia 实例 + 序列化/回灌）；③ `payload-plugin.ts` 是 `definePayloadPlugin`（只注册 reducer/reviver，**不建实例**，只管序列化剔除）。
-2. **`storesDirs` 默认值位置**：JSDoc 写 `@default ['stores']`，但 `defaults:{}` 为空，真正默认在 `setup` 内 `if (!options.storesDirs)` 处基于 `srcDir` 延迟赋值（`module.ts:73-76`）。
-3. **`optimizeDeps.exclude('pinia')` 的动机**：避免 SSR/客户端各持一份 pinia 导致注册表分裂，与 `composables.ts` 的 `export * from 'pinia'` 一起锁死「单一实例」。
-4. **`setActivePinia(undefined)` 的意义**：服务端渲染后清理活跃引用以隔离请求，把 [[pinia-instance]] 的全局活跃实例话题与 SSR 安全串起来。
-5. **未深究的边界**：`getLayerDirectories` / `addImportsDir` / `definePayloadReducer` 的内部实现属于 Nuxt/kit 与 Nuxt payload 机制，不在本章源码范围，此处仅据调用与注释描述其行为。
+`@pinia/nuxt` 之所以能让前面那四件事零配置发生，不是因为做了很多，而是因为**做对了几次「搭便车」的选择**：state 搭 payload 的车、自动导入搭 Nuxt kit 的车、HMR 搭 Vite 插件的车、skipHydrate 搭 Nuxt 类型化序列化协议的车。每一次搭便车都换来一份「不用自己维护」的轻松，代价则是要尊重每辆车的发车时刻表与装载规则。这章的四条权衡本质上都在说同一件事：**集成层的智慧不在「写了多少代码」，而在「忍住不写多少代码」**。

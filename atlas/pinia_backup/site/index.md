@@ -2,41 +2,46 @@
 layout: home
 
 hero:
-  name: Pinia
-  text: 源码精读 · Code Atlas
-  tagline: 按 primitive → composite → system 三层架构逐章拆解 Pinia 运行时
+  name: "Pinia 源码导读"
+  text: 从 effectScope 到 Nuxt 集成的分层拆解
+  tagline: 15 章，自底向上看透 Vue 官方状态库的设计与实现
   actions:
     - theme: brand
       text: 开始阅读
-      link: /guide/01-core-types
+      link: /guide/01-effect-scope-pinia
     - theme: alt
-      text: Pinia 根实例
-      link: /guide/04-pinia-instance
+      text: 复合层概览
+      link: /guide/06-store-definition-registry
 
 features:
-  - icon: 🧱
-    title: 原子层
-    details: 核心类型契约、发布-订阅原语、运行时诊断——为整库立下骨架的编译期/轻运行时基石。
-  - icon: 🧩
-    title: 复合层
-    details: Pinia 根实例、store 定义与装配、变更/订阅 API、storeToRefs、Options API 映射辅助。
-  - icon: ⚙️
-    title: 系统层
-    details: HMR 无损热替换、Vue Devtools 集成、@pinia/nuxt 的 SSR payload 往返、@pinia/testing 测试夹具。
+  - title: 原子层
+    details: effectScope、订阅原语、$patch、Action 包装、storeToRefs —— Pinia 的五块底座，每块独立可运行。
+  - title: 复合层
+    details: defineStore 注册表、Setup/Options 两套构建器、State 集中化、插件系统 —— 把原子层粘合成完整的 store 工厂。
+  - title: 系统层
+    details: HMR、DevTools、mapHelpers、@pinia/nuxt、@pinia/testing —— 把 store 工厂挂到 Vue 与 Nuxt 生态上。
 ---
 
 ## 这是什么
 
-一份自底向上、面向源码的 Pinia 精读手册。每章都带 `file:line` 标注的源码摘录、设计意图拆解、易混淆点速查，多数章节配有一份可独立 `bun run` 的最小复刻（replica）。
+这是一份按「原子层 → 复合层 → 系统层」三层架构组织的 [Pinia](https://pinia.vuejs.org/) 源码导读。
+每一章都从「问题」出发，拆解 Pinia 在该处做的设计选择，并明确展开「换来什么 / 代价是什么」的权衡，
+而不是简单复述 API。
 
 ## 快速开始
 
 ```bash
-cd site
-bun install          # 或 npm install / pnpm install
-bun run docs:dev     # 本地开发预览：http://localhost:5173
-
-# 构建生产站点：
-bun run docs:build
-bun run docs:preview
+# 在 site/ 目录下
+bun install
+bun run docs:dev      # 本地开发服务器
+bun run docs:build    # 产出静态站点到 .vitepress/dist
+bun run docs:preview  # 预览构建产物
 ```
+
+也可以直接挂到任意支持静态站点的平台（GitHub Pages / Vercel / Netlify）。
+
+## 阅读路径
+
+- **想从最底层开始**：从 [01-effect-scope-pinia](/guide/01-effect-scope-pinia) 顺着侧栏往下读。
+- **想看一条 store 是怎么造出来的**：跳到 [06-store-definition-registry](/guide/06-store-definition-registry)。
+- **想看 SSR / 测试支持**：直接读 [14-nuxt-module](/guide/14-nuxt-module) 与 [15-testing-pinia](/guide/15-testing-pinia)。
