@@ -61,6 +61,11 @@ export default defineConfig({
   title: "<仓库名>",
   description: "<简介>",
   themeConfig: {
+    // 启用 VitePress 内置本地搜索（基于 MiniSearch，零外部服务、零额外依赖，
+    // 符合 ADR-0006 自包含）。缺失则站点不出现搜索框——**必须配**。
+    search: {
+      provider: "local",
+    },
     sidebar: [
       {
         text: "原子层",
@@ -123,7 +128,7 @@ export default defineConfig({
 1. **搬运完整**：`topoOrder` 中每个 slug 都有对应的 `site/guide/{nn}-{slug}.md`，且内容与 `work/chapters/{slug}/draft.md` 逐字一致（正文部分）。
 2. **编号正确**：`nn` 严格等于 `(topoIndex+1)` 两位补零；文件名 slug 与 outline 一致。
 3. **侧边栏正确**：config.ts 的 sidebar 按 `primitive → composite → system` 分组，组内按 topoOrder 顺序；每项 link 指向正确的 `/guide/{nn}-{slug}`。
-4. **工程可构建**：`package.json` 含 vitepress 依赖与 `docs:dev`/`docs:build` 脚本，`"type":"module"`；config.ts 是合法 ESM TS。`cd site && bun install && bun run docs:build` 应能成功（AC-1）。
+4. **工程可构建**：`package.json` 含 vitepress 依赖与 `docs:dev`/`docs:build` 脚本，`"type":"module"`；config.ts 是合法 ESM TS，且 `themeConfig.search.provider` 为 `"local"`（本地搜索框）。`cd site && bun install && bun run docs:build` 应能成功（AC-1）。
 5. **自包含**：site/ 内不出现对引擎仓库的 import/require；config.ts 不 `import` outline.json。
 6. **未越界**：你没有改任何 draft.md 内容、没有写 Source、没有改 work/ 下任何产物。
 

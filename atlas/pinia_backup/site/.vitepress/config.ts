@@ -6,6 +6,7 @@ export default defineConfig({
   lang: "zh-CN",
   cleanUrls: true,
   themeConfig: {
+    search: { provider: "local" },
     sidebar: [
       {
         text: "原子层",

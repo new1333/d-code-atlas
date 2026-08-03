@@ -8,6 +8,7 @@ export default defineConfig({
   lastUpdated: true,
   cleanUrls: true,
   themeConfig: {
+    search: { provider: "local" },
     outline: { level: [2, 3], label: "本页内容" },
     docFooter: { prev: "上一章", next: "下一章" },
     sidebar: [

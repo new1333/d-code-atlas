@@ -5,6 +5,7 @@ export default defineConfig({
   description: "Pinia 源码解读 · Code Atlas",
   lang: "zh-CN",
   themeConfig: {
+    search: { provider: "local" },
     sidebar: [
       {
         text: "原子层",
