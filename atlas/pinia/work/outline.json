@@ -1,0 +1,241 @@
+{
+  "repo": "pinia",
+  "generatedAt": "2026-08-03T04:31:56.445Z",
+  "chapters": [
+    {
+      "slug": "pinia-instance-active-context",
+      "title": "Pinia 实例：根状态、注册表与全局活跃上下文",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "packages/pinia/src/createPinia.ts",
+        "packages/pinia/src/rootStore.ts",
+        "packages/pinia/src/env.ts",
+        "packages/pinia/src/globalExtensions.ts",
+        "packages/pinia/src/global.d.ts",
+        "packages/pinia/src/diagnostics.ts"
+      ],
+      "summary": "用一个挂在 app 上的单例 Pinia 承载全部状态：每个 store 的 state 收进一个在 effectScope(true) 里创建的根 ref({})（便于一次性 dispose），store 实例缓存进 _s 注册表；核心权衡是引入模块级全局 activePinia 换取『调用 useStore 不必显式传 pinia』的人体工学，代价是 SSR 下有跨请求串态风险——故 getActivePinia 先走 provide/inject、全局只作兜底并在 dev 下告警。"
+    },
+    {
+      "slug": "subscription-primitive",
+      "title": "订阅原语：回调集合与作用域自动清理",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "packages/pinia/src/subscriptions.ts"
+      ],
+      "summary": "用最小的 Set<回调> + addSubscription/triggerSubscriptions 同时支撑 $onAction 与 $subscribe：订阅即往集合加回调并返回移除函数；关键取舍是默认把订阅生命周期绑到当前 effectScope（借 onScopeDispose 自动清理），用 detached 退出该绑定——让订阅随组件/store 自动回收，又保留跨作用域长订阅的能力。"
+    },
+    {
+      "slug": "define-store-hook",
+      "title": "defineStore：惰性 useStore 闭包与注册表缓存",
+      "layer": "composite",
+      "dependsOn": [
+        "pinia-instance-active-context"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/store.ts",
+        "packages/pinia/src/types.ts"
+      ],
+      "summary": "defineStore 不立即创建 store，而是返回一个仅持有 id/选项的 useStore 闭包，把创建推迟到首次调用并缓存进 pinia._s；核心思想是『store 即可组合 hook』——定义零副作用（可 tree-shake、可剔除未用 store），实例化惰性且按调用解析 pinia（注入优先、active 兜底、可显式传参），权衡是用『返回函数而非实例』换取惰性创建与按调用选 pinia，代价是每次 use 都做一次解析。"
+    },
+    {
+      "slug": "store-assembly",
+      "title": "Store 装配：effectScope 托管的返回值分类与状态镜像",
+      "layer": "composite",
+      "dependsOn": [
+        "pinia-instance-active-context",
+        "subscription-primitive",
+        "define-store-hook"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/store.ts",
+        "packages/pinia/src/types.ts"
+      ],
+      "summary": "createSetupStore 在 pinia 的 _e 下开一个子 effectScope 跑 setup，再逐个分类返回值：ref/reactive 当 state 并镜像进 pinia.state.value[id]（换来单一可序列化状态树）、function 包成 action、computed 留作 getter，最后把整个 store 包成 reactive()；关键取舍是『先占位注册再懒装配』——先把未完成的 store 塞进 _s 再跑 setup，让 store 间互相引用不死循环，代价是装配顺序与赋值时机必须小心安排。"
+    },
+    {
+      "slug": "state-patch-model",
+      "title": "状态变更模型：$patch 双形态与暂停监听批处理",
+      "layer": "composite",
+      "dependsOn": [
+        "store-assembly",
+        "subscription-primitive"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/store.ts"
+      ],
+      "summary": "变更状态只走 $patch 两条路：函数式直接改 state（暂停深度 watcher 后手动触发一次订阅），对象式经 mergeReactiveObjects 深合并（处理 Map/Set、跳过 ref/reactive）；核心权衡是『打补丁期间暂停监听、再手动统一触发订阅』，把一批改动收拢成单条订阅事件并避免 watcher 与手动触发重复通知，而 $reset（仅 option store）与 $state 的 setter 也都路由回 $patch 以复用这套批处理。"
+    },
+    {
+      "slug": "action-state-subscriptions",
+      "title": "订阅系统：$onAction 的动作包裹与 $subscribe 的监听协调",
+      "layer": "composite",
+      "dependsOn": [
+        "store-assembly",
+        "state-patch-model",
+        "subscription-primitive"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/store.ts",
+        "packages/pinia/src/subscriptions.ts",
+        "packages/pinia/src/types.ts"
+      ],
+      "summary": "在订阅原语之上搭出两类订阅：$onAction 用一个 action 包裹器拦截每次调用，对外暴露 before/after/onError 钩子（并感知 Promise），$subscribe 则是对 store state 的深度 watch；关键取舍是用 isListening/isSyncListening 两个开关与 $patch 协调——补丁期间关掉 watcher 以免与手动触发重复、结束后再恢复，从而让『直接改 state』与『$patch』都能被订阅正确捕获且只通知一次。"
+    },
+    {
+      "slug": "options-store-unification",
+      "title": "Options Store：双作者语法统一于单一装配路径",
+      "layer": "composite",
+      "dependsOn": [
+        "store-assembly",
+        "state-patch-model"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/store.ts"
+      ],
+      "summary": "createOptionsStore 不另起装配逻辑，而是把 state/getters/actions 拼成一个 setup 函数（getters 包成 computed、state 取 toRefs(根状态)）后转交 createSetupStore；核心思想是『两种作者语法、一条内部装配路径』，换来实现统一与跨语法一致的插件/订阅能力，权衡是 option store 因 state 形状已知而能合成 $reset、setup store 因 state 命令式创建而无法自动重置——$reset 的有无正是这条统一路径的必然代价。"
+    },
+    {
+      "slug": "store-to-refs",
+      "title": "storeToRefs：从 reactive store 定向提取 ref",
+      "layer": "composite",
+      "dependsOn": [
+        "store-assembly"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/storeToRefs.ts",
+        "packages/pinia/src/store.ts"
+      ],
+      "summary": "storeToRefs 不能直接 toRefs(store)：store 是个混了 state ref、computed getter 和 action 函数的 reactive() 对象，toRefs 会把 action 也包成 ref 并破坏响应性；核心取舍是写一套定向提取——遍历 toRaw(store)，凭 .effect 识别 computed（重包成可写 computed）、凭 isRef/isReactive 识别 state（取 toRef）并跳过函数与非响应式属性——因为 Vue 的 toRefs 无法在 reactive 对象上区分 getter 与 action。"
+    },
+    {
+      "slug": "plugin-system",
+      "title": "插件系统：context 注入的 store 增强",
+      "layer": "composite",
+      "dependsOn": [
+        "store-assembly",
+        "pinia-instance-active-context"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/rootStore.ts",
+        "packages/pinia/src/createPinia.ts",
+        "packages/pinia/src/store.ts"
+      ],
+      "summary": "插件是收 { store, app, pinia, options } 上下文、返回扩展并合并进 store 的函数；pinia.use 在 app.use 前先入队 toBeInstalled、安装时再灌进 _p，每个 store 装配时在自身 effectScope 内逐个跑插件；核心权衡是用『上下文注入的增强器』换取可向 store 注入新 state/getter/action 且其响应式自动归 store 的 effectScope 托管，代价是插件返回的纯对象会被诊断告警（须显式 ref/markRaw），并用 _customProperties 登记插件键以供 devtools 与 storeToRefs 识别。"
+    },
+    {
+      "slug": "map-helpers-options-api",
+      "title": "mapHelpers：组合式 store 到 Options API 的适配层",
+      "layer": "composite",
+      "dependsOn": [
+        "define-store-hook",
+        "store-assembly",
+        "pinia-instance-active-context"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/mapHelpers.ts",
+        "packages/pinia/src/globalExtensions.ts"
+      ],
+      "summary": "mapState/mapWritableState/mapActions/mapStores 不在装配时做事，而是生成一批 computed/methods，其 getter 在被求值时才调用 useStore(this.$pinia) 惰性取 store；核心思想是『store 本质是组合式，mapHelpers 只是适配层』——把实例化推迟到访问时、经注入的 $pinia 解析，让同一份 store 在 Options API 与 setup() 下行为完全一致，权衡是它必须消费 store 的 state/getter/action 三分结构与 $pinia 全局属性，因此排在装配机制之后而非当作基础原语。"
+    },
+    {
+      "slug": "hmr-hot-update",
+      "title": "HMR：保留状态的就地热更新",
+      "layer": "system",
+      "dependsOn": [
+        "store-assembly",
+        "state-patch-model"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/hmr.ts",
+        "packages/pinia/src/store.ts"
+      ],
+      "summary": "acceptHMRUpdate 不重建 store，而是建一个 __hot: 前缀的临时 store，再调既有 store 的 _hotUpdate 把 state/action/getter 原地搬运过去（option store 用 patchObject 按新形状调和、setup store 整值迁移）；核心权衡是『就地变异既有 store 对象』而非替换——保留运行时状态、对象身份与跨 store 引用不断，代价是热更新逻辑须精确同步新旧 state/getter/action 集合，该机制仅 dev 可用、prod 下 acceptHMRUpdate 退化为空函数。"
+    },
+    {
+      "slug": "devtools-plugin",
+      "title": "DevTools 集成：作为 Pinia 插件的可观测层",
+      "layer": "system",
+      "dependsOn": [
+        "plugin-system",
+        "action-state-subscriptions",
+        "state-patch-model"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/devtools/plugin.ts",
+        "packages/pinia/src/devtools/index.ts",
+        "packages/pinia/src/devtools/formatting.ts",
+        "packages/pinia/src/devtools/actions.ts",
+        "packages/pinia/src/devtools/utils.ts",
+        "packages/pinia/src/devtools/file-saver.ts",
+        "packages/pinia/src/createPinia.ts"
+      ],
+      "summary": "整套 DevTools 作为一个普通插件经 pinia.use(devtoolsPlugin) 注入：注册 timeline 层记录每次 mutation、inspector 展开 store 树与可编辑 state、并提供复制/粘贴/导入导出状态；它进一步包裹 $onAction/$subscribe/_hotUpdate/$dispose 来发时间线事件，并用 Proxy 包 action 把状态变更归因到正在运行的 action 以做分组；核心权衡是用『DevTools 即插件』换取与核心彻底解耦并借 __USE_DEVTOOLS__ 在 prod 整体 tree-shake，代价是为重建『action→mutation』因果关系而对 action 做侵入式 Proxy 包裹。"
+    },
+    {
+      "slug": "ssr-hydration",
+      "title": "SSR 与状态水合：单一根状态的序列化契约",
+      "layer": "system",
+      "dependsOn": [
+        "store-assembly",
+        "state-patch-model"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/store.ts"
+      ],
+      "summary": "SSR 的契约就是那一个根 pinia.state.value：服务端序列化它，客户端整体回填后 createSetupStore 再按 key 把水合状态灌进各 store 的 setup ref（option store 走可选的 hydrate 钩子）；核心权衡是『单一可序列化根状态即全部 SSR 契约』——setup store 因 state 命令式创建须逐 key 把入站状态同步进 ref，故提供 skipHydrate/shouldHydrate 标记路由实例等非状态对象以跳过水合，避免把不该序列化的东西发给客户端。"
+    },
+    {
+      "slug": "nuxt-module",
+      "title": "Nuxt 模块：自动导入、运行时插件与自动 HMR 的框架集成",
+      "layer": "system",
+      "dependsOn": [
+        "ssr-hydration",
+        "hmr-hot-update",
+        "define-store-hook"
+      ],
+      "sourceFiles": [
+        "packages/nuxt/src/module.ts",
+        "packages/nuxt/src/runtime/plugin.ts",
+        "packages/nuxt/src/runtime/payload-plugin.ts",
+        "packages/nuxt/src/runtime/composables.ts",
+        "packages/nuxt/src/auto-hmr-plugin.ts"
+      ],
+      "summary": "@pinia/nuxt 用一个 Nuxt module 把三件手活自动化：经 addImports/addImportsDir 自动导入 defineStore/storeToRefs 等 composables 与 stores 目录；用运行时 plugin 在客户端从 payload 回填 state、在 app:rendered 序列化 state 到 payload（并配 payload reducer 处理 skipHydrate）；再加一个 Vite 插件 AST 解析 defineStore 调用、自动注入 acceptHMRUpdate 免去样板；核心权衡是『框架集成 = 构建期变换 + Nuxt 钩子』，用编译期自动化换取零样板接入，代价是强绑 Nuxt 的导入/SSR/HMR 约定。"
+    },
+    {
+      "slug": "testing-pinia",
+      "title": "测试：以插件重塑 store 行为",
+      "layer": "system",
+      "dependsOn": [
+        "plugin-system",
+        "store-assembly"
+      ],
+      "sourceFiles": [
+        "packages/testing/src/testing.ts",
+        "packages/testing/src/restoreGetters.ts",
+        "packages/testing/src/index.ts"
+      ],
+      "summary": "createTestingPinia 不写测试专用的 store 代码路径，而是预装一组插件来重塑 store 行为：注入 initialState、用 spy 按 stubActions 配置桩化或监视 action、桩化 $patch/$reset，并用 _testing 标志绕过 useStore 的 pinia 参数；核心权衡是『测试人体工学完全建立在插件系统之上』——复用同一套装配与扩展机制，唯一的逃生口是直捣 Vue computed 内部 _value/_dirty（WritableComputed 把 getter 改成测试期可覆盖再可恢复），以换取『在测试里覆盖 getter』这一本不该可能的能力。"
+    }
+  ],
+  "topoOrder": [
+    "pinia-instance-active-context",
+    "subscription-primitive",
+    "define-store-hook",
+    "store-assembly",
+    "state-patch-model",
+    "action-state-subscriptions",
+    "options-store-unification",
+    "store-to-refs",
+    "plugin-system",
+    "map-helpers-options-api",
+    "hmr-hot-update",
+    "devtools-plugin",
+    "ssr-hydration",
+    "nuxt-module",
+    "testing-pinia"
+  ]
+}

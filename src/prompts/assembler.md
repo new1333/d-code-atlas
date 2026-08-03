@@ -48,7 +48,7 @@ site/
 
 **用字符串模板生成**（不引运行时依赖读 outline——保持 site 自包含，ADR-0006）：
 
-- 侧边栏按 `layer` 分组，分组顺序固定为 `primitive → composite → system`，分组标题用中文（如「原子层」「复合层」「系统层」）。
+- 侧边栏按 `layer` 分组，分组顺序固定为 `primitive → composite → system`，分组标题用中文（「核心原语」/「组合机制」/「应用集成」）。
 - 组内章节按 `topoOrder` 顺序排列（不是按 layer 内字母序）。
 - 每个 sidebar 项：`{ text: <title>, link: /guide/{nn}-{slug} }`。
 
