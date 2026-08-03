@@ -1,0 +1,389 @@
+{
+  "root": "work/source",
+  "sourceKind": "git-clone",
+  "languages": [
+    "ts",
+    "js",
+    "vue"
+  ],
+  "frameworks": [
+    "nuxt",
+    "vue",
+    "unocss"
+  ],
+  "entrypoints": [
+    "packages/node-modules-inspector/bin.mjs",
+    "packages/node-modules-inspector/src/node/index.ts",
+    "packages/node-modules-tools/src/index.ts"
+  ],
+  "manifests": [
+    "package.json",
+    "packages/node-modules-inspector/package.json",
+    "packages/node-modules-tools/package.json",
+    "pnpm-workspace.yaml",
+    "tsconfig.json",
+    "vitest.config.ts",
+    "playwright.config.ts",
+    "eslint.config.js",
+    "netlify.toml",
+    "node-modules-inspector.config.ts",
+    "packages/node-modules-inspector/build.config.ts",
+    "packages/node-modules-inspector/rollup.config.mjs",
+    "packages/node-modules-tools/build.config.ts"
+  ],
+  "packages": [
+    {
+      "name": "node-modules-inspector",
+      "path": "packages/node-modules-inspector"
+    },
+    {
+      "name": "node-modules-tools",
+      "path": "packages/node-modules-tools"
+    }
+  ],
+  "tree": [
+    {
+      "path": "packages",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/bin.mjs",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/node-modules-inspector/build.config.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-inspector/package.json",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-inspector/rollup.config.mjs",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-inspector/scripts",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/scripts/copy-skills.mjs",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-inspector/src",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/app",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/app/app.vue",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/app/backends",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/app/components",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/app/components/chart",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/app/components/display",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/app/components/graph",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/app/components/grid",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/app/components/integrations",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/app/components/option",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/app/components/panel",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/app/components/report",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/app/components/tree",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/app/components/ui",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/dirs.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/node",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/node/cli-report",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/node/cli.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/node/config.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/node/constants.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/node/devframe.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/node/index.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/node/rpc",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/node/storage.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/node/webcontainer",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/nuxt.config.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/public",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/server",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/server/api",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/shared",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/shared/constants.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/shared/filters.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/shared/reports",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/shared/semver.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/shared/types.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/shared/utils.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/shared/version-info.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/shared/vulnerable-info.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-inspector/src/uno.config.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-tools",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-tools/README.md",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-tools/build.config.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-tools/package.json",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-tools/src",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-tools/src/agent-entry",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-tools/src/agents",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-tools/src/agents/bun",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-tools/src/agents/npm",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-tools/src/agents/pnpm",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-tools/src/analyze-esm.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-tools/src/constants.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-tools/src/index.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/node-modules-tools/src/json-parse-stream.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-tools/src/list.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-tools/src/resolve.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-tools/src/size.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-tools/src/types",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-tools/src/utils",
+      "type": "dir"
+    },
+    {
+      "path": "packages/node-modules-tools/src/utils.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/node-modules-tools/test",
+      "type": "dir"
+    },
+    {
+      "path": "patches",
+      "type": "dir"
+    },
+    {
+      "path": "skills",
+      "type": "dir"
+    },
+    {
+      "path": "skills/node-modules-inspector",
+      "type": "dir"
+    },
+    {
+      "path": "skills/node-modules-inspector/SKILL.md",
+      "type": "file"
+    },
+    {
+      "path": "test",
+      "type": "dir"
+    },
+    {
+      "path": "test/e2e",
+      "type": "dir"
+    },
+    {
+      "path": "package.json",
+      "type": "file"
+    },
+    {
+      "path": "pnpm-workspace.yaml",
+      "type": "file"
+    },
+    {
+      "path": "tsconfig.json",
+      "type": "file"
+    },
+    {
+      "path": "vitest.config.ts",
+      "type": "file"
+    },
+    {
+      "path": "playwright.config.ts",
+      "type": "file"
+    },
+    {
+      "path": "eslint.config.js",
+      "type": "file"
+    },
+    {
+      "path": "netlify.toml",
+      "type": "file"
+    },
+    {
+      "path": "node-modules-inspector.config.ts",
+      "type": "file"
+    }
+  ],
+  "docs": [
+    "README.md",
+    "AGENTS.md",
+    "LICENSE.md",
+    "CLAUDE.md",
+    "packages/node-modules-tools/README.md",
+    "skills/node-modules-inspector/SKILL.md"
+  ]
+}

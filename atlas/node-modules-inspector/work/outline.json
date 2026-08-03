@@ -1,0 +1,272 @@
+{
+  "repo": "node-modules-inspector",
+  "generatedAt": "2026-08-02T23:37:20.155Z",
+  "chapters": [
+    {
+      "slug": "json-stream-parser",
+      "title": "流式 JSON 解析：应付百万行依赖输出",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "packages/node-modules-tools/src/json-parse-stream.ts"
+      ],
+      "summary": "用 stream-json + Assembler 边读边装配 npm/pnpm 的 stdout。关键权衡是『放弃 JSON.parse 一次性反序列化的简单性』换取对「同一 stdout 里多个 JSON 数组拼接到一起」(jsonStreaming 模式) 的支持——大型 monorepo 的 pnpm ls 输出可超 V8 字符串上限，必须流式"
+    },
+    {
+      "slug": "package-manager-strategy",
+      "title": "包管理器策略：pnpm/npm/bun 三态归一",
+      "layer": "primitive",
+      "dependsOn": [
+        "json-stream-parser"
+      ],
+      "sourceFiles": [
+        "packages/node-modules-tools/src/agent-entry/detect.ts",
+        "packages/node-modules-tools/src/agent-entry/list.ts",
+        "packages/node-modules-tools/src/agents/pnpm/list.ts",
+        "packages/node-modules-tools/src/agents/npm/list.ts",
+        "packages/node-modules-tools/src/agents/bun/list.ts"
+      ],
+      "summary": "用「detect → 动态 import → 归一化」抹平 pnpm/npm/bun 三种清单来源差异：pnpm 调 `ls --json`、npm 并发跑 5 个 query selector、bun 直接读 lockfile。关键权衡是『把 lockfile/CLI 的不可调和差异封装到 agent 内部』换上层一份统一 PackageNodeRaw 流，代价是每接入新包管理器都要重写一遍 traverse"
+    },
+    {
+      "slug": "dep-graph-materialize",
+      "title": "依赖图物化：flatDeps/dependents/depth 一次算清",
+      "layer": "primitive",
+      "dependsOn": [
+        "package-manager-strategy"
+      ],
+      "sourceFiles": [
+        "packages/node-modules-tools/src/agent-entry/list.ts",
+        "packages/node-modules-tools/src/types/node.ts"
+      ],
+      "summary": "用「双 DFS + postTasks 延迟回填」从直接依赖边一次性算出 flatDependencies/flatDependents/depth/shallowestDependent——同时把 PackageNodeRaw 渐进扩展为 PackageNodeBase（闭包字段全部 lazy fill）。关键权衡是『用一次全图遍历换查询期 O(1) 读取』让前端筛选/排序/why 能瞬时响应，代价是图一旦改动就要重算所有闭包"
+    },
+    {
+      "slug": "module-type-analyzer",
+      "title": "静态推断模块类型 cjs/esm/dual/faux/dts",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "packages/node-modules-tools/src/analyze-esm.ts"
+      ],
+      "summary": "用「exports 字段递归查找 import/require/module 条件」把 package.json 静态推断为 cjs/esm/dual/faux/dts。关键权衡是『不真正加载包』换纯静态分析的速度，代价是 exports 写得不规范的包会被划成 faux（有 module 字段但无 exports）"
+    },
+    {
+      "slug": "install-size-classifier",
+      "title": "安装体积测算与文件类别分类",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "packages/node-modules-tools/src/size.ts"
+      ],
+      "summary": "用「目录递归 + 后缀/路径正则」把每个包的字节拆到 test/js/ts/dts/wasm 等桶。关键权衡是『跳过 dotfile 与嵌套 node_modules』换算得快，代价是分类只能靠文件名启发式——编译产物可能被错判为 source"
+    },
+    {
+      "slug": "pkg-json-normalizer",
+      "title": "package.json 字段规范化（author/repo/license/funding）",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "packages/node-modules-tools/src/utils/package-json.ts"
+      ],
+      "summary": "用「先正则抽取再优先级合并」处理 author/repo/license/funding 在 30 年里累积的多种合法形态（字符串/对象/数组）。关键权衡是『GitHub handle 优先、丢弃纯文本作者』换展示一致性，代价是冷门写法（无 GitHub 关联的纯名字）会被丢"
+    },
+    {
+      "slug": "resolve-package-pipeline",
+      "title": "resolvePackage：把磁盘包变可读节点",
+      "layer": "composite",
+      "dependsOn": [
+        "package-manager-strategy",
+        "dep-graph-materialize",
+        "module-type-analyzer",
+        "install-size-classifier",
+        "pkg-json-normalizer"
+      ],
+      "sourceFiles": [
+        "packages/node-modules-tools/src/resolve.ts",
+        "packages/node-modules-tools/src/list.ts",
+        "packages/node-modules-tools/src/types/node.ts"
+      ],
+      "summary": "用「读 package.json → 并发跑 5 个 normalize → mutate 进 pkg.resolved」把 base 节点变可展示 PackageNode（同时完成 PackageNodeBase → PackageNode 的类型演进），外层用 pLimit(10) 限流。关键权衡是『mutate 而非重建』换零拷贝，代价是调用方必须接受副作用——同一对象在不同阶段字段会变"
+    },
+    {
+      "slug": "filters-and-search",
+      "title": "过滤器与搜索：声明式 schema + 字段 DSL",
+      "layer": "composite",
+      "dependsOn": [
+        "resolve-package-pipeline"
+      ],
+      "sourceFiles": [
+        "packages/node-modules-inspector/src/shared/filters.ts",
+        "packages/node-modules-inspector/src/app/state/filters.ts",
+        "packages/node-modules-inspector/src/app/utils/search-parser.ts",
+        "packages/node-modules-tools/src/utils/filter.ts"
+      ],
+      "summary": "用「FILTERS_SCHEMA 单一声明 + 构造式谓词 + 子串搜索 DSL(`license:`, `author:`, `not:`)」组合多维筛选。关键权衡是『把 select/exclude/compare 三类过滤合并到同一个 reactive state』换交互即时反馈，代价是双向同步需要 ignorableWatch 防循环"
+    },
+    {
+      "slug": "maintainer-action-cohort",
+      "title": "维护者行动算法：迁移比例与 catalog 解析",
+      "layer": "composite",
+      "dependsOn": [
+        "resolve-package-pipeline"
+      ],
+      "sourceFiles": [
+        "packages/node-modules-inspector/src/shared/reports/maintainers.ts",
+        "packages/node-modules-inspector/src/shared/reports/duplicates.ts",
+        "packages/node-modules-inspector/src/shared/reports/sizes.ts",
+        "packages/node-modules-inspector/src/shared/reports/dto.ts"
+      ],
+      "summary": "用「按 depName 聚合 cohort → 用 semver 范围判定 migrated/behind → 按 consumer 分组」算出「该升哪些依赖」的 actionable 列表。关键权衡是『跳过同仓库兄弟（repository URL 相等）』避免误报 monorepo 内部 alias，代价是没填 repository 的包会漏判"
+    },
+    {
+      "slug": "npm-meta-fetch",
+      "title": "npm 元信息拉取：批量化、TTL、漏洞",
+      "layer": "composite",
+      "dependsOn": [
+        "resolve-package-pipeline"
+      ],
+      "sourceFiles": [
+        "packages/node-modules-inspector/src/shared/version-info.ts",
+        "packages/node-modules-inspector/src/shared/vulnerable-info.ts",
+        "packages/node-modules-inspector/src/shared/utils.ts",
+        "packages/node-modules-inspector/src/node/storage.ts"
+      ],
+      "summary": "用「10 个一组批量 + 失败回退单查 + 按发布时长算 TTL（5h~15d）」控制对 npm registry 的请求量。关键权衡是『TTL 与包年龄成正比』换热点包缓存新、冷门包缓存久，代价是流行包刚发版时会有几小时延迟"
+    },
+    {
+      "slug": "computed-payload-cascade",
+      "title": "响应式 payload 级联：main→excluded→available→filtered",
+      "layer": "composite",
+      "dependsOn": [
+        "filters-and-search"
+      ],
+      "sourceFiles": [
+        "packages/node-modules-inspector/src/app/state/payload.ts",
+        "packages/node-modules-inspector/src/app/state/highlight.ts"
+      ],
+      "summary": "用「main → excluded → available → filtered 四层 computed Payload + 派生时清缓存」把 rawPayload 按过滤器逐级缩小。关键权衡是『excluded 用不动点迭代把「全部父都被排除」的节点也排除』换图语义正确，代价是一次过滤改动可能触发 O(N²) 重算（已被 watch 缓存限制）"
+    },
+    {
+      "slug": "query-url-binding",
+      "title": "URL ↔ 状态双向绑定",
+      "layer": "composite",
+      "dependsOn": [
+        "filters-and-search"
+      ],
+      "sourceFiles": [
+        "packages/node-modules-inspector/src/app/state/query.ts",
+        "packages/node-modules-inspector/src/app/state/current.ts",
+        "packages/node-modules-inspector/src/app/state/ui.ts"
+      ],
+      "summary": "用「kebab-case 序列化 + debouncedWatch + ignorableWatch 防循环」把所有筛选/选中状态压进 location.hash。关键权衡是『选中节点的 spec 也走 URL』换可分享链接，代价是反向解析必须忽略自身触发的更新否则会震荡"
+    },
+    {
+      "slug": "devframe-rpc",
+      "title": "devframe RPC：一份 handler，多种传输",
+      "layer": "system",
+      "dependsOn": [
+        "resolve-package-pipeline",
+        "maintainer-action-cohort",
+        "npm-meta-fetch"
+      ],
+      "sourceFiles": [
+        "packages/node-modules-inspector/src/node/devframe.ts",
+        "packages/node-modules-inspector/src/node/rpc/handlers.ts",
+        "packages/node-modules-inspector/src/node/rpc/get-payload.ts",
+        "packages/node-modules-inspector/src/node/rpc/get-packages-npm-meta.ts",
+        "packages/node-modules-inspector/src/node/rpc/get-packages-npm-meta-latest.ts",
+        "packages/node-modules-inspector/src/node/rpc/get-publint.ts",
+        "packages/node-modules-inspector/src/node/rpc/report-sizes.ts",
+        "packages/node-modules-inspector/src/node/rpc/open-in-editor.ts"
+      ],
+      "summary": "用「defineRpcFunction 注册 + name 前缀(`nmi:`) 路由」把 getPayload/getPublint 等纯函数适配到 websocket / 静态 dump / MCP 三种传输。关键权衡是『把传输细节下沉到 devframe 框架』换 handler 与传输解耦，代价是静态 build 时要把可序列化方法显式标 jsonSerializable"
+    },
+    {
+      "slug": "backend-abstraction",
+      "title": "Backend 抽象：dev/static/webcontainer 三态前端",
+      "layer": "system",
+      "dependsOn": [
+        "devframe-rpc"
+      ],
+      "sourceFiles": [
+        "packages/node-modules-inspector/src/app/backends/index.ts",
+        "packages/node-modules-inspector/src/app/backends/dev.ts",
+        "packages/node-modules-inspector/src/app/types/backend.ts",
+        "packages/node-modules-inspector/src/app/state/data.ts"
+      ],
+      "summary": "用「Backend 接口 + functions? 可选」让前端在同一份代码下跑动态 RPC（dev/webcontainer）或读静态 dump（build）。关键权衡是『isDynamic 决定哪些能力可用（编辑器/finder/publint 在静态模式下不存在）』换部署灵活性，代价是 UI 必须优雅降级"
+    },
+    {
+      "slug": "webcontainer-runtime",
+      "title": "WebContainer：浏览器里跑真 pnpm",
+      "layer": "system",
+      "dependsOn": [
+        "devframe-rpc",
+        "backend-abstraction"
+      ],
+      "sourceFiles": [
+        "packages/node-modules-inspector/src/app/webcontainer/container.ts",
+        "packages/node-modules-inspector/src/app/webcontainer/Landing.vue",
+        "packages/node-modules-inspector/src/node/webcontainer/server.ts",
+        "packages/node-modules-inspector/src/app/modules/webcontainer.ts",
+        "packages/node-modules-inspector/src/shared/constants.ts"
+      ],
+      "summary": "用「boot WebContainer → 写 package.json → spawn pnpm install → 跑打包好的 server.mjs → 解析带前缀的 stdout」让用户在浏览器里装任意包并实时分析。关键权衡是『用 stdout 前缀(`::node-modules-inspector::`)区分日志与数据』换零传输层，代价是心跳超时/错误只能靠轮询检测"
+    },
+    {
+      "slug": "cli-commands",
+      "title": "CLI 多形态：dev/build/check/report/mcp",
+      "layer": "system",
+      "dependsOn": [
+        "devframe-rpc",
+        "maintainer-action-cohort"
+      ],
+      "sourceFiles": [
+        "packages/node-modules-inspector/src/node/cli.ts",
+        "packages/node-modules-inspector/src/node/cli-report/run-report.ts",
+        "packages/node-modules-inspector/src/node/cli-report/format-sizes.ts",
+        "packages/node-modules-inspector/src/node/cli-report/format-duplicates.ts",
+        "packages/node-modules-inspector/src/node/cli-report/format-maintainers.ts",
+        "packages/node-modules-inspector/src/node/cli-report/format-util.ts",
+        "packages/node-modules-inspector/src/node/config.ts",
+        "packages/node-modules-inspector/bin.mjs"
+      ],
+      "summary": "用「cac 子命令 + 复用同一份 RPC handlers」让 CLI 在 dev / 静态 build / CI check / 机器可读 report / MCP 工具五种形态间共享业务逻辑。关键权衡是『report 命令把计算结果同时渲染成 ANSI 表格与 JSON』换人工/CI 双场景，代价是格式化器必须严格分叉"
+    },
+    {
+      "slug": "visualizations",
+      "title": "可视化层：treemap/sunburst/flamegraph/graph/grid",
+      "layer": "system",
+      "dependsOn": [
+        "computed-payload-cascade"
+      ],
+      "sourceFiles": [
+        "packages/node-modules-inspector/src/app/pages/chart/[...chart].vue",
+        "packages/node-modules-inspector/src/app/pages/graph.vue",
+        "packages/node-modules-inspector/src/app/pages/grid/[...grid].vue",
+        "packages/node-modules-inspector/src/app/components/graph/Canvas.vue"
+      ],
+      "summary": "用「d3-hierarchy 统一布局 + nanovis 渲染 + ChartNode 中间结构」把同一份依赖图转成 treemap/sunburst/flamegraph/graph/grid 五种视角。关键权衡是『把 shallowestDependent 作为分桶依据』避免重复占用，代价是某些跨树引用只能复制节点"
+    }
+  ],
+  "topoOrder": [
+    "json-stream-parser",
+    "package-manager-strategy",
+    "dep-graph-materialize",
+    "module-type-analyzer",
+    "install-size-classifier",
+    "pkg-json-normalizer",
+    "resolve-package-pipeline",
+    "filters-and-search",
+    "maintainer-action-cohort",
+    "npm-meta-fetch",
+    "computed-payload-cascade",
+    "query-url-binding",
+    "devframe-rpc",
+    "backend-abstraction",
+    "webcontainer-runtime",
+    "cli-commands",
+    "visualizations"
+  ]
+}
