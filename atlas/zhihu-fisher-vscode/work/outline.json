@@ -1,0 +1,202 @@
+{
+  "repo": "zhihu-fisher-vscode",
+  "generatedAt": "2026-08-03T08:05:20.985Z",
+  "chapters": [
+    {
+      "slug": "global-shared-store",
+      "title": "全局共享状态容器",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "src/core/stores.ts"
+      ],
+      "summary": "用一个模块级可变单例对象充当扩展全生命周期的共享内存（context、webview 映射、浏览器实例、各列表数据），换来命令/侧边栏/webview 之间无需依赖注入即可通信，代价是全局可变状态带来隐式耦合与统一的清理负担。"
+    },
+    {
+      "slug": "cookie-manager",
+      "title": "Cookie 凭证的清洗与校验",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "src/core/zhihu/cookie/index.ts"
+      ],
+      "summary": "知乎反爬严苛，Cookie 必须先清洗掉第三方统计项（否则 403）、再校验关键安全项（__zse_ck 签名 + z_c0 登录凭证）、并去掉 BEC 避免被重定向到热榜；同时用「DOM 登录墙探测」反向判断 Cookie 是否已失效。"
+    },
+    {
+      "slug": "puppeteer-browser-engine",
+      "title": "防反爬浏览器引擎",
+      "layer": "primitive",
+      "dependsOn": [
+        "cookie-manager",
+        "global-shared-store"
+      ],
+      "sourceFiles": [
+        "src/core/zhihu/puppeteer/index.ts"
+      ],
+      "summary": "用一台真实 Chrome（单例 + 5 次重试启动 + 自定义/默认路径回退）而非纯 HTTP 去对抗知乎反爬：隐藏 navigator.webdriver、伪造 UA、注入 Cookie、模拟人类滚动；headless/有头切换兼顾隐蔽与调试，代价是重资源与孤立页面的生命周期清理。"
+    },
+    {
+      "slug": "zhihu-api-client",
+      "title": "知乎 JSON API 写操作客户端",
+      "layer": "primitive",
+      "dependsOn": [
+        "cookie-manager"
+      ],
+      "sourceFiles": [
+        "src/core/zhihu/api/index.ts"
+      ],
+      "summary": "写操作（投票/收藏/关注/不喜欢）走知乎官方 JSON API 而非爬页面：用一套完整的伪造浏览器请求头（Sec-Ch-Ua/UA/Origin/Referer）+ Cookie 模拟前端 XHR，把 GET/POST/DELETE 的请求构造、Cookie 校验与错误处理统一收敛到一个 makeRequest。"
+    },
+    {
+      "slug": "sidebar-tree-provider",
+      "title": "侧边栏内容列表",
+      "layer": "composite",
+      "dependsOn": [
+        "global-shared-store",
+        "cookie-manager",
+        "puppeteer-browser-engine"
+      ],
+      "sourceFiles": [
+        "src/core/zhihu/sidebar/hot.ts",
+        "src/core/zhihu/sidebar/recommend.ts",
+        "src/core/zhihu/sidebar/search.ts",
+        "src/core/zhihu/sidebar/follow.ts",
+        "src/core/types/index.ts"
+      ],
+      "summary": "用 VSCode TreeDataProvider 模式把知乎列表搬进侧边栏：fetch HTML → cheerio 解析成 LinkItem → onDidChangeTreeData 事件驱动刷新，并按加载中/需登录/出错做状态化渲染；列表故意用轻量 fetch（而非 Puppeteer），却又必须先校验浏览器可创建——因为点不开详情的列表毫无意义。"
+    },
+    {
+      "slug": "webview-content-crawling",
+      "title": "详情页爬取与反爬内容提取",
+      "layer": "composite",
+      "dependsOn": [
+        "puppeteer-browser-engine",
+        "cookie-manager",
+        "global-shared-store"
+      ],
+      "sourceFiles": [
+        "src/core/zhihu/webview/index.ts",
+        "src/core/zhihu/webview/components/content-processor.ts",
+        "src/core/zhihu/zhida/index.ts"
+      ],
+      "summary": "同一台真实 Chrome 在页面上下文里提数据以对抗反爬，分两个实例共用一套原理：详情页用 page.evaluate 提结构化数据（回答/作者/投票态）、模拟滚动触发懒加载、递归去重、每批到上限即停，以『每批回答数』在加载体验与烧 Cookie 致失效间取平衡；『知乎直答』AI 提取则由 content-processor 先把 zhida 链接拦截改写成弹窗入口，ZhidaManager 再模拟点击 AIPanel、两阶段轮询（面板出现→思考中→完成回答），并用『查询关键词校验』防止抓到上一轮缓存的旧结果、失败时换临时源页重试——两实例各自配一套一致性护栏（批次上限 / 关键词校验），揭示『真实页面上下文提数据』的代价。"
+    },
+    {
+      "slug": "webview-render-messaging",
+      "title": "详情页 HTML 渲染与双向消息",
+      "layer": "composite",
+      "dependsOn": [
+        "webview-content-crawling",
+        "global-shared-store"
+      ],
+      "sourceFiles": [
+        "src/core/zhihu/webview/html.ts",
+        "src/core/zhihu/webview/index.ts",
+        "src/core/zhihu/webview/components/related-questions.ts"
+      ],
+      "summary": "把爬取到的 ArticleInfo 由 HtmlRenderer 渲染成详情页 HTML，扩展与 webview 以 postMessage 双向通信——导航计数、媒体模式、AI 直答请求（zhidaSummarize→zhidaResult）等更新都走增量 postMessage 而非整页重刷，换取滚动位置与输入态不丢失；相关问题则由 page.evaluate 解析『相关问题』卡片、用 Set 按问题 id 去重后增量合并、再 postMessage(updateRelatedQuestions) 只推新增项，共同体现『以增量消息保住长文阅读连续性』这一关键权衡。"
+    },
+    {
+      "slug": "comments-cursor-pagination",
+      "title": "评论父子树的游标分页",
+      "layer": "composite",
+      "dependsOn": [
+        "webview-render-messaging"
+      ],
+      "sourceFiles": [
+        "src/core/zhihu/webview/components/comments.ts",
+        "src/core/zhihu/webview/templates/scripts/comments.ts"
+      ],
+      "summary": "评论区是父子两层结构，各自维护一套游标（next/previous/offset）；按需懒加载子评论并与已加载列表增量合并，关键权衡是用游标续传换取「分页深、不重复、可展开收起」的展示。"
+    },
+    {
+      "slug": "collections-tree-cache",
+      "title": "收藏夹树形结构与本地缓存",
+      "layer": "composite",
+      "dependsOn": [
+        "sidebar-tree-provider",
+        "zhihu-api-client"
+      ],
+      "sourceFiles": [
+        "src/core/zhihu/sidebar/collections.ts",
+        "src/core/utils/collection-cache.ts",
+        "src/core/utils/collection-picker.ts",
+        "src/core/commands/collection.ts"
+      ],
+      "summary": "收藏夹是「我创建的/我关注的 → 收藏夹 → 收藏项」三级树，区别于扁平的热榜；用两级分页游标加载收藏夹与收藏项，并以带 30 分钟 TTL 与 lastPage 续传的本地缓存减少重复请求，权衡缓存新鲜度与请求成本。"
+    },
+    {
+      "slug": "smart-disguise-engine",
+      "title": "智能伪装引擎",
+      "layer": "composite",
+      "dependsOn": [
+        "global-shared-store"
+      ],
+      "sourceFiles": [
+        "src/core/utils/disguise-manager.ts",
+        "src/core/utils/code-generator.ts"
+      ],
+      "summary": "摸鱼的灵魂：WebView 一失焦就把标签页标题/图标换成 32 种语言的真实文件名，并叠加一层假代码界面；文件名组合按 webview 缓存以避免频繁切换闪烁，假代码按语言语法 pattern 轮转生成且自带 VSCode 高亮 span，权衡的是「稳定不闪」与「每次随机更真实」。"
+    },
+    {
+      "slug": "qr-login-flow",
+      "title": "扫码登录全流程",
+      "layer": "system",
+      "dependsOn": [
+        "puppeteer-browser-engine",
+        "cookie-manager",
+        "sidebar-tree-provider"
+      ],
+      "sourceFiles": [
+        "src/core/commands/qr-login.ts"
+      ],
+      "summary": "用独立 BrowserContext（无痕隔离）打开知乎登录页，截图二维码 canvas（用 screenshot+clip 绕过跨域 tainted canvas）回传给 webview，轮询 URL 变化判定登录成功，再导航到热榜触发知乎 JS 写入 __zse_ck 签名 Cookie，最后只提取知乎域 Cookie 保存——核心是用真实浏览器渲染登录页来绕过登录加密。"
+    },
+    {
+      "slug": "sidebar-disguise-filetree",
+      "title": "侧边栏伪装成假文件树",
+      "layer": "system",
+      "dependsOn": [
+        "smart-disguise-engine",
+        "sidebar-tree-provider"
+      ],
+      "sourceFiles": [
+        "src/core/utils/sidebar-disguise-manager.ts",
+        "src/core/utils/file-list-provider.ts"
+      ],
+      "summary": "与 webview 伪装联动：用 setContext 命令翻转 zhihu-fisher.sidebarDisguised 这个 context key，靠 views 的 when 条件把整组知乎侧边栏整体替换成 fakeFileList 假文件树（按语言扩展名映射生成真实感目录结构），换取「失焦时整个界面一体伪装」的隐蔽性。"
+    },
+    {
+      "slug": "command-assembly",
+      "title": "扩展激活与命令编排",
+      "layer": "system",
+      "dependsOn": [
+        "sidebar-tree-provider",
+        "webview-render-messaging",
+        "qr-login-flow",
+        "collections-tree-cache",
+        "sidebar-disguise-filetree"
+      ],
+      "sourceFiles": [
+        "src/extension.ts",
+        "src/core/commands/index.ts"
+      ],
+      "summary": "扩展激活的顶层组装：activate 里创建 ZhihuService 与各侧边栏 provider，registerAllCommands 以依赖注入把 provider 注入对应命令组并挂到 context.subscriptions，同时监听配置变更驱动侧边栏刷新——是把全局 Store 与各子系统胶合起来、声明全部命令与视图清单的入口。"
+    }
+  ],
+  "topoOrder": [
+    "global-shared-store",
+    "cookie-manager",
+    "puppeteer-browser-engine",
+    "zhihu-api-client",
+    "sidebar-tree-provider",
+    "webview-content-crawling",
+    "webview-render-messaging",
+    "comments-cursor-pagination",
+    "collections-tree-cache",
+    "smart-disguise-engine",
+    "qr-login-flow",
+    "sidebar-disguise-filetree",
+    "command-assembly"
+  ]
+}

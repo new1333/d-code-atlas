@@ -1,0 +1,170 @@
+{
+  "root": "work/source",
+  "sourceKind": "git-clone",
+  "languages": [
+    "ts",
+    "js"
+  ],
+  "frameworks": [
+    "vscode"
+  ],
+  "entrypoints": [
+    "src/extension.ts"
+  ],
+  "manifests": [
+    "package.json",
+    "tsconfig.json",
+    "esbuild.js",
+    "eslint.config.mjs",
+    ".vscode-test.mjs"
+  ],
+  "packages": [],
+  "tree": [
+    {
+      "path": ".github",
+      "type": "dir"
+    },
+    {
+      "path": ".vscode",
+      "type": "dir"
+    },
+    {
+      "path": "resources",
+      "type": "dir"
+    },
+    {
+      "path": "resources/fake",
+      "type": "dir"
+    },
+    {
+      "path": "resources/icon.svg",
+      "type": "file"
+    },
+    {
+      "path": "src",
+      "type": "dir"
+    },
+    {
+      "path": "src/extension.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "src/core",
+      "type": "dir"
+    },
+    {
+      "path": "src/core/stores.ts",
+      "type": "file"
+    },
+    {
+      "path": "src/core/commands",
+      "type": "dir"
+    },
+    {
+      "path": "src/core/commands/index.ts",
+      "type": "file"
+    },
+    {
+      "path": "src/core/utils",
+      "type": "dir"
+    },
+    {
+      "path": "src/core/utils/index.ts",
+      "type": "file"
+    },
+    {
+      "path": "src/core/types",
+      "type": "dir"
+    },
+    {
+      "path": "src/core/types/index.ts",
+      "type": "file"
+    },
+    {
+      "path": "src/core/zhihu",
+      "type": "dir"
+    },
+    {
+      "path": "src/core/zhihu/index.ts",
+      "type": "file"
+    },
+    {
+      "path": "src/core/zhihu/api",
+      "type": "dir"
+    },
+    {
+      "path": "src/core/zhihu/cookie",
+      "type": "dir"
+    },
+    {
+      "path": "src/core/zhihu/puppeteer",
+      "type": "dir"
+    },
+    {
+      "path": "src/core/zhihu/sidebar",
+      "type": "dir"
+    },
+    {
+      "path": "src/core/zhihu/zhida",
+      "type": "dir"
+    },
+    {
+      "path": "src/core/zhihu/webview",
+      "type": "dir"
+    },
+    {
+      "path": "src/core/zhihu/webview/index.ts",
+      "type": "file"
+    },
+    {
+      "path": "src/core/zhihu/webview/html.ts",
+      "type": "file"
+    },
+    {
+      "path": "src/core/zhihu/webview/components",
+      "type": "dir"
+    },
+    {
+      "path": "src/core/zhihu/webview/styles",
+      "type": "dir"
+    },
+    {
+      "path": "src/core/zhihu/webview/templates",
+      "type": "dir"
+    },
+    {
+      "path": "walkthrough",
+      "type": "dir"
+    },
+    {
+      "path": "package.json",
+      "type": "file"
+    },
+    {
+      "path": "tsconfig.json",
+      "type": "file"
+    },
+    {
+      "path": "esbuild.js",
+      "type": "file"
+    },
+    {
+      "path": "README.md",
+      "type": "file"
+    }
+  ],
+  "docs": [
+    "README.md",
+    "CHANGELOG.md",
+    "OPEN_SOURCE.md",
+    "vsc-extension-quickstart.md",
+    "walkthrough/welcome.md",
+    "walkthrough/explore-content.md",
+    "walkthrough/reading-features.md",
+    "walkthrough/display-settings.md",
+    "walkthrough/collections.md",
+    "walkthrough/smart-disguise.md",
+    "walkthrough/support-creator.md"
+  ]
+}

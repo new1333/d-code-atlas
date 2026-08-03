@@ -1,0 +1,487 @@
+{
+  "root": "work/source",
+  "sourceKind": "git-clone",
+  "languages": [
+    "ts"
+  ],
+  "frameworks": [
+    "vue"
+  ],
+  "entrypoints": [
+    "packages/macros/src/index.ts",
+    "packages/macros/src/vite.ts",
+    "packages/macros/src/rollup.ts",
+    "packages/macros/src/webpack.ts",
+    "packages/macros/src/esbuild.ts",
+    "packages/macros/src/rspack.ts",
+    "packages/macros/src/rolldown.ts",
+    "packages/macros/src/volar.ts",
+    "packages/macros/src/runtime.ts"
+  ],
+  "manifests": [
+    "package.json",
+    "pnpm-workspace.yaml",
+    "tsconfig.json",
+    "tsconfig.base.json",
+    "tsconfig.lib.json",
+    "tsconfig.test.json",
+    "tsconfig.dts.json",
+    "tsconfig.fixture.json",
+    "tsdown.config.ts",
+    "vitest.config.ts",
+    "eslint.config.ts",
+    "uno.config.ts",
+    "monoman.config.ts",
+    "publint.ts",
+    "cspell.json",
+    ".npmrc"
+  ],
+  "packages": [
+    {
+      "name": "@vue-macros/api",
+      "path": "packages/api"
+    },
+    {
+      "name": "@vue-macros/astro",
+      "path": "packages/astro"
+    },
+    {
+      "name": "@vue-macros/better-define",
+      "path": "packages/better-define"
+    },
+    {
+      "name": "@vue-macros/boolean-prop",
+      "path": "packages/boolean-prop"
+    },
+    {
+      "name": "@vue-macros/chain-call",
+      "path": "packages/chain-call"
+    },
+    {
+      "name": "@vue-macros/common",
+      "path": "packages/common"
+    },
+    {
+      "name": "@vue-macros/config",
+      "path": "packages/config"
+    },
+    {
+      "name": "@vue-macros/define-emit",
+      "path": "packages/define-emit"
+    },
+    {
+      "name": "@vue-macros/define-models",
+      "path": "packages/define-models"
+    },
+    {
+      "name": "unplugin-vue-define-options",
+      "path": "packages/define-options"
+    },
+    {
+      "name": "@vue-macros/define-prop",
+      "path": "packages/define-prop"
+    },
+    {
+      "name": "@vue-macros/define-props",
+      "path": "packages/define-props"
+    },
+    {
+      "name": "@vue-macros/define-props-refs",
+      "path": "packages/define-props-refs"
+    },
+    {
+      "name": "@vue-macros/define-render",
+      "path": "packages/define-render"
+    },
+    {
+      "name": "@vue-macros/define-slots",
+      "path": "packages/define-slots"
+    },
+    {
+      "name": "@vue-macros/define-stylex",
+      "path": "packages/define-stylex"
+    },
+    {
+      "name": "@vue-macros/devtools",
+      "path": "packages/devtools"
+    },
+    {
+      "name": "@vue-macros/eslint-config",
+      "path": "packages/eslint-config"
+    },
+    {
+      "name": "@vue-macros/export-expose",
+      "path": "packages/export-expose"
+    },
+    {
+      "name": "@vue-macros/export-props",
+      "path": "packages/export-props"
+    },
+    {
+      "name": "@vue-macros/export-render",
+      "path": "packages/export-render"
+    },
+    {
+      "name": "@vue-macros/hoist-static",
+      "path": "packages/hoist-static"
+    },
+    {
+      "name": "@vue-macros/jsx-directive",
+      "path": "packages/jsx-directive"
+    },
+    {
+      "name": "vue-macros",
+      "path": "packages/macros"
+    },
+    {
+      "name": "@vue-macros/named-template",
+      "path": "packages/named-template"
+    },
+    {
+      "name": "@vue-macros/nuxt",
+      "path": "packages/nuxt"
+    },
+    {
+      "name": "@vue-macros/reactivity-transform",
+      "path": "packages/reactivity-transform"
+    },
+    {
+      "name": "@vue-macros/script-lang",
+      "path": "packages/script-lang"
+    },
+    {
+      "name": "@vue-macros/setup-block",
+      "path": "packages/setup-block"
+    },
+    {
+      "name": "@vue-macros/setup-component",
+      "path": "packages/setup-component"
+    },
+    {
+      "name": "@vue-macros/setup-sfc",
+      "path": "packages/setup-sfc"
+    },
+    {
+      "name": "@vue-macros/short-bind",
+      "path": "packages/short-bind"
+    },
+    {
+      "name": "@vue-macros/short-emits",
+      "path": "packages/short-emits"
+    },
+    {
+      "name": "@vue-macros/short-vmodel",
+      "path": "packages/short-vmodel"
+    },
+    {
+      "name": "@vue-macros/test-utils",
+      "path": "packages/test-utils"
+    },
+    {
+      "name": "@vue-macros/volar",
+      "path": "packages/volar"
+    }
+  ],
+  "tree": [
+    {
+      "path": "packages",
+      "type": "dir"
+    },
+    {
+      "path": "packages/api",
+      "type": "dir"
+    },
+    {
+      "path": "packages/astro",
+      "type": "dir"
+    },
+    {
+      "path": "packages/better-define",
+      "type": "dir"
+    },
+    {
+      "path": "packages/boolean-prop",
+      "type": "dir"
+    },
+    {
+      "path": "packages/chain-call",
+      "type": "dir"
+    },
+    {
+      "path": "packages/common",
+      "type": "dir"
+    },
+    {
+      "path": "packages/common/src",
+      "type": "dir"
+    },
+    {
+      "path": "packages/common/src/index.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/common/src/vue.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/common/src/unplugin.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/common/src/ast.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/common/src/options.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/common/src/types.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/config",
+      "type": "dir"
+    },
+    {
+      "path": "packages/define-emit",
+      "type": "dir"
+    },
+    {
+      "path": "packages/define-models",
+      "type": "dir"
+    },
+    {
+      "path": "packages/define-options",
+      "type": "dir"
+    },
+    {
+      "path": "packages/define-prop",
+      "type": "dir"
+    },
+    {
+      "path": "packages/define-props",
+      "type": "dir"
+    },
+    {
+      "path": "packages/define-props-refs",
+      "type": "dir"
+    },
+    {
+      "path": "packages/define-render",
+      "type": "dir"
+    },
+    {
+      "path": "packages/define-slots",
+      "type": "dir"
+    },
+    {
+      "path": "packages/define-stylex",
+      "type": "dir"
+    },
+    {
+      "path": "packages/devtools",
+      "type": "dir"
+    },
+    {
+      "path": "packages/eslint-config",
+      "type": "dir"
+    },
+    {
+      "path": "packages/export-expose",
+      "type": "dir"
+    },
+    {
+      "path": "packages/export-props",
+      "type": "dir"
+    },
+    {
+      "path": "packages/export-render",
+      "type": "dir"
+    },
+    {
+      "path": "packages/hoist-static",
+      "type": "dir"
+    },
+    {
+      "path": "packages/jsx-directive",
+      "type": "dir"
+    },
+    {
+      "path": "packages/macros",
+      "type": "dir"
+    },
+    {
+      "path": "packages/macros/src",
+      "type": "dir"
+    },
+    {
+      "path": "packages/macros/src/index.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/macros/src/vite.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/macros/src/rollup.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/macros/src/webpack.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/macros/src/esbuild.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/macros/src/rspack.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/macros/src/rolldown.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/macros/src/volar.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/macros/src/runtime.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/named-template",
+      "type": "dir"
+    },
+    {
+      "path": "packages/nuxt",
+      "type": "dir"
+    },
+    {
+      "path": "packages/reactivity-transform",
+      "type": "dir"
+    },
+    {
+      "path": "packages/script-lang",
+      "type": "dir"
+    },
+    {
+      "path": "packages/setup-block",
+      "type": "dir"
+    },
+    {
+      "path": "packages/setup-component",
+      "type": "dir"
+    },
+    {
+      "path": "packages/setup-sfc",
+      "type": "dir"
+    },
+    {
+      "path": "packages/short-bind",
+      "type": "dir"
+    },
+    {
+      "path": "packages/short-emits",
+      "type": "dir"
+    },
+    {
+      "path": "packages/short-vmodel",
+      "type": "dir"
+    },
+    {
+      "path": "packages/test-utils",
+      "type": "dir"
+    },
+    {
+      "path": "packages/volar",
+      "type": "dir"
+    },
+    {
+      "path": "playground",
+      "type": "dir"
+    },
+    {
+      "path": "playground/vue3",
+      "type": "dir"
+    },
+    {
+      "path": "playground/nuxt",
+      "type": "dir"
+    },
+    {
+      "path": "playground/astro",
+      "type": "dir"
+    },
+    {
+      "path": "docs",
+      "type": "dir"
+    },
+    {
+      "path": "package.json",
+      "type": "file"
+    },
+    {
+      "path": "pnpm-workspace.yaml",
+      "type": "file"
+    },
+    {
+      "path": "tsconfig.json",
+      "type": "file"
+    },
+    {
+      "path": "tsconfig.base.json",
+      "type": "file"
+    },
+    {
+      "path": "tsdown.config.ts",
+      "type": "file"
+    },
+    {
+      "path": "vitest.config.ts",
+      "type": "file"
+    },
+    {
+      "path": "eslint.config.ts",
+      "type": "file"
+    },
+    {
+      "path": "README.md",
+      "type": "file"
+    }
+  ],
+  "docs": [
+    "README.md",
+    "CONTRIBUTING.md",
+    "docs/index.md",
+    "docs/guide/getting-started.md",
+    "docs/guide/configurations.md",
+    "docs/guide/bundler-integration.md",
+    "docs/guide/nuxt-integration.md",
+    "docs/guide/astro-integration.md",
+    "docs/guide/eslint-integration.md",
+    "docs/guide/migration-v3.md",
+    "docs/macros/index.md",
+    "docs/macros/define-options.md",
+    "docs/macros/define-models.md",
+    "docs/macros/define-props.md",
+    "docs/features/jsx-directive.md",
+    "docs/features/better-define.md",
+    "docs/features/reactivity-transform.md",
+    "docs/volar/define-generic.md",
+    "docs/volar/template-ref.md",
+    "docs/interactive/index.md",
+    "docs/zh-CN/index.md"
+  ]
+}

@@ -1,0 +1,272 @@
+{
+  "repo": "vue-macros",
+  "generatedAt": "2026-08-03T07:55:05.413Z",
+  "chapters": [
+    {
+      "slug": "sfc-parse-and-ast-edit",
+      "title": "SFC 解析与增量 AST 编辑",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "packages/common/src/vue.ts",
+        "packages/common/src/constants.ts"
+      ],
+      "summary": "所有宏的地基：用 @vue/compiler-sfc 的 parse 把 SFC 拆成 script/scriptSetup，但 AST 懒解析（getSetupAst 按需 babelParse 并缓存）省去无用开销；编辑层统一走 magic-string-ast 做基于偏移的增量改写以保留 sourcemap。关键权衡是『懒解析 + 增量编辑』换来多道转换可叠加，代价是每个宏都要自行处理 setupOffset 偏移。"
+    },
+    {
+      "slug": "unplugin-multi-bundler",
+      "title": "一次编写、六套构建器适配的 unplugin 模式",
+      "layer": "primitive",
+      "dependsOn": [
+        "sfc-parse-and-ast-edit"
+      ],
+      "sourceFiles": [
+        "packages/common/src/unplugin.ts",
+        "packages/macros/src/core/plugin.ts",
+        "packages/define-models/src/index.ts"
+      ],
+      "summary": "每个宏都用 createUnplugin 包裹一个纯函数 transformXxx(code,id)，自动获得 vite/rollup/webpack/esbuild/rspack/rolldown 六套入口；resolvePlugin 再按 framework 把实例分发成对应 plugin。关键设计是『转换逻辑与构建器解耦』——宏只关心 AST 改写，include 过滤/getVuePluginApi/HMR hack 等通用职责收在 common，代价是各宏的 bundler 入口文件高度重复（靠约定收敛）。"
+    },
+    {
+      "slug": "virtual-helper-module",
+      "title": "编译期注入虚拟 helper 模块",
+      "layer": "primitive",
+      "dependsOn": [
+        "unplugin-multi-bundler"
+      ],
+      "sourceFiles": [
+        "packages/define-models/src/core/helper/index.ts",
+        "packages/define-models/src/core/helper/use-vModel.ts",
+        "packages/define-models/src/core/helper/emit-helper.ts"
+      ],
+      "summary": "宏在编译期往源码插入 import，但目标模块并不存在于磁盘——靠 resolveId/load/loadInclude 三件套拦截虚拟 id（helperPrefix）并就地返回模块代码。关键思想是『用虚拟模块桥接编译期与运行时』：编译期只注入 import 语句、运行时由 load 提供真实实现（如 useVModel/emitHelper），换来 helper 代码集中可复用且不污染源码树；同一机制也可动态生成 SFC（见 sfc-structure-extensions）。"
+    },
+    {
+      "slug": "props-emit-macro-rewrite",
+      "title": "props/emit 宏的编译期重写与类型转换",
+      "layer": "composite",
+      "dependsOn": [
+        "sfc-parse-and-ast-edit"
+      ],
+      "sourceFiles": [
+        "packages/short-emits/src/core/index.ts",
+        "packages/define-props/src/core/index.ts",
+        "packages/define-emit/src/core/index.ts",
+        "packages/define-prop/src/core/index.ts"
+      ],
+      "summary": "把更顺手或更旧的写法在编译期改写成 Vue 原生宏：$defineProps 重命名为 defineProps、ShortEmits/SE 类型签名展开成标准 { 'evt':[payload] } 形式、defineProp 单个生成。关键权衡是『语法糖留在编译期、运行时只认原生宏』——读者拿到的语义与原生 defineProps/defineEmits 完全一致，代价是这些宏只是重写器、不引入新运行时能力。"
+    },
+    {
+      "slug": "define-models-two-way-binding",
+      "title": "defineModels：从类型合成 props/emits 双向绑定",
+      "layer": "composite",
+      "dependsOn": [
+        "sfc-parse-and-ast-edit",
+        "virtual-helper-module",
+        "props-emit-macro-rewrite"
+      ],
+      "sourceFiles": [
+        "packages/define-models/src/core/index.ts"
+      ],
+      "summary": "一个 model 既是一根 prop 又是对应的 update:事件——defineModels 从泛型类型提取每个字段，编译期同时注入到 defineProps 与 defineEmits 的类型交集里，再用运行时 useVModel(props,emit) 把两者粘成可写 ref。关键权衡是 runtime 模式（返回 ref，需读 .value）与 reactivity-transform 模式（赋值即触发 emit，靠 walkAST 改写赋值表达式）之间的取舍：前者显式可控、后者语法最简但侵入赋值语义。"
+    },
+    {
+      "slug": "better-define-type-to-runtime",
+      "title": "better-define：把 TS 类型降级为运行时校验",
+      "layer": "composite",
+      "dependsOn": [
+        "props-emit-macro-rewrite"
+      ],
+      "sourceFiles": [
+        "packages/better-define/src/core/index.ts",
+        "packages/api/src/vue/analyze.ts",
+        "packages/api/src/ts/resolve.ts"
+      ],
+      "summary": "原生 defineProps 的类型只在编译期擦除、运行时不校验；better-define 用 @vue-macros/api 的 analyzeSFC 解析类型（含跨文件 import、resolveTSReferencedType 递归展开），把它降级成 { type, required, default } 的运行时对象。关键思想是『让类型成为运行时校验的唯一真相来源』，代价是异步解析（neverthrow 的 ResultAsync）与跨文件类型求值的复杂度。"
+    },
+    {
+      "slug": "reactivity-transform",
+      "title": "响应式语法糖：赋值即 .value",
+      "layer": "composite",
+      "dependsOn": [
+        "sfc-parse-and-ast-edit"
+      ],
+      "sourceFiles": [
+        "packages/reactivity-transform/src/core/transform.ts",
+        "packages/reactivity-transform/src/core/index.ts",
+        "packages/reactivity-transform/src/core/sfc.ts"
+      ],
+      "summary": "让 $ref/$()/$computed 声明的变量能像普通变量一样直接赋值——编译期识别被标记变量，把对它的读写改写成 .value 访问。关键权衡是『牺牲语法透明性换取无 .value 的书写体验』：赋值表达式被静默改写，读者需知哪些变量被宏接管；同一思想也被 defineModels 的 reactivity-transform 模式复用。"
+    },
+    {
+      "slug": "sfc-structure-extensions",
+      "title": "突破单 script setup 的 SFC 结构扩展",
+      "layer": "composite",
+      "dependsOn": [
+        "sfc-parse-and-ast-edit",
+        "virtual-helper-module"
+      ],
+      "sourceFiles": [
+        "packages/setup-component/src/core/index.ts",
+        "packages/setup-component/src/core/sub-module.ts",
+        "packages/setup-sfc/src/core/index.ts",
+        "packages/setup-block/src/core/index.ts"
+      ],
+      "summary": "把『一个 SFC 恰好一个 script setup』的约束打开：setup-sfc 让整文件即 setup、setup-block 增加独立 setup 块、setup-component 让 setup 内联定义子组件——后者把函数体抽成虚拟 .vue 子模块并 import 回来，再通过注入的 ctx() 把外层作用域变量传进子组件。关键设计是『虚拟 SFC + 作用域注入』换组件内联组合能力，代价是 scan/transform/load/hotUpdate 四阶段协调与 HMR 复杂度。"
+    },
+    {
+      "slug": "jsx-directives",
+      "title": "在 JSX 里镜像 Vue 模板指令",
+      "layer": "composite",
+      "dependsOn": [
+        "sfc-parse-and-ast-edit"
+      ],
+      "sourceFiles": [
+        "packages/jsx-directive/src/core/index.ts",
+        "packages/jsx-directive/src/core/v-if.ts",
+        "packages/jsx-directive/src/core/v-for.ts",
+        "packages/jsx-directive/src/core/v-model.ts",
+        "packages/jsx-directive/src/helpers.ts"
+      ],
+      "summary": "把 v-if/v-for/v-model/v-slot/v-on/v-html/v-memo 等 JSX attribute 在编译期识别并展开成等价的 JSX 表达式（三元、.map、mergeProps、withModifiers）。关键思想是『不发明新运行时、只做模板指令到 JSX 的翻译』——遍历一次 AST 按指令类型分桶收集后各自改写，让 JSX 写法获得与 template 一致的指令语义，代价是 v-if/v-for 嵌套时需按兄弟节点分组还原控制流。"
+    },
+    {
+      "slug": "template-and-render-redirect",
+      "title": "模板与渲染函数的重定向",
+      "layer": "composite",
+      "dependsOn": [
+        "sfc-parse-and-ast-edit",
+        "virtual-helper-module"
+      ],
+      "sourceFiles": [
+        "packages/named-template/src/core/index.ts",
+        "packages/define-render/src/core/index.ts",
+        "packages/export-render/src/core/index.ts",
+        "packages/define-slots/src/core/index.ts"
+      ],
+      "summary": "提供非默认的渲染来源：define-render/export-render 用 JSX 或 h() 在 setup 里定义渲染函数代替 <template>，define-slots 给出插槽类型，named-template 用 <template name> 定义可复用模板再由 <component is=\"named-template-x\"> 引用（虚拟模块 + 编译后改写 _createVNode）。关键权衡是『把渲染输出从声明式 template 扩展到命令式/可复用形态』，代价是 named-template 需分 preTransform/postTransform 两阶段且要识别编译器产出的 _createBlock。"
+    },
+    {
+      "slug": "hoist-static-and-export-rewrite",
+      "title": "静态提升与 export 语义重写",
+      "layer": "composite",
+      "dependsOn": [
+        "sfc-parse-and-ast-edit"
+      ],
+      "sourceFiles": [
+        "packages/hoist-static/src/core/index.ts",
+        "packages/export-expose/src/core/index.ts",
+        "packages/export-props/src/core/index.ts",
+        "packages/define-stylex/src/core/index.ts"
+      ],
+      "summary": "重排 setup 内语句的语义：hoist-static 用 isStaticExpression 判定纯静态 const/enum，把它们从每次执行的 <script setup> 提升到只执行一次的普通 <script>；export-expose/export-props 把 export 语句重写成 defineExpose/defineProps，让 setup 像普通模块那样用 export 暴露。关键思想是『借普通 script 的模块级语义换性能/可读性』，代价是静态判定必须保守（误判副作用会改变行为）。"
+    },
+    {
+      "slug": "syntax-shims",
+      "title": "为旧版本补齐与简化样板的语法垫片",
+      "layer": "composite",
+      "dependsOn": [
+        "sfc-parse-and-ast-edit"
+      ],
+      "sourceFiles": [
+        "packages/short-bind/src/core/index.ts",
+        "packages/short-vmodel/src/core/index.ts",
+        "packages/boolean-prop/src/core/index.ts",
+        "packages/chain-call/src/core/index.ts",
+        "packages/script-lang/src/core/index.ts"
+      ],
+      "summary": "针对两类需求做编译期改写：一是把新版 Vue 才有的语法向下兼容（short-bind 的 <Comp foo> 等价 :foo=\"foo\"、short-vmodel 简写），二是消样板（boolean-prop 让布尔无须显式、chain-call 串联）。关键权衡是『按 Vue 版本号条件启用』——用宏把语法差异抹平在编译期、运行时零成本，代价是这些宏只在特定版本有意义、且依赖版本探测。"
+    },
+    {
+      "slug": "config-version-aware",
+      "title": "统一配置体系与版本感知默认值",
+      "layer": "system",
+      "dependsOn": [
+        "unplugin-multi-bundler"
+      ],
+      "sourceFiles": [
+        "packages/config/src/options.ts",
+        "packages/config/src/config.ts",
+        "packages/config/src/define.ts"
+      ],
+      "summary": "用 FeatureOptionsMap 把三十多个特性收敛成一张带版本条件的开关表：resolveSubOptions 按检测到的 Vue 版本决定某特性默认开或关（如 shortEmits 默认 vue<3.3，因 3.3+ 原生支持）。关键设计是『版本号即默认配置来源』——同一份配置在新旧 Vue 下行为自适应，代价是用户须理解每个特性的版本门槛、且配置加载走 quansync 异步以支持读取配置文件。"
+    },
+    {
+      "slug": "macros-pipeline",
+      "title": "主聚合插件与转换管道顺序编排",
+      "layer": "system",
+      "dependsOn": [
+        "virtual-helper-module",
+        "props-emit-macro-rewrite",
+        "define-models-two-way-binding",
+        "better-define-type-to-runtime",
+        "reactivity-transform",
+        "sfc-structure-extensions",
+        "jsx-directives",
+        "template-and-render-redirect",
+        "hoist-static-and-export-rewrite",
+        "syntax-shims",
+        "config-version-aware"
+      ],
+      "sourceFiles": [
+        "packages/macros/src/index.ts",
+        "packages/macros/src/core/plugin.ts",
+        "packages/macros/src/core/exclude-macros.ts"
+      ],
+      "summary": "vue-macros 主入口用 unplugin-combine 的 createCombinePlugin 把所有宏按精心设计的顺序串成一条转换管道：先跑结构扩展（setup-sfc/component、named-template）改写文件形态，再 props→emits→defineModels→betterDefine 逐级把类型落到运行时，最后注入 vue/vueJsx 插件与 devtools。关键思想是『顺序即语义』——betterDefine 必须在 defineProps 之后才能看到已重写的 props，结构扩展必须先于一切否则后续宏拿不到 script setup，代价是新增宏必须找到正确插队位置否则管道错乱。"
+    },
+    {
+      "slug": "volar-ide-mirror",
+      "title": "volar：编译期能力的 IDE 镜像",
+      "layer": "system",
+      "dependsOn": [
+        "props-emit-macro-rewrite",
+        "define-models-two-way-binding",
+        "better-define-type-to-runtime",
+        "sfc-structure-extensions",
+        "jsx-directives",
+        "hoist-static-and-export-rewrite",
+        "syntax-shims"
+      ],
+      "sourceFiles": [
+        "packages/volar/src/index.ts",
+        "packages/volar/src/common.ts",
+        "packages/volar/src/define-models.ts",
+        "packages/volar/src/jsx-directive.ts"
+      ],
+      "summary": "自定义宏在运行时被擦除，编辑器里会报未知符号——volar 以 VueLanguagePlugin 形式为每个宏重新实现一份『类型层镜像』，让 IDE 能识别 defineModels/shortEmits 等并给出补全与类型提示。关键权衡是『编译器 transform 与 IDE 类型服务是两套独立实现』：core 改写源码、volar 改写语言服务的虚拟代码，两边必须手工保持一致，代价是每新增一个宏要同步维护两处。"
+    },
+    {
+      "slug": "framework-integration",
+      "title": "Nuxt / Astro / DevTools 框架集成",
+      "layer": "system",
+      "dependsOn": [
+        "macros-pipeline"
+      ],
+      "sourceFiles": [
+        "packages/nuxt/src/index.ts",
+        "packages/astro/src/index.ts",
+        "packages/devtools/src/index.ts"
+      ],
+      "summary": "在更高层框架里接入 vue-macros：nuxt 把 macros 作为模块自动装配并传 nuxtContext 解决 SSR 客户端判定，astro 集成进 Islands 架构，devtools 在 vite 层挂载可视化面板查看各宏的转换结果。关键设计是『框架特定的装配上下文由集成层注入、转换内核保持不变』，换来在多框架下一处实现处处可用，代价是每接一个框架要处理其独有的 SSR/HMR/模块系统差异。"
+    }
+  ],
+  "topoOrder": [
+    "sfc-parse-and-ast-edit",
+    "unplugin-multi-bundler",
+    "virtual-helper-module",
+    "props-emit-macro-rewrite",
+    "define-models-two-way-binding",
+    "better-define-type-to-runtime",
+    "reactivity-transform",
+    "sfc-structure-extensions",
+    "jsx-directives",
+    "template-and-render-redirect",
+    "hoist-static-and-export-rewrite",
+    "syntax-shims",
+    "config-version-aware",
+    "macros-pipeline",
+    "volar-ide-mirror",
+    "framework-integration"
+  ]
+}
