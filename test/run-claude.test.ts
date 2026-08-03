@@ -81,15 +81,18 @@ describe("buildCmd · 只读模式", () => {
     });
     // args: flag 名与值分开。--permission-mode bypassPermissions 彻底跳过权限检查。
     // 安全性由 --allowedTools 工具白名单保证。
+    // --effort max 固定最高思考强度：一次性高质量产出，最大化推理深度。
     expect(args).toEqual([
       "-p", "hi",
       "--allowedTools", "Read,Glob,Grep",
       "--permission-mode", "bypassPermissions",
+      "--effort", "max",
     ]);
-    // cmd 形态：<CLAUDE_BIN> -p "hi" --allowedTools Read,Glob,Grep --permission-mode bypassPermissions
+    // cmd 形态：<CLAUDE_BIN> -p "hi" --allowedTools Read,Glob,Grep --permission-mode bypassPermissions --effort max
     // CLAUDE_BIN 已被 resolveClaudeBin() 解析到真正可执行文件（如 .../claude.exe），不硬编码 "claude"。
     expect(cmd.startsWith(`${CLAUDE_BIN} -p \"hi\" --allowedTools Read,Glob,Grep`)).toBe(true);
     expect(cmd.includes("--permission-mode bypassPermissions")).toBe(true);
+    expect(cmd.includes("--effort max")).toBe(true);
   });
 });
 
@@ -136,6 +139,19 @@ describe("buildCmd · model 与 systemPrompt", () => {
     );
     // 加了 system prompt，readonly 锚点仍在
     expect(cmd.includes("--allowedTools Read,Glob,Grep")).toBe(true);
+  });
+});
+
+describe("buildCmd · 思考强度固定为 max（硬约束）", () => {
+  test("readonly/write 两种模式 cmd 都必然含 `--effort max`", () => {
+    const ro = buildCmd({ prompt: "x", cwd: ".", tools: "readonly" });
+    const wr = buildCmd({ prompt: "x", cwd: ".", tools: "write" });
+    expect(ro.cmd.includes("--effort max")).toBe(true);
+    expect(wr.cmd.includes("--effort max")).toBe(true);
+    expect(ro.args).toContain("--effort");
+    expect(ro.args[ro.args.indexOf("--effort") + 1]).toBe("max");
+    expect(wr.args).toContain("--effort");
+    expect(wr.args[wr.args.indexOf("--effort") + 1]).toBe("max");
   });
 });
 

@@ -1,0 +1,25 @@
+我已经根据真实的 Pinia 源码（GitHub 上的 `$patch`、`mergeReactiveObjects`、`$subscribe` watcher、`isPlainObject` 以及 `$reset`/`$state` setter）核实了草稿中所有关键的技术主张。
+
+**验证总结：**
+- **`$patch` 流水线**：两个开关均设为 false → 变异/合并 → token (`activeListener = Symbol()`) + `nextTick` 恢复异步 → `isSyncListening = true` → `triggerSubscriptions`。草稿中的排序（③ 同步恢复在 ④ 手动广播之前）完全吻合。✓
+- **合并通知 / 异步间隙推理**：草稿中的“夹缝聋”分析（Vue 的异步 watcher 作业在同一个微任务刷新中、nextTick 回调之前运行，因此重新打开 `isListening` 必须延迟）在 Vue 3 调度器下是正确的。✓
+- **`mergeReactiveObjects`**：Map→set, Set→add, 原生对象递归, ref/reactive 跳过, 其他替换。✓
+- **`isPlainObject`**：`[object Object]` + 无 `toJSON`。✓
+- **嵌套 patch token**：`if (activeListener === myListenerId)` 守卫。✓
+- **`$reset` / `$state` setter 复用 `$patch`**。✓
+- **演示输出**：追踪了确切的单行结果（同步 watcher 在 `isSyncListening=false` 时短路；异步合并任务在 `isListening=false` 时运行；仅手动 `notify` 触发）。✓
+
+**7 项标准评估：**
+- ① 准确性 — 每个核心行为断言都与源码一致。（微小的范围标签：“模块级 `activeListener`”实际上是按存储划分的闭包，但这并不影响所描述的行为，也不是误导。）
+- ② 衔接 — 明确重用了前一章 subscriptions 中的 `triggerSubscriptions`。
+- ③ 演示 — 从零开始编写，精简（`reactive`+`watch`+`nextTick`），与源码逐字重合度为 0%，自洽，使用了正确的 TS/Vue 载体。
+- ④ 清晰 — 包含动机 → 核心思想 → 流水线心智模型 → 带有追踪输出的演示。
+- ⑤ 教学·非源码导读 — 正文没有 `path:line` / 行号 / 源码对照小节；以权衡和心智模型为主导，而非重载枚举。
+- ⑥ 原理 — 三个具体的“做了X/换来Y/代价Z”权衡（加上 token 的那个）；权衡部分篇幅 > 演示部分篇幅。
+- ⑦ 概念分层 — 隐喻仅落在设计级机制上（watcher-gating/关麦），而非基础概念上；Symbol 有单行解释；没有多行排比铺陈。
+
+所有 7 项标准均通过。
+
+```json
+{ "verdict": "approve", "fixes": [] }
+```

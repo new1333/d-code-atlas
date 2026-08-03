@@ -27,6 +27,10 @@ export { resolveClaudeBin } from "./config.ts";
 // - 系统指令注入：`--append-system-prompt-file <path>`（读文件追加到默认 system prompt 后）
 //     比 `@path` 展开更明确，且语义贴合「角色 prompt = 系统级指令」
 // - model 指定：`--model <model>`
+// - 思考强度：`--effort <low|medium|high|xhigh|max>`（控制 reasoning 预算）
+//     ⇒ 固定 `--effort max`：每个 agent 都是一次性高质量产出（Surveyor 测绘 /
+//        Architect 分章 / Critic 评审 / Writer 写章节），最大化推理深度换产出质量；
+//        成本由并发上限与重试次数控制，不在思考强度上省。
 // - 工作目录：claude CLI 无 `--cwd` flag → 靠 spawn 的 cwd 参数透传
 // ---------------------------------------------------------------------------
 
@@ -146,7 +150,7 @@ export interface ClaudeResult {
  * - `args`：传给真实 spawn 的参数数组（不含二进制本身，由 spawn 拼）。
  *
  * 命令形态（readonly 全量示例）：
- *   claude -p "<prompt>" --allowedTools Read,Glob,Grep --model sonnet \
+ *   claude -p "<prompt>" --allowedTools Read,Glob,Grep --effort max --model sonnet \
  *          --append-system-prompt-file /abs/path/role.md
  *
  * 注：prompt 含 shell 特殊字符时，spawn 用数组传参天然安全（不经 shell）；
@@ -170,6 +174,9 @@ export function buildCmd(opts: ClaudeRunOptions): { cmd: string; args: string[] 
     toolsValue,
     "--permission-mode",
     "bypassPermissions",
+    // 固定最高思考强度：每个 agent = 一次性高质量产出，最大化推理深度换产出质量。
+    "--effort",
+    "max",
   ];
 
   if (opts.model && opts.model.trim() !== "") {
