@@ -96,7 +96,8 @@ for (const key of keys) {
     cpSync(join(siteDir, ".vitepress", "dist"), join(distRoot, key), {
       recursive: true,
     });
-    links.push(`<li><a href="/${key}/">${siteTitle(siteDir, key)}</a></li>`);
+    // 用相对链接：聚合页无论部署在项目子路径（/d-code-atlas/）还是根路径都能正确跳转。
+    links.push(`<li><a href="${key}/">${siteTitle(siteDir, key)}</a></li>`);
   } finally {
     writeFileSync(configPath, original);
   }
