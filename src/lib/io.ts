@@ -98,6 +98,11 @@ export function draftPath(key: string, slug: string): string {
   return joinPath(chapterDir(key, slug), "draft.md");
 }
 
+/** 导读产物：`atlas/{key}/work/prologue/draft.md`（全书级，由 Synthesizer 产）。 */
+export function prologuePath(key: string): string {
+  return joinPath(workDir(key), "prologue/draft.md");
+}
+
 /** 复刻子工程目录：`atlas/{key}/work/chapters/{slug}/replica/`。 */
 export function replicaDir(key: string, slug: string): string {
   return joinPath(chapterDir(key, slug), "replica/");

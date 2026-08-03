@@ -791,6 +791,15 @@ describe("06-assemble · site 结构校验", () => {
       const call: SpawnCall = { args: [...args], cwd: opts.cwd };
       calls.push(call);
       const prompt = args[1] ?? "";
+      if (prompt.includes("你是 Synthesizer")) {
+        // 导读：返回有效的 prologue markdown fence（4 反引号外层）。
+        // stage 会提取 fence 后原子落盘到 work/prologue/draft.md。
+        return {
+          exitCode: 0,
+          stdout: "````markdown\n# 导读\n\n一句话主线。\n````",
+          stderr: "",
+        };
+      }
       if (prompt.includes("你是 Assembler")) {
         // 从 prompt 嵌入的 outline digest 抽 topoOrder。
         // digest 形如 JSON，含 "topoOrder": [...].
@@ -802,8 +811,10 @@ describe("06-assemble · site 结构校验", () => {
           .filter(Boolean);
 
         const site = siteDir(key);
-        // 写 guide/{nn}-{slug}.md。
         await ensureDir(joinPath(site, "guide/"));
+        // 若导读已落盘（Synthesizer 成功），Assembler 应搬为 00-prologue.md。
+        await writeText(joinPath(site, "guide/00-prologue.md"), "# 导读");
+        // 写 guide/{nn}-{slug}.md。
         for (let i = 0; i < topoOrder.length; i++) {
           const slug = topoOrder[i];
           const nn = (i + 1).toString().padStart(2, "0");
@@ -840,6 +851,8 @@ describe("06-assemble · site 结构校验", () => {
     expect(await pathExists(joinPath(site, ".vitepress/config.ts"))).toBe(true);
     expect(await pathExists(joinPath(site, "index.md"))).toBe(true);
     expect(await pathExists(joinPath(site, "package.json"))).toBe(true);
+    // 导读已被搬运为 00-prologue.md（Synthesizer 成功 → Assembler 搬运）。
+    expect(await pathExists(joinPath(site, "guide/00-prologue.md"))).toBe(true);
 
     // guide 文件编号 == topo 序号（AC-4）。
     const onDiskOutline = await readJson<Outline>(outlinePath(key));
@@ -850,7 +863,9 @@ describe("06-assemble · site 结构校验", () => {
       const expected = joinPath(site, `guide/${nn}-${slug}.md`);
       expect(await pathExists(expected)).toBe(true);
     }
-    expect(calls.length).toBe(1);
+    // spawn 被调用 2 次：先 Synthesizer（导读，mock 不认识返回空 → 失败但不阻断），
+    // 再 Assembler（真正落盘 site/）。
+    expect(calls.length).toBe(2);
   });
 
   test("assembler 失败 → stage failed", async () => {

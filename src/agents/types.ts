@@ -28,7 +28,8 @@ export type PromptRole =
   | "critic-chapter"
   | "reader"
   | "writer"
-  | "assembler";
+  | "assembler"
+  | "synthesizer";
 
 /**
  * 解析角色 prompt 文件的绝对路径。

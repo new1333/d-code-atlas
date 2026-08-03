@@ -4,8 +4,10 @@
 //
 // 流程：
 //   读 outline（含 topoOrder）→ 标 stage running + save →
-//   调 assembler（Assembler 自己落盘 site/：guide/{nn}-{slug}.md、.vitepress/config.ts、
-//     index.md、package.json）→
+//   ① 先调 Synthesizer 产全书导读（可选产物：失败不阻断，记 stderr 继续）；
+//     成功则原子落盘 work/prologue/draft.md →
+//   ② 调 assembler（Assembler 自己落盘 site/：guide/{nn}-{slug}.md、.vitepress/config.ts、
+//     index.md、package.json；若 work/prologue/draft.md 存在，额外搬 site/guide/00-prologue.md）→
 //   校验 site 结构完整性（缺关键文件 → stage failed，但保留已生成的 site/）→
 //   成功 → setStage done + save + return。
 //
@@ -22,12 +24,15 @@
 //   缺任一关键文件 → stage failed（保留 site/，design §15）。
 
 import { assembler } from "../agents/assembler.ts";
+import { synthesizer } from "../agents/synthesizer.ts";
 import {
   siteDir,
   outlinePath,
   readJson,
   pathExists,
   joinPath,
+  writeText,
+  prologuePath,
 } from "../lib/io.ts";
 import { setStageStatus, saveManifest } from "../lib/manifest.ts";
 import type { Outline } from "../lib/types.ts";
@@ -68,6 +73,32 @@ export async function assemble(ctx: StageContext): Promise<StageResult> {
   let m = setStageStatus(manifest, "assemble", "running");
   await saveManifest(key, m);
 
+  // 0) 先调 Synthesizer 产全书导读（可选产物）。
+  // 导读是锦上添花——失败不阻断搬运：site 仍可构建（只是缺 00-导读），章节正文才是主体。
+  // 成功则原子落盘到 work/prologue/draft.md，供 Assembler 搬运为 site/guide/00-prologue.md。
+  let prologueOk = false;
+  try {
+    const syn = await synthesizer({ key, model, spawn });
+    if (syn.ok && syn.prologueMd) {
+      await writeText(prologuePath(key), syn.prologueMd);
+      prologueOk = true;
+    } else {
+      // 导读失败：记 stderr 到 manifest（不改 stage status，继续搬运）。
+      m = setStageStatus(m, "assemble", "running", {
+        cmd: syn.cmd,
+        stderr: `(导读生成失败，已跳过) ${syn.stderr || ""}`.slice(0, 500),
+      });
+      await saveManifest(key, m);
+    }
+  } catch (err) {
+    // synthesizer 异常（非预期）：同样不阻断，记 stderr 继续。
+    const msg = (err as Error).message ?? String(err);
+    m = setStageStatus(m, "assemble", "running", {
+      stderr: `(导读生成异常，已跳过) ${msg}`.slice(0, 500),
+    });
+    await saveManifest(key, m);
+  }
+
   // 调 Assembler（自己落盘 site/）。
   const outcome = await assembler({ key, model, spawn });
 
@@ -106,6 +137,14 @@ export async function assemble(ctx: StageContext): Promise<StageResult> {
       const expected = joinPath(guideDir, `${nn(i)}-${slug}.md`);
       if (!(await pathExists(expected))) {
         errors.push(`缺 guide 文件: ${expected}`);
+      }
+    }
+
+    // 3.5) 若导读生成成功（work/prologue/draft.md 已落盘），校验 00-prologue.md 已搬运。
+    if (prologueOk) {
+      const expectedPrologue = joinPath(guideDir, "00-prologue.md");
+      if (!(await pathExists(expectedPrologue))) {
+        errors.push(`缺 guide 文件（导读）: ${expectedPrologue}`);
       }
     }
   }
