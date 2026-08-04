@@ -1,0 +1,229 @@
+{
+  "root": "work/source",
+  "sourceKind": "git-clone",
+  "languages": [
+    "ts",
+    "js",
+    "vue"
+  ],
+  "frameworks": [
+    "vue",
+    "vite",
+    "vitest",
+    "playwright",
+    "vitepress",
+    "unplugin"
+  ],
+  "entrypoints": [
+    "packages/router/src/index.ts",
+    "packages/router/src/experimental/index.ts",
+    "packages/router/src/unplugin/index.ts",
+    "packages/router/src/unplugin/vite.ts",
+    "packages/router/index.cjs"
+  ],
+  "manifests": [
+    "package.json",
+    "pnpm-workspace.yaml",
+    "vitest.config.ts",
+    "netlify.toml",
+    "codecov.yml",
+    "packages/router/package.json",
+    "packages/router/tsconfig.json",
+    "packages/docs/package.json",
+    "packages/playground/package.json",
+    "packages/playground-file-based/package.json",
+    "packages/experiments-playground/package.json"
+  ],
+  "packages": [
+    {
+      "name": "vue-router",
+      "path": "packages/router"
+    },
+    {
+      "name": "@vue/router-docs",
+      "path": "packages/docs"
+    },
+    {
+      "name": "@vue/router-playground",
+      "path": "packages/playground"
+    },
+    {
+      "name": "@vue/router-playground-file-based",
+      "path": "packages/playground-file-based"
+    },
+    {
+      "name": "experiments-playground",
+      "path": "packages/experiments-playground"
+    }
+  ],
+  "tree": [
+    {
+      "path": "packages",
+      "type": "dir"
+    },
+    {
+      "path": "packages/router",
+      "type": "dir"
+    },
+    {
+      "path": "packages/router/src",
+      "type": "dir"
+    },
+    {
+      "path": "packages/router/src/index.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/router/src/router.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/router/src/RouterLink.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/router/src/RouterView.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/router/src/navigationGuards.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/router/src/scrollBehavior.ts",
+      "type": "file"
+    },
+    {
+      "path": "packages/router/src/history",
+      "type": "dir"
+    },
+    {
+      "path": "packages/router/src/matcher",
+      "type": "dir"
+    },
+    {
+      "path": "packages/router/src/typed-routes",
+      "type": "dir"
+    },
+    {
+      "path": "packages/router/src/types",
+      "type": "dir"
+    },
+    {
+      "path": "packages/router/src/experimental",
+      "type": "dir"
+    },
+    {
+      "path": "packages/router/src/experimental/index.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/router/src/experimental/data-loaders",
+      "type": "dir"
+    },
+    {
+      "path": "packages/router/src/experimental/route-resolver",
+      "type": "dir"
+    },
+    {
+      "path": "packages/router/src/unplugin",
+      "type": "dir"
+    },
+    {
+      "path": "packages/router/src/unplugin/index.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/router/src/unplugin/vite.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/router/src/unplugin/core",
+      "type": "dir"
+    },
+    {
+      "path": "packages/router/src/unplugin/codegen",
+      "type": "dir"
+    },
+    {
+      "path": "packages/router/src/tests",
+      "type": "dir"
+    },
+    {
+      "path": "packages/router/index.cjs",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "packages/router/package.json",
+      "type": "file"
+    },
+    {
+      "path": "packages/router/tsconfig.json",
+      "type": "file"
+    },
+    {
+      "path": "packages/router/e2e",
+      "type": "dir"
+    },
+    {
+      "path": "packages/router/test-dts",
+      "type": "dir"
+    },
+    {
+      "path": "packages/docs",
+      "type": "dir"
+    },
+    {
+      "path": "packages/playground",
+      "type": "dir"
+    },
+    {
+      "path": "packages/playground-file-based",
+      "type": "dir"
+    },
+    {
+      "path": "packages/experiments-playground",
+      "type": "dir"
+    },
+    {
+      "path": "scripts",
+      "type": "dir"
+    },
+    {
+      "path": "package.json",
+      "type": "file"
+    },
+    {
+      "path": "pnpm-workspace.yaml",
+      "type": "file"
+    },
+    {
+      "path": "vitest.config.ts",
+      "type": "file"
+    },
+    {
+      "path": "README.md",
+      "type": "file"
+    }
+  ],
+  "docs": [
+    "README.md",
+    "SECURITY.md",
+    "packages/docs/index.md",
+    "packages/docs/introduction.md",
+    "packages/docs/installation.md",
+    "packages/docs/guide/index.md",
+    "packages/docs/guide/essentials/history-mode.md",
+    "packages/docs/guide/advanced/navigation-guards.md",
+    "packages/docs/guide/advanced/dynamic-routing.md",
+    "packages/docs/guide/migration/v4-to-v5.md",
+    "packages/docs/file-based-routing/index.md",
+    "packages/docs/data-loaders/index.md",
+    "packages/docs/experimental/router-resolver.md"
+  ]
+}

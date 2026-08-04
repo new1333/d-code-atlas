@@ -1,0 +1,194 @@
+{
+  "repo": "yt-dlp",
+  "generatedAt": "2026-08-04T00:45:29.103Z",
+  "chapters": [
+    {
+      "slug": "networking-abstraction",
+      "title": "可插拔传输层：请求中立与处理器竞争",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "yt_dlp/networking/common.py",
+        "yt_dlp/networking/__init__.py",
+        "yt_dlp/networking/exceptions.py"
+      ],
+      "summary": "用「Request/Response 是与传输无关的中立对象 + 多个 RequestHandler 竞争 + RequestDirector 按偏好函数排序择优」解耦『发什么请求』与『用哪个引擎发(urllib/requests/websockets/curl_cffi)』；关键权衡是引入 validate/UnsupportedRequest 的『能力探测』换来多后端可插拔且优雅降级，代价是每个 handler 必须自报支持的能力(scheme/代理/扩展)否则被跳过。"
+    },
+    {
+      "slug": "plugin-registry",
+      "title": "约定胜配置的插件注册机制",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "yt_dlp/plugins.py",
+        "yt_dlp/globals.py",
+        "yt_dlp/extractor/__init__.py",
+        "yt_dlp/postprocessor/__init__.py"
+      ],
+      "summary": "用『Python importlib MetaPathFinder 造虚拟命名空间包 + 类名后缀约定(IE/PP/RH) + Indirect 全局查表』实现零配置可扩展：丢一个文件即可注册新提取器/后处理器/请求处理器；关键权衡是『后缀即类型、约定胜配置』换来无需显式注册表、内置类与用户插件走同一发现路径，代价是类名受命名约束、加载顺序靠 merge_dicts 把插件前置合并控制。"
+    },
+    {
+      "slug": "impersonation",
+      "title": "浏览器指纹伪装：作为扩展叠加的传输能力",
+      "layer": "composite",
+      "dependsOn": [
+        "networking-abstraction"
+      ],
+      "sourceFiles": [
+        "yt_dlp/networking/impersonate.py"
+      ],
+      "summary": "把『浏览器指纹伪装』作为可叠加的能力挂在 RequestHandler 之上——通过 request.extensions 携带 ImpersonateTarget、handler 自报 _SUPPORTED_IMPERSONATE_TARGET_MAP、再用 register_preference 给支持伪装的 handler 加 1000 分偏好使其在 Director 路由中胜出；关键权衡是『能力走扩展、路由走偏好』让伪装与具体传输解耦(curl_cffi 真改 TLS 指纹 / 其它 handler 仅改 header)，代价是请求对象多一层 extension 协商与目标解析。"
+    },
+    {
+      "slug": "info-dict-contract",
+      "title": "info_dict 数据总线与提取器骨架",
+      "layer": "composite",
+      "dependsOn": [
+        "networking-abstraction",
+        "plugin-registry"
+      ],
+      "sourceFiles": [
+        "yt_dlp/extractor/common.py"
+      ],
+      "summary": "整个系统说一种语言——一个字段极丰富的 info_dict 字典在 提取器→编排器→下载器→后处理器 间流动；InfoExtractor 基类用 `_real_extract` 契约 + 一整套抓取样板(_download_webpage/_search_regex/_og_search_*/_json_ld/geo 假 IP 重试/URL suitable 匹配)把『解析一个站点』压缩成几十行；关键权衡是『胖字典当万能数据总线 + 基类吸收样板』换各阶段对字典做纯变换，代价是 schema 仅靠文档约定无编译期保证、字段语义随阶段演进(filepath 等后注入)。"
+    },
+    {
+      "slug": "js-interpreter",
+      "title": "进程内手写 JS 解释器：本地执行对抗性脚本",
+      "layer": "composite",
+      "dependsOn": [
+        "info-dict-contract"
+      ],
+      "sourceFiles": [
+        "yt_dlp/jsinterp.py"
+      ],
+      "summary": "为解出站点下发的签名解密/n 参数混淆 JS，不从外部拉 V8，而是在进程内手写一个 JavaScript 解释器(tokenizer + interpret_statement/expression 递归求值 + 对象/函数提取)，精确模拟 JS 的 32 位整数运算、JS_Undefined、原型等子集语义；关键权衡是『把对抗性 JS 当数据本地执行』换来不依赖浏览器/Node、可移植且行为可锁定，代价是只覆盖站点实际用到的那部分 JS、新语法须持续跟进补丁。"
+    },
+    {
+      "slug": "downloader-framework",
+      "title": "协议字段驱动的下载策略分派",
+      "layer": "composite",
+      "dependsOn": [
+        "info-dict-contract"
+      ],
+      "sourceFiles": [
+        "yt_dlp/downloader/common.py",
+        "yt_dlp/downloader/__init__.py",
+        "yt_dlp/downloader/external.py"
+      ],
+      "summary": "下载策略由 info_dict 里的 `protocol` 字段决定——get_suitable_downloader 把协议映射到 FileDownloader 子类(HttpFD/HlsFD/RtmpFD…)并允许外部下载器(aria2c/ffmpeg)按 can_download 自荐接管；FileDownloader 基类统一承担限速、断点续传、临时 .part 文件、进度钩子与多行进度条；关键权衡是『协议字段驱动策略选择』换编排器对下载细节无感，代价是协议→FD 的特例(直播、格式合并、section 裁剪)堆积成分派函数里的条件分支海洋。"
+    },
+    {
+      "slug": "fragment-downloading",
+      "title": "分片化下载：把长流拆成可恢复的工作单元",
+      "layer": "composite",
+      "dependsOn": [
+        "downloader-framework"
+      ],
+      "sourceFiles": [
+        "yt_dlp/downloader/fragment.py",
+        "yt_dlp/downloader/hls.py",
+        "yt_dlp/downloader/dash.py"
+      ],
+      "summary": "把 HLS/DASH 这类长流建模为『可迭代的分片序列』：FragmentFD 逐片下载、每片独立重试/跳过、用 `.ytdl` 簿记文件记录 fragment_index 以支持断点续传、可选并发拉取(concurrent_fragment_downloads)、并对 AES-128 分片就地解密；关键权衡是『把不可靠的长下载拆成可恢复的工作单元』换来断点续传与容错，代价是磁盘多了分片临时文件与簿记状态、下载后需额外合并步骤。"
+    },
+    {
+      "slug": "postprocessor-pipeline",
+      "title": "声明式后处理流水线与链式 info 变换",
+      "layer": "composite",
+      "dependsOn": [
+        "info-dict-contract"
+      ],
+      "sourceFiles": [
+        "yt_dlp/postprocessor/common.py",
+        "yt_dlp/postprocessor/__init__.py",
+        "yt_dlp/__init__.py"
+      ],
+      "summary": "后处理是一条 PP 链：每个 PostProcessor.run 接收并返回 (待删文件列表, info)，链式传递；PostProcessorMetaClass 自动给 run 包一层 started/finished 进度钩子；get_postprocessors 把一堆 CLI 开关翻译成有序的声明式流水线(转换→合并→嵌字幕→写元数据)并内置 PP 间先后约束(如 ModifyChapters 须早于 FFmpegMetadata)；关键权衡是『声明式拼装 + 链式 info 变换』换可组合的加工管线，代价是正确顺序依赖作者硬编码的注释化约束。"
+    },
+    {
+      "slug": "format-selection",
+      "title": "格式选择 DSL：从 -f 串到选择器 AST",
+      "layer": "composite",
+      "dependsOn": [
+        "info-dict-contract"
+      ],
+      "sourceFiles": [
+        "yt_dlp/YoutubeDL.py",
+        "yt_dlp/utils/_utils.py"
+      ],
+      "summary": "把 `-f bestvideo+bestaudio/best` 这种格式选择串用 Python tokenize 词法分析编译成一个 FormatSelector 命名元组 AST——规格符(best/worst)、过滤器([height<=?720])、`+` 合并(MERGE)、`/` 兜底(PICKFIRST)——对 info_dict.formats 求值选出最终格式，并配合 FormatSorter 的多键排序定序；关键权衡是『用一门迷你查询语言声明选格式』换掉命令式遍历，代价是 DSL 语法/优先级需自定义解析、且要单独处理音视频分流合并的可行性。"
+    },
+    {
+      "slug": "output-template",
+      "title": "输出模板引擎：命名即元数据投影",
+      "layer": "composite",
+      "dependsOn": [
+        "info-dict-contract"
+      ],
+      "sourceFiles": [
+        "yt_dlp/YoutubeDL.py"
+      ],
+      "summary": "输出文件名/进度串由 `%(title)s-%(id)s.%(ext)s` 这类模板从 info_dict 派生：prepare_outtmpl 把模板编译成求值器，支持类型感知过滤器(取整/截断/日期)、默认值交替(NA 占位)、嵌套播放列表字段与 outtmpl 校验；关键权衡是『命名与输出即元数据投影』换下载与命名解耦、同套模板复用于文件名/进度条/控制台标题，代价是模板语法自成一套转义与求值规则、须限制 eval 以防注入。"
+    },
+    {
+      "slug": "cookies",
+      "title": "统一 cookiejar：从浏览器密钥环解密登录态",
+      "layer": "composite",
+      "dependsOn": [
+        "networking-abstraction"
+      ],
+      "sourceFiles": [
+        "yt_dlp/cookies.py"
+      ],
+      "summary": "统一的 YoutubeDLCookieJar 既可从文件加载，也可从已装浏览器里提取——按浏览器×OS 定位 cookie 数据库并用各自密钥环(secretstorage/keychain/DPAPI)解密出明文 cookie，再注入到每个请求；关键权衡是『一处抽取、全网复用登录态』免去用户手动导出 cookie，代价是为每个浏览器×OS 维护脆弱的解密路径、随浏览器升级极易碎裂。"
+    },
+    {
+      "slug": "orchestrator-pipeline",
+      "title": "YoutubeDL 编排器：贯穿各阶段的 info_dict 主管线",
+      "layer": "system",
+      "dependsOn": [
+        "info-dict-contract",
+        "downloader-framework",
+        "postprocessor-pipeline",
+        "format-selection",
+        "output-template",
+        "networking-abstraction",
+        "cookies"
+      ],
+      "sourceFiles": [
+        "yt_dlp/YoutubeDL.py"
+      ],
+      "summary": "YoutubeDL 是把一切串起来的协调对象：extract_info→process_ie_result(区分视频/播放列表并递归展开)→process_video_result(选格式)→process_info/dl(下载)→post_process(跑 PP 链)，把同一个 info_dict 贯穿各阶段；同时独占横切关注点(cookiejar、urlopen 门面、进度/后处理钩子、download_archive 去重归档、模拟与重试)；关键权衡是『一个胖协调器 + 阶段化纯变换』换流程清晰可控，代价是 YoutubeDL 沦为数千行的上帝对象、状态与职责高度集中。"
+    },
+    {
+      "slug": "cli-options",
+      "title": "CLI 层：从命令行表面到 ydl_opts 与声明式流水线",
+      "layer": "system",
+      "dependsOn": [
+        "orchestrator-pipeline",
+        "postprocessor-pipeline"
+      ],
+      "sourceFiles": [
+        "yt_dlp/__init__.py",
+        "yt_dlp/options.py"
+      ],
+      "summary": "CLI 层把巨大的命令行表面压成一个 ydl_opts 字典 + 一条声明式后处理流水线：optparse 解析 → validate_options 做跨字段校验/冲突检测(report_conflict)/youtube-dl 兼容垫片(set_compat_opts) → get_postprocessors 把开关展开成有序 PP → 构造 YoutubeDL；关键权衡是『在校验与兼容层把脏活全做完、再交给纯参数驱动的核心』换核心与终端解耦，代价是选项→参数映射表巨大、兼容分支繁杂。"
+    }
+  ],
+  "topoOrder": [
+    "networking-abstraction",
+    "plugin-registry",
+    "impersonation",
+    "info-dict-contract",
+    "js-interpreter",
+    "downloader-framework",
+    "fragment-downloading",
+    "postprocessor-pipeline",
+    "format-selection",
+    "output-template",
+    "cookies",
+    "orchestrator-pipeline",
+    "cli-options"
+  ]
+}

@@ -1,0 +1,136 @@
+{
+  "repo": "mitt",
+  "generatedAt": "2026-08-04T00:43:24.998Z",
+  "chapters": [
+    {
+      "slug": "emitter-state-as-map",
+      "title": "把 pubsub 退化成一张查找表",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "src/index.ts"
+      ],
+      "summary": "用一张 `Map<事件类型, 处理器数组>` 作为整个发射器的唯一状态——核心思想是『把发布订阅退化成一个查找表』，代价是放弃优先级/once/异步等内置能力，换来极简与完全可窥探。事件类型取 `string | symbol` 且刻意不做大小写归一化（`'FOO'`≠`'foo'`），换取精确匹配的语义可预测性与 symbol 私有频道。"
+    },
+    {
+      "slug": "functional-factory-no-this",
+      "title": "函数工厂与无 this 的方法",
+      "layer": "primitive",
+      "dependsOn": [
+        "emitter-state-as-map"
+      ],
+      "sourceFiles": [
+        "src/index.ts"
+      ],
+      "summary": "以函数工厂 `mitt(all?)` 返回对象字面量、方法靠闭包捕获 `all` 而非依赖 `this`——核心思想是『无 this 的函数式方法』，换取方法可安全解构/传递（`const { on } = mitt()`）与可注入的共享注册表；代价是放弃封装，`all` 对外公开且可变。"
+    },
+    {
+      "slug": "on-lazy-append",
+      "title": "惰性初始化的追加式订阅",
+      "layer": "primitive",
+      "dependsOn": [
+        "emitter-state-as-map"
+      ],
+      "sourceFiles": [
+        "src/index.ts",
+        "test/index_test.ts"
+      ],
+      "summary": "`on` 采用惰性初始化的追加式订阅：某类型首个处理器才创建数组、其后直接 push——核心思想是『首次注册即建表』，并刻意不去重（重复注册同一函数会登记多次，对齐 Node EventEmitter 语义），换取最小代码与可预测语义；代价是把去重责任留给调用方。"
+    },
+    {
+      "slug": "off-branchless-removal",
+      "title": "无分支安全移除与重载清空",
+      "layer": "primitive",
+      "dependsOn": [
+        "emitter-state-as-map",
+        "on-lazy-append"
+      ],
+      "sourceFiles": [
+        "src/index.ts",
+        "test/index_test.ts"
+      ],
+      "summary": "`off` 用 `indexOf(handler) >>> 0` 把『找不到』的 -1 无分支地变成越界下标（splice 什么也不删），并让省略 handler 的重载表示『清空该类型全部处理器』——核心思想是『以位运算抹平边界、省掉 if 分支』换取 gzip 友好的极小体积；代价是可读性下降与参数重载语义。"
+    },
+    {
+      "slug": "emit-snapshot-iteration",
+      "title": "快照式派发抵御中途改表",
+      "layer": "composite",
+      "dependsOn": [
+        "on-lazy-append",
+        "off-branchless-removal"
+      ],
+      "sourceFiles": [
+        "src/index.ts",
+        "test/index_test.ts"
+      ],
+      "summary": "`emit` 先 `.slice()` 复制处理器数组再遍历调用——核心思想是『快照式派发』，抵御处理器在派发中途通过 on/off/clear 改动当前数组而导致的漏触发或重复触发；代价是每次派发多一次数组分配。"
+    },
+    {
+      "slug": "wildcard-dispatch",
+      "title": "通配符星号的第二条派发路径",
+      "layer": "composite",
+      "dependsOn": [
+        "emit-snapshot-iteration"
+      ],
+      "sourceFiles": [
+        "src/index.ts",
+        "test/index_test.ts"
+      ],
+      "summary": "通配符 `'*'` 是保留键：`emit` 在派发完类型匹配的处理器后，走第二条独立派发路径触发 `'*'` 处理器，并改用 `(type, event)` 双参签名——核心思想是『以一个保留键零成本地获得 catch-all』；代价是占用了 `'*'` 命名空间、且需为通配符维护不同签名（故手动 `emit('*')` 被刻意禁止）。"
+    },
+    {
+      "slug": "events-type-inference",
+      "title": "一张 Events 映射派生全 API 类型",
+      "layer": "composite",
+      "dependsOn": [
+        "functional-factory-no-this",
+        "on-lazy-append",
+        "off-branchless-removal",
+        "emit-snapshot-iteration"
+      ],
+      "sourceFiles": [
+        "src/index.ts",
+        "test/test-types-compilation.ts"
+      ],
+      "summary": "用户只供给一张 `Events extends Record<EventType, unknown>` 映射，整条 on/off/emit 的参数类型由 `Key extends keyof Events` 反向推导得出——核心思想是『一处定义、全 API 派生类型安全』（`on('foo', e=>…)` 中 `e` 自动收窄为该键的值类型）；代价是内部存储须用 `GenericEventHandler` 联合并靠 `as` 断言还原类型。"
+    },
+    {
+      "slug": "optional-payload-conditional-type",
+      "title": "条件类型区分可选载荷事件",
+      "layer": "composite",
+      "dependsOn": [
+        "events-type-inference"
+      ],
+      "sourceFiles": [
+        "src/index.ts",
+        "test/test-types-compilation.ts"
+      ],
+      "summary": "`emit` 的重载用条件类型 `undefined extends Events[Key] ? Key : never` 区分『可选载荷事件』——核心思想是『编译期判定某事件能否无参触发』：`bar?: number` 允许 `emit('bar')`，而必填载荷事件则禁止无参 emit；代价是一条晦涩的条件重载签名。"
+    },
+    {
+      "slug": "package-multi-format-distribution",
+      "title": "一源多格式通吃所有 JS 运行时",
+      "layer": "system",
+      "dependsOn": [
+        "functional-factory-no-this",
+        "events-type-inference"
+      ],
+      "sourceFiles": [
+        "package.json",
+        "README.md"
+      ],
+      "summary": "一份 TS 源码经 microbundle 同时产出 ESM/CJS/UMD，再用 `package.json` 的 `exports` 条件映射配合 `module`/`main`/`umd:main`/`typings`，把打包器、Node require、浏览器 `<script>`、TS 各自路由到正确产物——核心思想是『一源多格式，靠条件 exports 通吃所有运行时』（README 宣称从浏览器到 IE9+）；代价是构建工具链复杂与一份需手工对齐的 `index.d.ts`。"
+    }
+  ],
+  "topoOrder": [
+    "emitter-state-as-map",
+    "functional-factory-no-this",
+    "on-lazy-append",
+    "off-branchless-removal",
+    "emit-snapshot-iteration",
+    "wildcard-dispatch",
+    "events-type-inference",
+    "optional-payload-conditional-type",
+    "package-multi-format-distribution"
+  ]
+}

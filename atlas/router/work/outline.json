@@ -1,0 +1,273 @@
+{
+  "repo": "router",
+  "generatedAt": "2026-08-04T00:50:46.926Z",
+  "chapters": [
+    {
+      "slug": "url-encoding-query",
+      "title": "URL 分段编码与查询串",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "packages/router/src/encoding.ts",
+        "packages/router/src/query.ts"
+      ],
+      "summary": "用『按 URL 段（path/query/hash/param）细分保留字符集』的分段编码取代一刀切的 encodeURIComponent，对齐浏览器实际行为而非严格 RFC；并用 null/undefined 的类型区分精确表达 ?key（无等号标志）与完全省略两种 URL 形态，把领域规则上提到类型层。"
+    },
+    {
+      "slug": "route-location-url",
+      "title": "路由位置与 URL 解析",
+      "layer": "primitive",
+      "dependsOn": [
+        "url-encoding-query"
+      ],
+      "sourceFiles": [
+        "packages/router/src/location.ts"
+      ],
+      "summary": "把 URL 字符串拆解为 path/query/hash 三段并解析 ./ ../ 相对路径（手工切分换解析性能），用『matched 链引用相等 + params 结构 + stringify 后的 query/hash』判定『同一位置』为重复导航短路提供语义基础，并以 START_LOCATION 哨兵标识首次导航。"
+    },
+    {
+      "slug": "path-pattern-ranking",
+      "title": "路径模式编译与优先级评分",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "packages/router/src/matcher/pathTokenizer.ts",
+        "packages/router/src/matcher/pathParserRanker.ts",
+        "packages/router/src/matcher/pathMatcher.ts"
+      ],
+      "summary": "用字符级状态机把 path 模式（:param、自定义正则、?*+ 修饰符）词法分析成 token，再编译成单一正则 + parse/stringify 双向函数；核心是『从模式本身派生具体性评分（静态>动态>正则>通配）』替代脆弱的声明顺序来消解多路由歧义，使匹配结果确定且自明，二维 score 结构镜像 URL 层级。"
+    },
+    {
+      "slug": "navigation-failure-types",
+      "title": "导航失败的语义化分类",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "packages/router/src/errors.ts"
+      ],
+      "summary": "把『被守卫中止 / 被新导航取消 / 重复 / 重定向』等导航失败用位标志枚举 + Symbol 鸭子判定建模成可按位查询、可跨 realm 的可恢复值，而非笼统的 reject——让上层能精确区分失败种类，并避免把正常中止/取消误报为未捕获异常。"
+    },
+    {
+      "slug": "history-abstraction",
+      "title": "History 抽象：URL 模型的可导航可监听接口",
+      "layer": "primitive",
+      "dependsOn": [
+        "route-location-url"
+      ],
+      "sourceFiles": [
+        "packages/router/src/history/common.ts",
+        "packages/router/src/history/html5.ts",
+        "packages/router/src/history/hash.ts",
+        "packages/router/src/history/memory.ts"
+      ],
+      "summary": "把浏览器 URL 模型抽象成『可导航 + 可监听』的窄接口（深模块），让 html5/hash/memory 三实现透明可换；关键是在不可靠的 history 原语之上叠加 position/scroll 等方向语义（hash 仅靠把 base 标准化成 # 形态即零成本复用 html5），用内存栈换取 SSR/测试的同构运行。"
+    },
+    {
+      "slug": "route-matcher-table",
+      "title": "路由匹配表：从配置到 matched 链",
+      "layer": "composite",
+      "dependsOn": [
+        "path-pattern-ranking",
+        "navigation-failure-types"
+      ],
+      "sourceFiles": [
+        "packages/router/src/matcher/index.ts",
+        "packages/router/src/matcher/types.ts",
+        "packages/router/src/types/index.ts",
+        "packages/router/src/types/typeGuards.ts"
+      ],
+      "summary": "把用户路由配置递归编译成 RouteRecordMatcher 树（处理别名展开、父子路径拼接），按 score 二分插入维持有序表；resolve 时无论按 name/path/相对位置都能一次命中并沿 parent 链反推出 matched 记录链 + params，运行期匹配只剩一次正则 test，并以判别联合精确描述 RouteRecordRaw 的五种互斥变体。"
+    },
+    {
+      "slug": "navigation-guards",
+      "title": "导航守卫管线",
+      "layer": "composite",
+      "dependsOn": [
+        "route-matcher-table",
+        "navigation-failure-types"
+      ],
+      "sourceFiles": [
+        "packages/router/src/navigationGuards.ts"
+      ],
+      "summary": "把组件内/路由级/全局守卫按 leave→beforeEach→update→beforeEnter→enter→beforeResolve 严格顺序串成 promise 链；用 guardToPromiseFn 把 next 回调 promise 化、并凭函数 arity（<3）在新旧两套 API 间自动切换，任一守卫 reject 即短路，使『可异步、可取消、可重定向』的导航钩子统一为可组合的异步单元，并在导航期按需拉取懒加载组件 chunk。"
+    },
+    {
+      "slug": "scroll-restoration",
+      "title": "滚动位置恢复",
+      "layer": "composite",
+      "dependsOn": [
+        "history-abstraction",
+        "route-location-url"
+      ],
+      "sourceFiles": [
+        "packages/router/src/scrollBehavior.ts"
+      ],
+      "summary": "用『基于 history position 的 key』保存/恢复滚动位置，使同一 URL 在前进/后退栈不同位置可有不同滚动值；在 nextTick 后、且校验 to===currentRoute.value 才应用滚动，防止连点导航把旧页滚动误投到新页——把滚动可见性与导航生命周期而非数据到达时刻绑定。"
+    },
+    {
+      "slug": "router-core-navigation",
+      "title": "Router 核心与导航主循环",
+      "layer": "composite",
+      "dependsOn": [
+        "route-matcher-table",
+        "history-abstraction",
+        "navigation-guards",
+        "navigation-failure-types",
+        "scroll-restoration",
+        "route-location-url"
+      ],
+      "sourceFiles": [
+        "packages/router/src/router.ts",
+        "packages/router/src/diagnostics.ts",
+        "packages/router/src/devtools.ts"
+      ],
+      "summary": "把 matcher+history+guards+scroll 组装成『可取消的异步导航状态机』：pendingLocation 与守卫队列间的取消检查让任何阶段都能被新导航作废；用 shallowRef 只在最外层替换 currentRoute 驱动视图（避免对 matched/params 深响应），并通过 install 的 provide/$router/$route 与集中式诊断码、devtools 适配完成接入与可观测。"
+    },
+    {
+      "slug": "router-view-nesting",
+      "title": "RouterView 嵌套渲染",
+      "layer": "composite",
+      "dependsOn": [
+        "router-core-navigation",
+        "route-matcher-table"
+      ],
+      "sourceFiles": [
+        "packages/router/src/RouterView.ts",
+        "packages/router/src/injectionSymbols.ts",
+        "packages/router/src/useApi.ts"
+      ],
+      "summary": "凭『当前路由 matched 数组 + inject 到的 depth』自动选出该渲染的组件并向后代注入 depth+1，实现零配置的嵌套视图（并跳过无组件的 passthrough 路由）；用 scoped slot 把组件交出而非内置 transition/keep-alive——以隐式依赖换 API 极简，代价是 matched 顺序敏感、需 Symbol 类型化 DI 与 devtools 暴露 depth。"
+    },
+    {
+      "slug": "router-link-active",
+      "title": "RouterLink 与激活态判定",
+      "layer": "composite",
+      "dependsOn": [
+        "router-core-navigation"
+      ],
+      "sourceFiles": [
+        "packages/router/src/RouterLink.ts"
+      ],
+      "summary": "把 RouteLocationRaw resolve 成 href，并基于『matched 链包含 + params 子集』而非 URL 字符串前缀判定激活态（祖先链接也算 active、末端且参数全等才算 exact）；用 useLink 把全部逻辑抽成 headless 组合式函数支持完全自定义渲染，点击经 guardEvent 拦截后才触发 push/replace。"
+    },
+    {
+      "slug": "typed-routes",
+      "title": "类型安全路由的编译期推导",
+      "layer": "system",
+      "dependsOn": [
+        "route-matcher-table",
+        "navigation-guards",
+        "router-core-navigation"
+      ],
+      "sourceFiles": [
+        "packages/router/src/typed-routes/index.ts",
+        "packages/router/src/typed-routes/route-map.ts",
+        "packages/router/src/typed-routes/route-location.ts",
+        "packages/router/src/typed-routes/params.ts",
+        "packages/router/src/typed-routes/route-records.ts",
+        "packages/router/src/typed-routes/navigation-guards.ts",
+        "packages/router/src/config.ts",
+        "packages/router/src/types/utils.ts"
+      ],
+      "summary": "用一个空 TypesConfig interface + 条件类型推断作为可选类型注入点：无 codegen 时所有路由名/参数退化为 string、被模块增强后自动精确；对每个公开类型维护 Generic（库内部默认）/Typed（携带 RouteMap 的精确）/TypedList（按名查表）三态，让库内部不依赖用户配置、对外又能全链路类型推导，代价是大路由表的类型膨胀与编译开销。"
+    },
+    {
+      "slug": "file-routing-conventions",
+      "title": "文件路由：约定与前缀树",
+      "layer": "system",
+      "dependsOn": [
+        "route-matcher-table"
+      ],
+      "sourceFiles": [
+        "packages/router/src/unplugin/index.ts",
+        "packages/router/src/unplugin/options.ts",
+        "packages/router/src/unplugin/core/context.ts",
+        "packages/router/src/unplugin/core/tree.ts",
+        "packages/router/src/unplugin/core/treeNodeValue.ts",
+        "packages/router/src/unplugin/core/RoutesFolderWatcher.ts",
+        "packages/router/src/unplugin/core/extendRoutes.ts",
+        "packages/router/src/unplugin/core/utils.ts"
+      ],
+      "summary": "用前缀树承载路由的父子拓扑、用 Map<filePath, Override> + 优先级排序承载 path/name/meta/alias 等属性，让文件名约定、<route> 块、definePage()、extendRoute 钩子多来源深合并而非互斥；以『约定优先 + 多层逃逸舱』实现渐进式复杂度——简单场景零配置，复杂场景不必 eject 整套方案。"
+    },
+    {
+      "slug": "file-routing-codegen",
+      "title": "文件路由：类型生成与构建期集成",
+      "layer": "system",
+      "dependsOn": [
+        "file-routing-conventions",
+        "typed-routes",
+        "route-resolver"
+      ],
+      "sourceFiles": [
+        "packages/router/src/unplugin/codegen/generateDTS.ts",
+        "packages/router/src/unplugin/codegen/generateRouteMap.ts",
+        "packages/router/src/unplugin/codegen/generateRouteRecords.ts",
+        "packages/router/src/unplugin/codegen/generateRouteResolver.ts",
+        "packages/router/src/unplugin/codegen/generateRouteFileInfoMap.ts",
+        "packages/router/src/unplugin/codegen/generateParamParsers.ts",
+        "packages/router/src/unplugin/core/definePage.ts",
+        "packages/router/src/unplugin/core/customBlock.ts",
+        "packages/router/src/unplugin/core/vite/index.ts"
+      ],
+      "summary": "把 vue-router/auto-routes 做成虚拟模块作为构建期与运行时的契约边界，在 load 钩子按需生成 routes 数组/类型/实验 resolver 并支持不刷新页面的路由 HMR；通过 declare module 把 RouteNamedMap 注入 TypesConfig、生成 typed-router.d.ts，把路由名、路径、参数类型全前移到编译期——用构建时间与类型生成换运行时启动速度与编码期正确性。"
+    },
+    {
+      "slug": "data-loaders",
+      "title": "导航期数据加载器",
+      "layer": "system",
+      "dependsOn": [
+        "router-core-navigation",
+        "navigation-guards"
+      ],
+      "sourceFiles": [
+        "packages/router/src/experimental/data-loaders/defineLoader.ts",
+        "packages/router/src/experimental/data-loaders/defineColadaLoader.ts",
+        "packages/router/src/experimental/data-loaders/createDataLoader.ts",
+        "packages/router/src/experimental/data-loaders/navigation-guard.ts",
+        "packages/router/src/experimental/data-loaders/utils.ts",
+        "packages/router/src/experimental/data-loaders/symbols.ts"
+      ],
+      "summary": "用一组 navigation guard（beforeEach 建 abort signal、beforeResolve 并行 Promise.all、afterEach 统一 commit）把数据获取从组件树提升到导航管线、刻意绕开 Suspense；用 staged→commit 两阶段把数据可见性与导航生命周期绑定（防中途闪烁/回滚），并以『对象即 Promise』的 dual API 同时服务组件解构与嵌套 loader await，entry 缓存使导航往返不重复请求。"
+    },
+    {
+      "slug": "route-resolver",
+      "title": "新一代路由解析器",
+      "layer": "system",
+      "dependsOn": [
+        "route-matcher-table",
+        "url-encoding-query"
+      ],
+      "sourceFiles": [
+        "packages/router/src/experimental/route-resolver/resolver-abstract.ts",
+        "packages/router/src/experimental/route-resolver/resolver-fixed.ts",
+        "packages/router/src/experimental/route-resolver/matchers/matcher-pattern.ts",
+        "packages/router/src/experimental/route-resolver/matchers/matcher-pattern-query.ts",
+        "packages/router/src/experimental/route-resolver/matchers/matcher-pattern-path-star.ts",
+        "packages/router/src/experimental/route-resolver/matchers/errors.ts",
+        "packages/router/src/experimental/route-resolver/matchers/param-parsers/define-param-parser.ts",
+        "packages/router/src/experimental/route-resolver/matchers/param-parsers/standard-schema.ts",
+        "packages/router/src/experimental/router.ts"
+      ],
+      "summary": "面向 file-based routing 的下一代解析器：路由表构建期固定、无运行时增删；用独立的 path/query/hash 三段 MatcherPattern 分别匹配（query 非排他、可合并多 record），以抛 MatchMiss 异常作为『不匹配』的统一控制流，并借 ParamParser/Standard Schema 把参数类型转换与校验下沉到匹配层（:id 直出 number、无效值自然落选）——把动态性从运行时推到构建时。"
+    }
+  ],
+  "topoOrder": [
+    "url-encoding-query",
+    "route-location-url",
+    "path-pattern-ranking",
+    "navigation-failure-types",
+    "history-abstraction",
+    "route-matcher-table",
+    "navigation-guards",
+    "scroll-restoration",
+    "router-core-navigation",
+    "router-view-nesting",
+    "router-link-active",
+    "typed-routes",
+    "file-routing-conventions",
+    "data-loaders",
+    "route-resolver",
+    "file-routing-codegen"
+  ]
+}

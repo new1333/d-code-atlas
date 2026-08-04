@@ -1,0 +1,142 @@
+{
+  "root": "work/source",
+  "sourceKind": "git-clone",
+  "languages": [
+    "py"
+  ],
+  "frameworks": [],
+  "entrypoints": [
+    "yt_dlp/__init__.py",
+    "yt_dlp/__main__.py"
+  ],
+  "manifests": [
+    "pyproject.toml",
+    "uv.lock",
+    "Makefile",
+    ".pre-commit-config.yaml"
+  ],
+  "packages": [],
+  "tree": [
+    {
+      "path": "yt_dlp",
+      "type": "dir"
+    },
+    {
+      "path": "yt_dlp/__init__.py",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "yt_dlp/__main__.py",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "yt_dlp/YoutubeDL.py",
+      "type": "file"
+    },
+    {
+      "path": "yt_dlp/options.py",
+      "type": "file"
+    },
+    {
+      "path": "yt_dlp/jsinterp.py",
+      "type": "file"
+    },
+    {
+      "path": "yt_dlp/cookies.py",
+      "type": "file"
+    },
+    {
+      "path": "yt_dlp/plugins.py",
+      "type": "file"
+    },
+    {
+      "path": "yt_dlp/update.py",
+      "type": "file"
+    },
+    {
+      "path": "yt_dlp/utils",
+      "type": "dir"
+    },
+    {
+      "path": "yt_dlp/networking",
+      "type": "dir"
+    },
+    {
+      "path": "yt_dlp/extractor",
+      "type": "dir"
+    },
+    {
+      "path": "yt_dlp/downloader",
+      "type": "dir"
+    },
+    {
+      "path": "yt_dlp/postprocessor",
+      "type": "dir"
+    },
+    {
+      "path": "yt_dlp/compat",
+      "type": "dir"
+    },
+    {
+      "path": "yt_dlp/dependencies",
+      "type": "dir"
+    },
+    {
+      "path": "yt_dlp/__pyinstaller",
+      "type": "dir"
+    },
+    {
+      "path": "test",
+      "type": "dir"
+    },
+    {
+      "path": "test/test_jsc",
+      "type": "dir"
+    },
+    {
+      "path": "test/test_pot",
+      "type": "dir"
+    },
+    {
+      "path": "test/testdata",
+      "type": "dir"
+    },
+    {
+      "path": "devscripts",
+      "type": "dir"
+    },
+    {
+      "path": "bundle",
+      "type": "dir"
+    },
+    {
+      "path": "bundle/requirements",
+      "type": "dir"
+    },
+    {
+      "path": "pyproject.toml",
+      "type": "file"
+    },
+    {
+      "path": "yt-dlp.sh",
+      "type": "file"
+    },
+    {
+      "path": "yt-dlp.cmd",
+      "type": "file"
+    },
+    {
+      "path": "README.md",
+      "type": "file"
+    }
+  ],
+  "docs": [
+    "README.md",
+    "CONTRIBUTING.md",
+    "Changelog.md",
+    "Maintainers.md",
+    "supportedsites.md"
+  ]
+}

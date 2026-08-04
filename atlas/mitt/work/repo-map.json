@@ -1,0 +1,44 @@
+{
+  "root": "work/source",
+  "sourceKind": "git-clone",
+  "languages": [
+    "ts"
+  ],
+  "frameworks": [],
+  "entrypoints": [
+    "src/index.ts"
+  ],
+  "manifests": [
+    "package.json",
+    "tsconfig.json",
+    ".eslintrc",
+    ".editorconfig"
+  ],
+  "packages": [],
+  "tree": [
+    {
+      "path": "src",
+      "type": "dir"
+    },
+    {
+      "path": "src/index.ts",
+      "type": "file",
+      "role": "entry"
+    },
+    {
+      "path": "test",
+      "type": "dir"
+    },
+    {
+      "path": "test/index_test.ts",
+      "type": "file"
+    },
+    {
+      "path": "test/test-types-compilation.ts",
+      "type": "file"
+    }
+  ],
+  "docs": [
+    "README.md"
+  ]
+}
