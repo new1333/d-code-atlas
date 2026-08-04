@@ -1,0 +1,37 @@
+{
+  "key": "location-spoofer",
+  "source": {
+    "kind": "url",
+    "ref": "https://github.com/xweiba/location-spoofer",
+    "localPath": null
+  },
+  "version": 1,
+  "stages": {
+    "acquire": {
+      "status": "failed",
+      "cmd": "(acquire 失败) io.cloneSource: git clone 失败 (exit=128): Cloning into 'atlas/location-spoofer/work/source'...\nfatal: unable to access 'https://github.com/xweiba/location-spoofer/': Recv failure: Connection was reset",
+      "error": "io.cloneSource: git clone 失败 (exit=128): Cloning into 'atlas/location-spoofer/work/source'...\nfatal: unable to access 'https://github.com/xweiba/location-spoofer/': Recv failure: Connection was reset",
+      "finishedAt": "2026-08-04T05:46:20.480Z"
+    },
+    "survey": {
+      "status": "pending"
+    },
+    "outline": {
+      "status": "pending"
+    },
+    "research": {
+      "status": "pending"
+    },
+    "write": {
+      "status": "pending"
+    },
+    "assemble": {
+      "status": "pending"
+    },
+    "build": {
+      "status": "pending"
+    }
+  },
+  "chapters": {},
+  "chapterOrder": []
+}

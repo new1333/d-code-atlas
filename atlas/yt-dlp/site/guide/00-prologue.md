@@ -71,40 +71,48 @@
 
 ## 全书脉络图
 
-下图按 outline 的 layer 分三层。箭头/标注 `←依赖[N]` 严格来自各章的 `dependsOn`，没有臆造任何依赖边。
+下图由 outline 的 `dependsOn` + `topoOrder` 程序化生成（箭头方向：前置 → 后继）：
 
-```
-┌─ system ── 把零件缝成一条线、把命令行接进来 ───────────────────────┐
-│                                                                    │
-│   [13] CLI 层 ：命令行 → 纯参数表 ydl_opts       ←依赖 [12][8]      │
-│   [12] YoutubeDL 编排器：贯穿全程的 info 主管线                    │
-│                         ←依赖 [1][4][6][8][9][10][11]（汇聚下面全部）│
-│                                                                    │
-└────────────────────────────────▲───────────────────────────────────┘
-                                 │ 汇聚
-┌─ composite ── 各阶段可插拔的零件，都围着那条胖字典转 ──────────────┐
-│                                                                    │
-│   [4] info_dict 数据总线 ★全书枢纽    ←依赖 [1][2]                 │
-│       │                                                            │
-│       ├── [5]  JS 解释器        ←依赖 [4]                          │
-│       ├── [9]  格式选择 DSL     ←依赖 [4]                          │
-│       ├── [10] 输出模板引擎     ←依赖 [4]                          │
-│       ├── [8]  后处理流水线     ←依赖 [4]   （也回供 [12][13]）    │
-│       └── [6]  下载分派         ←依赖 [4]                          │
-│                   │                                                │
-│                   └── [7] 分片下载  ←依赖 [6]                      │
-│                                                                    │
-│   [3]  指纹伪装   ←依赖 [1]（挂在传输层之上的扩展能力）            │
-│   [11] cookies    ←依赖 [1]（挂在传输层上的共享附件）              │
-│                                                                    │
-└────────────────────────────────▲───────────────────────────────────┘
-                                 │ 建在两块地基上
-┌─ primitive ── 两块地基（全书其余都站在它们之上）──────────────────┐
-│                                                                    │
-│   [1] 可插拔传输层：中立请求 + 扩展槽 + 引擎竞争 + 偏好分派         │
-│   [2] 插件注册：约定胜配置（后缀即类型 + 空盒子延迟 + 前置合并）    │
-│                                                                    │
-└────────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+  subgraph 原子层 primitive
+    networking_abstraction["可插拔传输层：请求中立与处理器竞争"]
+    plugin_registry["约定胜配置的插件注册机制"]
+  end
+  subgraph 复合层 composite
+    impersonation["浏览器指纹伪装：作为扩展叠加的传输能力"]
+    info_dict_contract["info_dict 数据总线与提取器骨架"]
+    js_interpreter["进程内手写 JS 解释器：本地执行对抗性脚本"]
+    downloader_framework["协议字段驱动的下载策略分派"]
+    fragment_downloading["分片化下载：把长流拆成可恢复的工作单元"]
+    postprocessor_pipeline["声明式后处理流水线与链式 info 变换"]
+    format_selection["格式选择 DSL：从 -f 串到选择器 AST"]
+    output_template["输出模板引擎：命名即元数据投影"]
+    cookies["统一 cookiejar：从浏览器密钥环解密登录态"]
+  end
+  subgraph 系统层 system
+    orchestrator_pipeline["YoutubeDL 编排器：贯穿各阶段的 info_dict 主管线"]
+    cli_options["CLI 层：从命令行表面到 ydl_opts 与声明式流水线"]
+  end
+  networking_abstraction --> impersonation
+  networking_abstraction --> info_dict_contract
+  plugin_registry --> info_dict_contract
+  info_dict_contract --> js_interpreter
+  info_dict_contract --> downloader_framework
+  downloader_framework --> fragment_downloading
+  info_dict_contract --> postprocessor_pipeline
+  info_dict_contract --> format_selection
+  info_dict_contract --> output_template
+  networking_abstraction --> cookies
+  info_dict_contract --> orchestrator_pipeline
+  downloader_framework --> orchestrator_pipeline
+  postprocessor_pipeline --> orchestrator_pipeline
+  format_selection --> orchestrator_pipeline
+  output_template --> orchestrator_pipeline
+  networking_abstraction --> orchestrator_pipeline
+  cookies --> orchestrator_pipeline
+  orchestrator_pipeline --> cli_options
+  postprocessor_pipeline --> cli_options
 ```
 
 读这张图有一个关键观察：**[4] info_dict 数据总线是全书的绝对枢纽**——九个 composite 章节里有七个直接依赖它；而 [1] 可插拔传输层和 [2] 插件注册是两块平行的地基，几乎所有零件最终都能溯源到它们俩。最顶上，[12] 编排器把下面七块零件一次性收拢，[13] CLI 层再站在编排器肩上、负责和外面的命令行打交道——这就是「用户敲一行命令」到「一个文件落盘」之间，yt-dlp 内部完整的依赖形状。
