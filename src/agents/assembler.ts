@@ -129,7 +129,29 @@ export async function assembler(opts: AssemblerOpts): Promise<AssemblerOutcome> 
     "      只挂 { text: '导读', link: '/guide/00-prologue' }；并把该 draft **逐字复制**为",
     "      site/guide/00-prologue.md（编号 00，先于所有章节，不受 (i+1).padStart 规则约束）。",
     "3. 生成 site/index.md（首页：站名/简介/快速开始）。",
-    "4. 生成 site/package.json：{ \"type\":\"module\", devDependencies pin vitepress，",
+    "4. 生成 site/.vitepress/theme/index.ts：**逐字复制**以下内容（启用 mermaid 渲染，",
+    "   全书脉络图的 mermaid 块依赖此文件，缺失则图显示为源码）：",
+    "   ```ts",
+    "   import { h, nextTick, watch } from \"vue\";",
+    "   import type { Theme } from \"vitepress\";",
+    "   import DefaultTheme from \"vitepress/theme\";",
+    "   import { useData } from \"vitepress\";",
+    "   import { createMermaidRenderer } from \"vitepress-mermaid-renderer\";",
+    "   export default {",
+    "     extends: DefaultTheme,",
+    "     Layout: () => {",
+    "       const { isDark } = useData();",
+    "       const initMermaid = () => {",
+    "         createMermaidRenderer({ theme: isDark.value ? \"dark\" : \"default\" });",
+    "       };",
+    "       nextTick(() => initMermaid());",
+    "       watch(() => isDark.value, () => initMermaid());",
+    "       return h(DefaultTheme.Layout);",
+    "     },",
+    "   } satisfies Theme;",
+    "   ```",
+    "5. 生成 site/package.json：{ \"type\":\"module\", devDependencies pin vitepress +",
+    "   vitepress-mermaid-renderer(^1.1.28) + mermaid(^11.0.0)，",
     "   scripts 含 docs:dev/docs:build/docs:preview }。",
     "",
     "## 自检（交付前对照 design §11 / ADR-0006）",
@@ -141,6 +163,8 @@ export async function assembler(opts: AssemblerOpts): Promise<AssemblerOutcome> 
     "     config.ts 的 themeConfig 含 `search: { provider: 'local' }`（本地搜索框）。",
     "  ⑤ 自包含：site/ 不 import 引擎仓库；config.ts 不 import outline.json。",
     "  ⑥ 未越界：未改任何 draft.md 内容、未写 work/、未写 source/。",
+    "  ⑦ mermaid 渲染就绪：site/.vitepress/theme/index.ts 存在且 import 了",
+    "     createMermaidRenderer；package.json 含 vitepress-mermaid-renderer 依赖。",
   ].join("\n");
 
   // site/ 关键产物路径（validate 与兜底核验共用）。
@@ -149,6 +173,8 @@ export async function assembler(opts: AssemblerOpts): Promise<AssemblerOutcome> 
     joinPath(site, "package.json"),
     joinPath(site, "index.md"),
     joinPath(site, ".vitepress/config.ts"),
+    // theme/index.ts：启用 mermaid 渲染（全书脉络图依赖此文件，缺失则图显示为源码）。
+    joinPath(site, ".vitepress/theme/index.ts"),
   ];
 
   // validate：claude headless「假成功」治理（治本）。

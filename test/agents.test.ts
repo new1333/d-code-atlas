@@ -538,9 +538,15 @@ describe("assembler", () => {
       const { writeFileSync, mkdirSync } = await import("node:fs");
       const spawn = makeFakeSpawn(calls, (call) => {
         mkdirSync(`${site}.vitepress`, { recursive: true });
+        mkdirSync(`${site}.vitepress/theme`, { recursive: true });
         writeFileSync(`${site}package.json`, "{}");
         writeFileSync(`${site}index.md`, "# 首页");
         writeFileSync(`${site}.vitepress/config.ts`, "export default {}");
+        // theme/index.ts：mermaid 渲染入口（scaffoldFiles 校验项之一）。
+        writeFileSync(
+          `${site}.vitepress/theme/index.ts`,
+          'import { createMermaidRenderer } from "vitepress-mermaid-renderer";',
+        );
         return { exitCode: 0, stdout: "已组装 site/", stderr: "" };
       });
 
@@ -667,9 +673,14 @@ describe("assembler", () => {
       const spawn = makeFakeSpawn(calls, (call) => {
         mkdirSync(site, { recursive: true });
         mkdirSync(`${site}.vitepress`, { recursive: true });
+        mkdirSync(`${site}.vitepress/theme`, { recursive: true });
         writeFileSync(`${site}package.json`, "{}");
         writeFileSync(`${site}index.md`, "# hi");
         writeFileSync(`${site}.vitepress/config.ts`, "export default {}");
+        writeFileSync(
+          `${site}.vitepress/theme/index.ts`,
+          'import { createMermaidRenderer } from "vitepress-mermaid-renderer";',
+        );
         return { exitCode: 0, stdout: "done", stderr: "" };
       });
       const r = await assembler({ key: "demo", spawn });

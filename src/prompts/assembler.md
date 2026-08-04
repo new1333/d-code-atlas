@@ -28,10 +28,12 @@
 
 ```
 site/
-├── package.json                  # pin vitepress，含 docs:dev/docs:build，type:module
+├── package.json                  # pin vitepress + mermaid 渲染依赖，含 docs:dev/docs:build，type:module
 ├── index.md                      # 首页（站名/简介/快速开始）
 ├── .vitepress/
-│   └── config.ts                 # 侧边栏按 layer 分组 + topo 顺序；字符串模板生成
+│   ├── config.ts                 # 侧边栏按 layer 分组 + topo 顺序；字符串模板生成
+│   └── theme/
+│       └── index.ts              # 主题入口：启用 mermaid 渲染（全书脉络图依赖此文件）
 └── guide/
     ├── 01-{slug-a}.md            # 各章 draft 逐字复制，文件名 nn = topo 序号两位补零
     ├── 02-{slug-b}.md
@@ -100,6 +102,43 @@ export default defineConfig({
 });
 ```
 
+### 4.2b `site/.vitepress/theme/index.ts`（mermaid 渲染，**必生成**）
+
+导读页（`00-prologue.md`）的「全书脉络图」是编排层注入的 mermaid 代码块。VitePress 默认**不会**渲染 mermaid——会把图显示成源码文本。必须生成主题入口启用渲染（用 [`vitepress-mermaid-renderer`](https://github.com/sametcn99/vitepress-mermaid-renderer)）。
+
+**文件内容固定**（逐字按下述生成，不要自创）：
+
+```ts
+import { h, nextTick, watch } from "vue";
+import type { Theme } from "vitepress";
+import DefaultTheme from "vitepress/theme";
+import { useData } from "vitepress";
+import { createMermaidRenderer } from "vitepress-mermaid-renderer";
+
+export default {
+  extends: DefaultTheme,
+  Layout: () => {
+    const { isDark } = useData();
+
+    const initMermaid = () => {
+      createMermaidRenderer({
+        theme: isDark.value ? "dark" : "default",
+      });
+    };
+
+    nextTick(() => initMermaid());
+    watch(
+      () => isDark.value,
+      () => initMermaid(),
+    );
+
+    return h(DefaultTheme.Layout);
+  },
+} satisfies Theme;
+```
+
+> 此文件让 markdown 中任何 ```` ```mermaid ```` 围栏块自动渲染为可交互图，并跟随站点明暗主题切换。
+
 ### 4.3 `site/index.md`（首页）
 
 含站名、一句话简介、快速开始（如「`bun install && bun run docs:dev`」）。可用 VitePress 默认首页 frontmatter 风格。
@@ -117,12 +156,15 @@ export default defineConfig({
     "docs:preview": "vitepress preview"
   },
   "devDependencies": {
-    "vitepress": "^1.0.0"
+    "vitepress": "^1.0.0",
+    "vitepress-mermaid-renderer": "^1.1.28",
+    "mermaid": "^11.0.0"
   }
 }
 ```
 
-（pin 一个具体的 vitepress 版本；`"type":"module"` 必填以匹配 config.ts 的 ESM 语法。）
+（pin 一个具体的 vitepress 版本；`"type":"module"` 必填以匹配 config.ts 的 ESM 语法。
+`vitepress-mermaid-renderer` + `mermaid` 用于渲染全书脉络图的 mermaid 块——`mermaid` 是前者的 peer 依赖，需一并声明。）
 
 ## 5. 组装要点与自检清单
 
@@ -137,7 +179,7 @@ export default defineConfig({
 1. **搬运完整**：`topoOrder` 中每个 slug 都有对应的 `site/guide/{nn}-{slug}.md`，且内容与 `work/chapters/{slug}/draft.md` 逐字一致（正文部分）。
 2. **编号正确**：`nn` 严格等于 `(topoIndex+1)` 两位补零；文件名 slug 与 outline 一致。
 3. **侧边栏正确**：config.ts 的 sidebar 按 `原子层 → 复合层 → 系统层` 分组（primitive→composite→system），组内按 topoOrder 顺序；每项 link 指向正确的 `/guide/{nn}-{slug}`。**若 `work/prologue/draft.md` 存在**，侧边栏首组为「导读」（挂 `/guide/00-prologue`）。
-4. **工程可构建**：`package.json` 含 vitepress 依赖与 `docs:dev`/`docs:build` 脚本，`"type":"module"`；config.ts 是合法 ESM TS，且 `themeConfig.search.provider` 为 `"local"`（本地搜索框）。`cd site && bun install && bun run docs:build` 应能成功（AC-1）。
+4. **工程可构建**：`package.json` 含 vitepress 依赖与 `docs:dev`/`docs:build` 脚本，`"type":"module"`；config.ts 是合法 ESM TS，且 `themeConfig.search.provider` 为 `"local"`（本地搜索框）。`.vitepress/theme/index.ts` 存在且 `import { createMermaidRenderer } from "vitepress-mermaid-renderer"`（渲染全书脉络图 mermaid 块，缺失则图显示为源码）。`cd site && bun install && bun run docs:build` 应能成功（AC-1）。
 5. **自包含**：site/ 内不出现对引擎仓库的 import/require；config.ts 不 `import` outline.json。
 6. **未越界**：你没有改任何 draft.md 内容、没有写 Source、没有改 work/ 下任何产物。
 7. **导读搬运（条件）**：若 `work/prologue/draft.md` 存在，则 `site/guide/00-prologue.md` 存在且与 `work/prologue/draft.md` 逐字一致（正文部分）。
@@ -146,7 +188,8 @@ export default defineConfig({
 
 - **绝不改章节内容**（ADR-0006）：draft.md 的正文**逐字搬运**，哪怕有错别字/格式问题也不动（那是 Writer/Critic 循环的事）。你只搬运 + 加 frontmatter（可选）+ 生成脚手架。
 - **可写范围**：**仅限** `site/`。**绝不**写 Source、**绝不**改 `work/` 下任何文件。
-- `package.json` 必须 `"type":"module"`、必须 pin 一个具体的 vitepress 版本、必须含 `docs:dev` 与 `docs:build` 脚本（FR-7.3、AC-1）。
+- `package.json` 必须 `"type":"module"`、必须 pin 一个具体的 vitepress 版本、必须含 `docs:dev` 与 `docs:build` 脚本（FR-7.3、AC-1）。必须含 `vitepress-mermaid-renderer` 依赖（pin 版本）及其 peer 依赖 `mermaid`，否则全书脉络图无法渲染。
+- **必须生成** `site/.vitepress/theme/index.ts` 启用 mermaid 渲染（内容见 §4.2b）：否则导读页的脉络图会显示为 mermaid 源码而非图。
 - config.ts 用**字符串模板**生成（数据硬编码），**不**在运行时 `import outline.json`——保持 site 自包含（ADR-0006、NFR-5）。
 - 侧边栏分组顺序固定 `导读(若有) → primitive → composite → system`，中文标题为「原子层」/「复合层」/「系统层」（导读为可选首组，仅当 `work/prologue/draft.md` 存在时出现）；组内顺序 = topoOrder（不是字母序、不是 layer 内自定义顺序）。
 - 全程中文（分组标题、首页文案）；代码/路径/slug/字段名用英文。

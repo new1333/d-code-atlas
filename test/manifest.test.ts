@@ -306,6 +306,31 @@ describe("setStageStatus 失败诊断字段", () => {
     expect(m.stages.survey.stderr).toBeUndefined();
     expect(m.stages.survey.error).toBeUndefined();
   });
+
+  test("running 时显式传入的 stderr 不被抹除（audit 2026-08-04：非致命诊断可见性）", () => {
+    // 回归 06-assemble.ts 的用法：用 running+stderr 记录非致命失败（如导读生成失败）。
+    // 旧实现 applyStatus 在 running 态无条件 delete stderr，会立即抹除本次显式写入的诊断，
+    // 导致失败原因永不落盘、atlas show 查不到。修复后：仅当 opts 未显式提供该字段时才清旧诊断。
+    const m0 = initManifest("r", LOCAL_SOURCE);
+    const m = setStageStatus(m0, "assemble", "running", {
+      cmd: "synthesizer ...",
+      stderr: "(导读生成失败，已跳过) extractFence 返回 null",
+    });
+    expect(m.stages.assemble.status).toBe("running");
+    expect(m.stages.assemble.stderr).toBe("(导读生成失败，已跳过) extractFence 返回 null");
+    // 显式传入的 stderr 保留；未传入的 exitCode/error 仍为 undefined。
+    expect(m.stages.assemble.exitCode).toBeUndefined();
+    expect(m.stages.assemble.error).toBeUndefined();
+  });
+
+  test("running 重跑：未显式传入的诊断字段仍被清（保留重跑清旧语义）", () => {
+    // 先 failed 带诊断，再 running 不传诊断 → 旧诊断应被清（保留原语义，与上方 286-300 一致）。
+    const m0 = initManifest("r", LOCAL_SOURCE);
+    let m = setStageStatus(m0, "survey", "failed", { stderr: "boom", error: "x" });
+    m = setStageStatus(m, "survey", "running"); // 不传诊断
+    expect(m.stages.survey.stderr).toBeUndefined();
+    expect(m.stages.survey.error).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------

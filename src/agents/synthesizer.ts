@@ -14,7 +14,7 @@
 import { runClaude } from "../lib/run-claude.ts";
 import { runDir } from "../lib/io.ts";
 import { extractFence } from "../lib/extract.ts";
-import { promptPath, agentAddDirs, type AgentOutcome, type AgentCommonOpts } from "./types.ts";
+import { promptPath, type AgentOutcome, type AgentCommonOpts } from "./types.ts";
 
 /** Synthesizer 入参。 */
 export interface SynthesizerOpts extends AgentCommonOpts {
@@ -61,14 +61,14 @@ export async function synthesizer(opts: SynthesizerOpts): Promise<SynthesizerOut
     "   若全书确无单一主线，明示「无单一主线」并按 layer 组织，不要硬编。",
     "3. 产出两条阅读路线：线性路线（按 topoOrder）+ 按主题路线（针对常见阅读目标列章节子序列）。",
     "4. 列出贯穿全书的核心原理（在多章以不同化身现身的底层机制），每条点明在哪几章现身。",
-    "5. 画全书脉络图（ASCII/文字/简表），依赖关系严格来自 outline 的 dependsOn，不臆造。",
+    "5. 为全书脉络图写一段**引言**（图本身由编排层程序化生成，你**不画图**）。引言要点出：", "   图怎么读（箭头=前置→后继）、最显眼的根节点/汇聚点是哪章、有哪些跨 layer 的关键边。",
     "6. 全程**只读**：禁止 Write/Edit；不改任何章节 draft、不改 outline。",
     "",
     "## 产物结构（四块缺一不可）",
     "- 这本书在讲什么：一句话主线（原理骨架，不是功能清单）",
     "- 怎么读这本书：两条阅读路线（线性 + 按主题）",
     "- 贯穿全书的核心原理（跨章复现的底层机制 + 哪几章现身）",
-    "- 全书脉络图（依赖关系忠于 outline.dependsOn）",
+    "- 全书脉络图（**只写引言**；mermaid 依赖图由编排层依据 outline.dependsOn 程序化注入）",
     "",
     "## 输出契约（严格）",
     "你的最终回复**只**包含一个被 fence 包裹的 markdown 文本块（prologue/draft.md 的完整内容）。",
@@ -86,8 +86,20 @@ export async function synthesizer(opts: SynthesizerOpts): Promise<SynthesizerOut
     // 导读需要通读全部章节 draft（pinia 约 15 章），单次可能较久；给 25 分钟。
     timeoutMs: 25 * 60 * 1000,
     retries: 3,
-    // validate：必须产出 ```markdown fence（4 反引号外层）。
-    validate: (stdout) => extractFence(stdout, "markdown") !== null,
+    // validate：必须产出 ```markdown fence（4 反引号外层），且前三块 H2 齐全。
+    // 脉络图（第四块）不强制——06-assemble 会用 outline 程序化生成 mermaid 补上
+    // （audit 2026-08-04：杜绝 LLM 末尾截断导致脉络图空壳过闸）。
+    validate: (stdout) => {
+      const md = extractFence(stdout, "markdown");
+      if (!md) return false;
+      // startsWith + includes 容错冒号后缀（如 mitt 实际产出「## 这本书在讲什么：一句话主线」）。
+      const lines = md.split("\n").map((l) => l.trim());
+      const has = (kw: string) =>
+        lines.some((l) => l.startsWith("##") && l.includes(kw));
+      return (
+        has("这本书在讲什么") && has("怎么读这本书") && has("贯穿全书的核心原理")
+      );
+    },
   });
 
   // 从 stdout 提取 ```markdown fence 内文本。

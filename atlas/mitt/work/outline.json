@@ -119,7 +119,7 @@
         "package.json",
         "README.md"
       ],
-      "summary": "一份 TS 源码经 microbundle 同时产出 ESM/CJS/UMD，再用 `package.json` 的 `exports` 条件映射配合 `module`/`main`/`umd:main`/`typings`，把打包器、Node require、浏览器 `<script>`、TS 各自路由到正确产物——核心思想是『一源多格式，靠条件 exports 通吃所有运行时』（README 宣称从浏览器到 IE9+）；代价是构建工具链复杂与一份需手工对齐的 `index.d.ts`。"
+      "summary": "一份 TS 源码经 microbundle 同时产出 ESM/CJS/UMD，再用 `package.json` 的 `exports` 条件映射配合 `module`/`main`/`umd:main`/`typings`，把打包器、Node require、浏览器 `<script>`、TS 各自路由到正确产物——核心思想是『一源多格式，靠条件 exports 通吃所有运行时』（README 宣称从浏览器到 IE9+）；代价是构建工具链复杂（含一份构建自动生成、被 .gitignore 忽略的 `index.d.ts`）。"
     }
   ],
   "topoOrder": [

@@ -34,7 +34,7 @@ function defineStore(id, setup, setupOptions) {
     // 真正的实例化逻辑都在这里，但现在一行都不执行
   }
 
-  useStore.$id = id    // 入口函数自己也是个「数据载体」：挂着 id 供别处用
+  useStore.$id = id    // 入口函数自己也挂个 id 在身上，方便别处取用
   return useStore      // 注意：返回的是函数，不是 store
 }
 ```

@@ -325,9 +325,12 @@ function applyStatus(
   if (status === "running") {
     next.startedAt = now();
     // 进入新一轮 running：清掉上一次失败的诊断（重跑会产生新的；旧的不再适用）。
-    delete next.exitCode;
-    delete next.stderr;
-    delete next.error;
+    // 但仅当本次 opts 未显式提供该字段时才清——否则会误删调用方本次刚写入的非致命诊断
+    // （如 06-assemble.ts 用 running+stderr 记录导读生成失败；无条件 delete 会立即抹除它，
+    // 导致失败原因永不落盘、atlas show 查不到）。audit 2026-08-04 修复。
+    if (opts?.exitCode === undefined) delete next.exitCode;
+    if (opts?.stderr === undefined) delete next.stderr;
+    if (opts?.error === undefined) delete next.error;
   }
   if (TERMINAL_STATES.has(status)) {
     next.finishedAt = now();

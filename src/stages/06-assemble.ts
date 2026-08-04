@@ -33,9 +33,10 @@ import {
   joinPath,
   writeText,
   prologuePath,
+  ensureDir,
 } from "../lib/io.ts";
 import { setStageStatus, saveManifest } from "../lib/manifest.ts";
-import type { Outline } from "../lib/types.ts";
+import type { Outline, Chapter } from "../lib/types.ts";
 import type { StageContext, StageResult } from "./types.ts";
 
 /**
@@ -44,6 +45,121 @@ import type { StageContext, StageResult } from "./types.ts";
  */
 function nn(i: number): string {
   return (i + 1).toString().padStart(2, "0");
+}
+
+/**
+ * 由 outline 的 dependsOn + topoOrder 程序化生成 mermaid 脉络图。
+ * 脉络图是依赖图的确定性投影，不需要 LLM 推理——程序化生成保证 100% 忠于 outline，
+ * 杜绝 LLM 末尾截断导致空壳（audit 2026-08-04：mitt 曾出现「标题+引言在、图没生成」过闸上线）。
+ */
+function generateMermaidGraph(outline: Outline): string {
+  const bySlug = new Map<string, Chapter>();
+  for (const c of outline.chapters) bySlug.set(c.slug, c);
+  // mermaid 节点 id 仅允许字母/数字/下划线；slug 含连字符，统一替换。
+  const idOf = (slug: string) => slug.replace(/[^a-zA-Z0-9]/g, "_");
+  const layerTitle: Record<string, string> = {
+    primitive: "原子层 primitive",
+    composite: "复合层 composite",
+    system: "系统层 system",
+  };
+  const lines: string[] = ["```mermaid", "graph TD"];
+  for (const layer of ["primitive", "composite", "system"]) {
+    const inLayer = (outline.topoOrder ?? []).filter(
+      (s) => bySlug.get(s)?.layer === layer,
+    );
+    if (inLayer.length === 0) continue;
+    lines.push(`  subgraph ${layerTitle[layer]}`);
+    for (const slug of inLayer) {
+      const c = bySlug.get(slug);
+      if (!c) continue;
+      lines.push(`    ${idOf(slug)}["${c.title}"]`);
+    }
+    lines.push("  end");
+  }
+  // 依赖边：每章的 dependsOn 指向更底层章（ADR-0003 自底向上）。
+  for (const slug of outline.topoOrder ?? []) {
+    const c = bySlug.get(slug);
+    if (!c) continue;
+    for (const dep of c.dependsOn) {
+      if (!bySlug.has(dep)) continue; // 悬空依赖跳过（outline stage 本应已校验）
+      lines.push(`  ${idOf(dep)} --> ${idOf(slug)}`);
+    }
+  }
+  lines.push("```");
+  return lines.join("\n");
+}
+
+/**
+ * 确保 prologue 含一个有效的脉络图块：若 LLM 未画或只留空壳，用程序化 mermaid 补/换。
+ * LLM 已画 mermaid 则尊重其产物；否则程序化生成（始终忠实于 outline.dependsOn）。
+ */
+function ensurePrologueGraph(prologueMd: string, outline: Outline): string {
+  const graph = generateMermaidGraph(outline);
+  const headerIdx = prologueMd.search(/##\s*全书脉络图/);
+  // 无脉络图标题：补完整块（标题 + 说明 + 图）。
+  if (headerIdx < 0) {
+    const block =
+      "## 全书脉络图\n\n" +
+      "下图由 outline 的 `dependsOn` + `topoOrder` 程序化生成，与依赖图完全一致" +
+      "（箭头方向：前置 → 后继）。\n\n" +
+      `${graph}\n`;
+    return prologueMd.replace(/\s+$/, "") + "\n\n" + block;
+  }
+  // 有标题：检查 Synthesizer 是否已画 mermaid。
+  const afterHeader = prologueMd.slice(headerIdx);
+  if (/```mermaid/.test(afterHeader)) {
+    return prologueMd; // 已有 mermaid（Synthesizer 自画），尊重之。
+  }
+  // 有标题但无 mermaid：Synthesizer 按新契约只写了引言、没画图。
+  // 保留其引言，仅在末尾追加程序化 mermaid（脉络图是第四块即末块，追加在其后自然衔接）。
+  const graphNote =
+    "下图由 outline 的 `dependsOn` + `topoOrder` 程序化生成（箭头方向：前置 → 后继）：\n\n";
+  return prologueMd.replace(/\s+$/, "") + "\n\n" + graphNote + graph + "\n";
+}
+
+/**
+ * mermaid 渲染主题入口固定模板（vitepress-mermaid-renderer）。
+ * Assembler 应已按 prompt 生成同等内容；若 LLM 漏生成，用本模板兜底补写，
+ * 保证导读页的全书脉络图能渲染（否则 mermaid 块显示为源码）。
+ */
+const MERMAID_THEME_TS = `import { h, nextTick, watch } from "vue";
+import type { Theme } from "vitepress";
+import DefaultTheme from "vitepress/theme";
+import { useData } from "vitepress";
+import { createMermaidRenderer } from "vitepress-mermaid-renderer";
+
+export default {
+  extends: DefaultTheme,
+  Layout: () => {
+    const { isDark } = useData();
+
+    const initMermaid = () => {
+      createMermaidRenderer({
+        theme: isDark.value ? "dark" : "default",
+      });
+    };
+
+    nextTick(() => initMermaid());
+    watch(
+      () => isDark.value,
+      () => initMermaid(),
+    );
+
+    return h(DefaultTheme.Layout);
+  },
+} satisfies Theme;
+`;
+
+/**
+ * 若 site/.vitepress/theme/index.ts 不存在（Assembler 漏生成），程序化补写一份。
+ * 与 ensurePrologueGraph 同思路：双保险，保证不阻断 build。
+ */
+async function ensureMermaidTheme(site: string): Promise<void> {
+  const themeTs = joinPath(site, ".vitepress/theme/index.ts");
+  if (await pathExists(themeTs)) return;
+  // ensureDir 仅创建 theme 目录；写入固定模板。
+  await ensureDir(joinPath(site, ".vitepress/theme/"));
+  await writeText(themeTs, MERMAID_THEME_TS);
 }
 
 /**
@@ -80,7 +196,9 @@ export async function assemble(ctx: StageContext): Promise<StageResult> {
   try {
     const syn = await synthesizer({ key, model, spawn });
     if (syn.ok && syn.prologueMd) {
-      await writeText(prologuePath(key), syn.prologueMd);
+      // 用程序化 mermaid 兜底脉络图（防 LLM 末尾截断空壳），再落盘。
+      const withGraph = ensurePrologueGraph(syn.prologueMd, outline);
+      await writeText(prologuePath(key), withGraph);
       prologueOk = true;
     } else {
       // 导读失败：记 stderr 到 manifest（不改 stage status，继续搬运）。
@@ -113,8 +231,13 @@ export async function assemble(ctx: StageContext): Promise<StageResult> {
     return failed;
   }
 
-  // ---- 校验 site 结构完整性 ----
   const site = siteDir(key);
+
+  // 兜底：若 Assembler 漏生成 .vitepress/theme/index.ts（启用 mermaid 渲染），程序化补写。
+  // （与 ensurePrologueGraph 同思路：双保险，防 LLM 偶发漏文件导致脉络图显示为源码。）
+  await ensureMermaidTheme(site);
+
+  // ---- 校验 site 结构完整性 ----
   const errors: string[] = [];
 
   // 1) site/ 目录存在。
@@ -125,9 +248,13 @@ export async function assemble(ctx: StageContext): Promise<StageResult> {
     const configTs = joinPath(site, ".vitepress/config.ts");
     const indexMd = joinPath(site, "index.md");
     const pkgJson = joinPath(site, "package.json");
+    const themeTs = joinPath(site, ".vitepress/theme/index.ts");
     if (!(await pathExists(configTs))) errors.push(`缺 ${configTs}`);
     if (!(await pathExists(indexMd))) errors.push(`缺 ${indexMd}`);
     if (!(await pathExists(pkgJson))) errors.push(`缺 ${pkgJson}`);
+    // theme/index.ts 启用 mermaid 渲染（全书脉络图依赖）；ensureMermaidTheme 已兜底补写，
+    // 此处为不变量断言（兜底写盘异常时能捕获）。
+    if (!(await pathExists(themeTs))) errors.push(`缺 ${themeTs}`);
 
     // 3) guide/ 下按 topoOrder 编号的文件齐全。
     const guideDir = joinPath(site, "guide/");
@@ -162,7 +289,17 @@ export async function assemble(ctx: StageContext): Promise<StageResult> {
 
   // CAS：site 结构校验通过后才置 done。
   // （site/ 已由 Assembler 落盘，stage 不再写额外产物文件。）
-  m = setStageStatus(m, "assemble", "done", { cmd: outcome.cmd });
+  m = setStageStatus(m, "assemble", "done", {
+    cmd: outcome.cmd,
+    // 导读缺失属非致命警告（章节正文完整）：显式记到 error，让 atlas show 醒目可见。
+    // running 态记的 stderr 因 applyStatus 修复也已保留；此处 error 作为一句话摘要。
+    ...(prologueOk
+      ? {}
+      : {
+          error:
+            "导读(prologue)未生成——章节正文完整，但缺全书导读入口页；可重跑 assemble 补齐",
+        }),
+  });
   await saveManifest(key, m);
   return m;
 }

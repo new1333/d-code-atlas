@@ -202,7 +202,12 @@ function makeMockSpawn(o: MockSpawnOpts): SpawnFn {
         await writeText(joinPath(site, `guide/${nn}-${slug}.md`), `# ${slug}`);
       }
       await ensureDir(joinPath(site, ".vitepress/"));
+      await ensureDir(joinPath(site, ".vitepress/theme/"));
       await writeText(joinPath(site, ".vitepress/config.ts"), "export default {}");
+      await writeText(
+        joinPath(site, ".vitepress/theme/index.ts"),
+        'import { createMermaidRenderer } from "vitepress-mermaid-renderer";',
+      );
       await writeText(joinPath(site, "index.md"), "# Home");
       await writeText(joinPath(site, "package.json"), JSON.stringify({ name: "site" }));
       return { exitCode: 0, stdout: "assembled", stderr: "" };
@@ -857,7 +862,12 @@ describe("失败终止（design §15）", () => {
           await writeText(joinPath(site, `guide/${nn}-${slug}.md`), `# ${slug}`);
         }
         await ensureDir(joinPath(site, ".vitepress/"));
+        await ensureDir(joinPath(site, ".vitepress/theme/"));
         await writeText(joinPath(site, ".vitepress/config.ts"), "export default {}");
+        await writeText(
+          joinPath(site, ".vitepress/theme/index.ts"),
+          'import { createMermaidRenderer } from "vitepress-mermaid-renderer";',
+        );
         await writeText(joinPath(site, "index.md"), "# Home");
         await writeText(joinPath(site, "package.json"), JSON.stringify({ name: "site" }));
         return { exitCode: 0, stdout: "assembled", stderr: "" };

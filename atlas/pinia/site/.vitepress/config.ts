@@ -2,11 +2,23 @@ import { defineConfig } from "vitepress";
 
 export default defineConfig({
   title: "Pinia",
-  description: "Pinia 源码解读 · Code Atlas",
+  description:
+    "Vue 官方状态管理库 Pinia 的源码解读——从响应式托管、全局活跃上下文，到装配流水线、订阅系统，再到 SSR、HMR、DevTools 与测试的完整机制拆解。",
   lang: "zh-CN",
   themeConfig: {
-    search: { provider: "local" },
+    // 启用 VitePress 内置本地搜索（基于 MiniSearch，零外部服务、零额外依赖，
+    // 符合 ADR-0006 自包含）。
+    search: {
+      provider: "local",
+    },
     sidebar: [
+      {
+        // 导读组：全书级入口，固定为侧边栏首组。
+        text: "导读",
+        items: [
+          { text: "导读", link: "/guide/00-prologue" },
+        ],
+      },
       {
         text: "原子层",
         items: [

@@ -792,11 +792,12 @@ describe("06-assemble · site 结构校验", () => {
       calls.push(call);
       const prompt = args[1] ?? "";
       if (prompt.includes("你是 Synthesizer")) {
-        // 导读：返回有效的 prologue markdown fence（4 反引号外层）。
-        // stage 会提取 fence 后原子落盘到 work/prologue/draft.md。
+        // 导读：返回有效的 prologue markdown fence（4 反引号外层），含四块结构的前三块 H2
+        // （synthesizer.ts validate 校验这三块齐全；脉络图第四块由 assemble 程序化补）。
         return {
           exitCode: 0,
-          stdout: "````markdown\n# 导读\n\n一句话主线。\n````",
+          stdout:
+            "````markdown\n# 导读\n\n## 这本书在讲什么\n\n一句话主线。\n\n## 怎么读这本书\n\n线性路线。\n\n## 贯穿全书的核心原理\n\n原理 X。\n````",
           stderr: "",
         };
       }
@@ -822,7 +823,13 @@ describe("06-assemble · site 结构校验", () => {
         }
         // 写脚手架。
         await ensureDir(joinPath(site, ".vitepress/"));
+        await ensureDir(joinPath(site, ".vitepress/theme/"));
         await writeText(joinPath(site, ".vitepress/config.ts"), "export default {}");
+        // theme/index.ts：含 createMermaidRenderer 标识串（过 assembler scaffoldFiles 校验）。
+        await writeText(
+          joinPath(site, ".vitepress/theme/index.ts"),
+          'import { createMermaidRenderer } from "vitepress-mermaid-renderer";',
+        );
         await writeText(joinPath(site, "index.md"), "# Home");
         await writeText(joinPath(site, "package.json"), JSON.stringify({ name: "site" }));
         return { exitCode: 0, stdout: "assembled", stderr: "" };
@@ -849,6 +856,7 @@ describe("06-assemble · site 结构校验", () => {
     // site 结构校验。
     const site = siteDir(key);
     expect(await pathExists(joinPath(site, ".vitepress/config.ts"))).toBe(true);
+    expect(await pathExists(joinPath(site, ".vitepress/theme/index.ts"))).toBe(true);
     expect(await pathExists(joinPath(site, "index.md"))).toBe(true);
     expect(await pathExists(joinPath(site, "package.json"))).toBe(true);
     // 导读已被搬运为 00-prologue.md（Synthesizer 成功 → Assembler 搬运）。
