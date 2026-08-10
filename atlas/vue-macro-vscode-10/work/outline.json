@@ -1,0 +1,165 @@
+{
+  "repo": "vue-macro-vscode-10",
+  "generatedAt": "2026-08-10T04:27:18.239Z",
+  "chapters": [
+    {
+      "slug": "compiler-macro-essence",
+      "title": "编译期宏的本质：运行时不存在的「变换提示」",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [],
+      "summary": "宏是只存在于编译期、运行时被彻底擦除的「伪函数」——核心思想是把『运行期才能表达的约定』前移到编译期，用编译期 AST 变换换取零运行时开销与更声明式的语法；关键权衡是宏调用没有真实函数语义、不能被普通 JS 工具按函数来理解"
+    },
+    {
+      "slug": "script-setup-macros",
+      "title": "<script setup> 与内置宏的设计动机",
+      "layer": "primitive",
+      "dependsOn": [
+        "compiler-macro-essence"
+      ],
+      "sourceFiles": [],
+      "summary": "内置宏（defineProps/defineEmits/defineModel 等）的本质是『编译期去糖』——把声明式 setup 语法编译成等价的 setup() 返回值；核心思想是用编译器替用户生成样板，关键权衡是宏语义由编译器硬编码、可扩展性受限，这正是 Vue Macros 之所以存在的痛点"
+    },
+    {
+      "slug": "sfc-compile-pipeline",
+      "title": "SFC 编译管线与宏的注入时机",
+      "layer": "primitive",
+      "dependsOn": [
+        "script-setup-macros"
+      ],
+      "sourceFiles": [],
+      "summary": "compiler-sfc 先把 .vue 解析为 SFCDescriptor，再分阶段走 parse→compileScript→compileTemplate；核心原理是『宏变换必须挂在 compileScript 的 AST 遍历阶段而非字符串阶段』，因为只有拿到 AST 才能精确识别宏调用——关键权衡是阶段顺序决定了宏能感知到多少上下文"
+    },
+    {
+      "slug": "ast-traversal",
+      "title": "靠 AST 而非正则识别宏调用节点",
+      "layer": "primitive",
+      "dependsOn": [
+        "sfc-compile-pipeline"
+      ],
+      "sourceFiles": [],
+      "summary": "宏识别的本质是『在 Babel 产出的 AST 上按节点类型+调用名精确匹配』而非正则匹配文本；核心思想是用结构化 AST 保证健壮性（不会误匹配注释/字符串里的同名标识符），关键权衡是引入解析成本、且源码格式不敏感反而让报错定位更难还原到用户写法"
+    },
+    {
+      "slug": "magic-string-sourcemap",
+      "title": "magic-string：sourcemap 友好的源码就地变换",
+      "layer": "primitive",
+      "dependsOn": [
+        "ast-traversal"
+      ],
+      "sourceFiles": [],
+      "summary": "宏变换用 magic-string 而非直接拼字符串，核心原理是『在原始 offset 上记录 overwrite/remove 操作、最终一次性 generateMap 还原 sourcemap』；关键权衡是只能用 offset 级操作、禁用绝对字符串替换，换取编译产物可回溯用户源码——否则断点与报错会全部错位"
+    },
+    {
+      "slug": "macro-transform-pipeline",
+      "title": "Vue Macros 的宏变换流水线",
+      "layer": "composite",
+      "dependsOn": [
+        "ast-traversal",
+        "magic-string-sourcemap"
+      ],
+      "sourceFiles": [],
+      "summary": "把『注册宏→遍历 AST→命中调用节点→用 magic-string 注入变换』串成一条可插拔流水线；核心思想是『每个特性是一个独立 AST visitor + 变换器』，关键权衡是多个宏可能改写同一节点带来的变换顺序与冲突问题，需用统一 walk 调度来解决"
+    },
+    {
+      "slug": "macro-design-catalog",
+      "title": "宏的设计原型：把什么前移到编译期",
+      "layer": "composite",
+      "dependsOn": [
+        "macro-transform-pipeline"
+      ],
+      "sourceFiles": [],
+      "summary": "归纳各宏背后的几类设计原型——『补全内置宏缺失能力』(defineModels/better-define)、『把运行期约定编译期化』(响应式 Props 解构)、『引入全新 DSL』(setupSFC/defineRender/JSX 指令)；核心思想是『凡能用编译期变换确定性还原的运行期样板都是宏的候选』，关键权衡是语法糖越激进、与标准 Vue 心智模型偏离越大"
+    },
+    {
+      "slug": "unplugin-abstraction",
+      "title": "unplugin：跨构建工具的统一插件抽象",
+      "layer": "composite",
+      "dependsOn": [
+        "sfc-compile-pipeline",
+        "macro-transform-pipeline"
+      ],
+      "sourceFiles": [],
+      "summary": "Vue Macros 用 unplugin 一次编写同时接入 Vite/Rollup/webpack，核心原理是『用工厂函数把同一份 transform 逻辑适配到各打包器的 hook 约定上』；关键权衡是抽象层抹平了工具能力差异（esbuild 流式变换能力有限导致只支持有限特性），换取一份代码库的维护成本优势"
+    },
+    {
+      "slug": "volar-virtual-code",
+      "title": "Volar 的虚拟代码生成与位置回映",
+      "layer": "composite",
+      "dependsOn": [
+        "script-setup-macros"
+      ],
+      "sourceFiles": [],
+      "summary": "Volar 把 .vue 映射成多个『虚拟 .ts/.css/.html 文件』交给下游 TS 服务，再把诊断/补全位置映射回原 .vue；核心思想是『用虚拟代码 + 双向位置映射让任意语言服务能处理 SFC』，关键权衡是映射层带来性能开销与保真风险（虚拟代码 offset 必须与真实源码严格对齐）"
+    },
+    {
+      "slug": "volar-language-plugin",
+      "title": "Vue Language Plugin 接口与 SFC 解析扩展点",
+      "layer": "composite",
+      "dependsOn": [
+        "volar-virtual-code"
+      ],
+      "sourceFiles": [],
+      "summary": "语言插件在虚拟代码生成管线里挂载扩展点，可改写『如何解析 SFC、如何生成虚拟代码』；核心思想是『把 SFC→虚拟代码的映射规则做成可插拔接口』，@vue-macros/volar 正是借此让自定义宏被 TS 理解；关键权衡是插件必须同时正确生成类型层虚拟代码，否则编辑器类型与编译产物会不一致"
+    },
+    {
+      "slug": "dual-track-compile-and-ide",
+      "title": "双轨制：编译变换与 IDE 类型支持为何必须并存",
+      "layer": "system",
+      "dependsOn": [
+        "unplugin-abstraction",
+        "volar-language-plugin"
+      ],
+      "sourceFiles": [],
+      "summary": "Vue Macros 必须同时维护两条管线——unplugin 负责构建期真的改写代码、@vue-macros/volar 负责 IDE 里假装改写以给出类型提示；核心原理是『运行产物靠编译变换、编辑器智能靠虚拟代码，二者语义必须对齐却各自独立』，关键权衡是双轨实现成本高，任一侧更新滞后都会出现『能跑但红线 / 能提示但报错』的割裂"
+    },
+    {
+      "slug": "vue-tsc-type-check",
+      "title": "vue-tsc：在 CLI 复用 Volar 插件做类型检查",
+      "layer": "system",
+      "dependsOn": [
+        "volar-language-plugin",
+        "dual-track-compile-and-ide"
+      ],
+      "sourceFiles": [],
+      "summary": "vue-tsc 复用 @vue-macros/volar 同一套虚拟代码生成逻辑，把 IDE 的类型能力搬到命令行做 CI 门禁；核心思想是『一套语言插件同时服务 IDE 与 CLI，保证编辑器提示与构建期类型检查一致』，关键权衡是 vue-tsc 完全依赖 Volar 虚拟代码保真度，宏的类型支持漏洞会同时体现为 IDE 与 CI 的误报"
+    },
+    {
+      "slug": "config-and-feature-flags",
+      "title": "配置系统：一份配置驱动两条管线",
+      "layer": "system",
+      "dependsOn": [
+        "dual-track-compile-and-ide"
+      ],
+      "sourceFiles": [],
+      "summary": "vue-macros 的单一配置对象（特性开关、宏选项）必须同时被 unplugin 与 @vue-macros/volar 读取，核心原理是『以一份声明式配置作为两条管线的唯一真相源』；关键权衡是配置 schema 一旦演进必须两侧同步，否则出现『构建认但 IDE 不认』的开关漂移"
+    },
+    {
+      "slug": "tradeoffs-cost-debugging",
+      "title": "根本权衡：零运行时 vs 可调试性，以及宏的生态演进",
+      "layer": "system",
+      "dependsOn": [
+        "dual-track-compile-and-ide",
+        "macro-design-catalog"
+      ],
+      "sourceFiles": [],
+      "summary": "编译期宏的根本取舍是『用编译期复杂度换运行时零开销与声明式语法』，代价是断点/堆栈/报错都指向编译产物而非用户源码，且宏与官方编译器演进存在张力（如 reactivity transform 被废弃的历史）；核心思想是『宏是编译器能力的临时扩张，需随官方能力收敛而逐步退场』，关键权衡是激进语法糖的短期收益与长期维护/迁移成本"
+    }
+  ],
+  "topoOrder": [
+    "compiler-macro-essence",
+    "script-setup-macros",
+    "sfc-compile-pipeline",
+    "ast-traversal",
+    "magic-string-sourcemap",
+    "macro-transform-pipeline",
+    "macro-design-catalog",
+    "unplugin-abstraction",
+    "volar-virtual-code",
+    "volar-language-plugin",
+    "dual-track-compile-and-ide",
+    "vue-tsc-type-check",
+    "config-and-feature-flags",
+    "tradeoffs-cost-debugging"
+  ]
+}
