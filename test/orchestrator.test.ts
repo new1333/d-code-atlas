@@ -82,7 +82,7 @@ interface SpawnCall {
  *   - "你是 Architect" → ```json {chapters}
  *   - "你是 Critic" · Outline/Chapter → ```json {verdict:"approve"}
  *   - "你是 Reader" → ````markdown research.md
- *   - "技术文档撰写员" → 真的写 draft.md 到 runDir，返回成功
+ *   - "你是 Writer" → 真的写 draft.md 到 runDir，返回成功
  *   - "你是 Assembler" → 真的写 site/ 骨架到 runDir，返回成功
  *
  * chapters 用于 Architect 与 Assembler（取 topoOrder）；criticSeq 可覆盖 critic 返回
@@ -194,7 +194,7 @@ function makeMockSpawn(o: MockSpawnOpts): SpawnFn {
     }
 
     // Writer：返回 markdown fence（stage 提取后落盘 draft.md）。
-    if (prompt.includes("技术文档撰写员")) {
+    if (prompt.includes("你是 Writer")) {
       if (writerExit !== 0) {
         return { exitCode: writerExit, stdout: "", stderr: "writer error" };
       }
@@ -414,7 +414,7 @@ describe("AC-1 端到端 mock 跑通", () => {
     expect(architectCalls.length).toBe(0);
     // 应有 Reader/Writer/Assembler 调用。
     expect(calls2.some((c) => c.args[1]?.includes("你是 Reader"))).toBe(true);
-    expect(calls2.some((c) => c.args[1]?.includes("技术文档撰写员"))).toBe(true);
+    expect(calls2.some((c) => c.args[1]?.includes("你是 Writer"))).toBe(true);
     expect(calls2.some((c) => c.args[1]?.includes("你是 Assembler"))).toBe(true);
 
     // complete 串。
@@ -474,7 +474,7 @@ describe("AC-1 端到端 mock 跑通", () => {
     expect(calls.some((c) => c.args[1]?.includes("你是 Architect"))).toBe(false);
     expect(calls.some((c) => c.args[1]?.includes("你是 Reader"))).toBe(false);
     // 只调了 Writer + Critic + Assembler。
-    expect(calls.some((c) => c.args[1]?.includes("技术文档撰写员"))).toBe(true);
+    expect(calls.some((c) => c.args[1]?.includes("你是 Writer"))).toBe(true);
     expect(calls.some((c) => c.args[1]?.includes("你是 Assembler"))).toBe(true);
 
     // complete 串。
@@ -516,7 +516,7 @@ describe("--from <stage>", () => {
     expect(calls.some((c) => c.args[1]?.includes("你是 Architect"))).toBe(false);
     // research/write/assemble 被调。
     expect(calls.some((c) => c.args[1]?.includes("你是 Reader"))).toBe(true);
-    expect(calls.some((c) => c.args[1]?.includes("技术文档撰写员"))).toBe(true);
+    expect(calls.some((c) => c.args[1]?.includes("你是 Writer"))).toBe(true);
     expect(calls.some((c) => c.args[1]?.includes("你是 Assembler"))).toBe(true);
 
     // 日志不含 acquire/survey/outline 的开始（被跳过）。
@@ -590,7 +590,7 @@ describe("--only <stage>", () => {
     expect(calls.some((c) => c.args[1]?.includes("你是 Architect"))).toBe(true);
     expect(calls.some((c) => c.args[1]?.includes("你是 Critic"))).toBe(true);
     expect(calls.some((c) => c.args[1]?.includes("你是 Reader"))).toBe(false);
-    expect(calls.some((c) => c.args[1]?.includes("技术文档撰写员"))).toBe(false);
+    expect(calls.some((c) => c.args[1]?.includes("你是 Writer"))).toBe(false);
     expect(calls.some((c) => c.args[1]?.includes("你是 Assembler"))).toBe(false);
 
     // complete 串（即使只跑一个 stage 也算完成）。
@@ -635,7 +635,7 @@ describe("--only <stage>", () => {
     // Reader 被调 3 次（每章一次），无 Writer/Assembler。
     const readerCalls = calls.filter((c) => c.args[1]?.includes("你是 Reader"));
     expect(readerCalls.length).toBe(3);
-    expect(calls.some((c) => c.args[1]?.includes("技术文档撰写员"))).toBe(false);
+    expect(calls.some((c) => c.args[1]?.includes("你是 Writer"))).toBe(false);
     expect(calls.some((c) => c.args[1]?.includes("你是 Assembler"))).toBe(false);
 
     // complete 串。
@@ -791,7 +791,7 @@ describe("失败终止（design §15）", () => {
 
     // 下游 spawn 调用未发生（无 Reader/Writer/Assembler）。
     expect(calls.some((c) => c.args[1]?.includes("你是 Reader"))).toBe(false);
-    expect(calls.some((c) => c.args[1]?.includes("技术文档撰写员"))).toBe(false);
+    expect(calls.some((c) => c.args[1]?.includes("你是 Writer"))).toBe(false);
     expect(calls.some((c) => c.args[1]?.includes("你是 Assembler"))).toBe(false);
 
     // 含 halted 摘要日志。
@@ -863,7 +863,7 @@ describe("失败终止（design §15）", () => {
         }
         return { exitCode: 0, stdout: mdFence(validResearchMd(slug)), stderr: "" };
       }
-      if (prompt.includes("技术文档撰写员")) {
+      if (prompt.includes("你是 Writer")) {
         const slugMatch = opts.cwd.match(/chapters\/([a-z0-9-]+)\/?$/);
         const slug = slugMatch ? slugMatch[1] : "x";
         // beta 章 research.md 缺失 → write 子流程会标 write=failed（缺料）。

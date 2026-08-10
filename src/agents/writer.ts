@@ -8,10 +8,8 @@
 //     提取后由 Stage 原子落盘（见下方"设计变更"）。Writer 不调 Write/Edit。
 //   - **cwd = chapterDir(key, slug)**（chapters/{slug}/）：research.md 就在当前目录，
 //     outline.json/source/ 在 cwd 之外，通过 --add-dir 声明可读（见 addDirs）。
-//   - **不注入 system prompt**：实测 writer.md 内的 Write/replica 落盘指令会让 claude
-//     顽固尝试 Write 工具（即便 user prompt 说"不要 Write"）。故写作要求全部写进下方
-//     user prompt（含通俗化文风、关键权衡硬要求等），不读 writer.md。
-//     ⇒ 若改 writer.md，必须同步把改动落到本文件的 user prompt，否则不生效。
+//   - system prompt = writer.md（写作规范的唯一权威）；user prompt 只含运行时变量。
+//     与 reader.ts/architect.ts 的架构对齐。
 //
 // 注：相对 cwd（chapterDir）的路径用 research.md（当前目录）、../outline.json、../../../source/。
 
@@ -19,7 +17,7 @@ import { runClaude } from "../lib/run-claude.ts";
 import { workDir, chapterDir, sourceDir } from "../lib/io.ts";
 import { extractFence } from "../lib/extract.ts";
 import { type ChapterContext } from "../lib/chapter-context.ts";
-import { type AgentOutcome, type AgentCommonOpts } from "./types.ts";
+import { promptPath, type AgentOutcome, type AgentCommonOpts } from "./types.ts";
 
 /** Writer 入参。 */
 export interface WriterOpts extends AgentCommonOpts {
@@ -79,16 +77,15 @@ function buildChapterContextBlock(ctx: ChapterContext): string {
 }
 
 /**
- * 调起 Writer agent：基于 research.md + outline 写一章 draft.md + replica/。
+ * 调起 Writer agent：基于 research.md + outline 写一章 draft.md。
  *
- * 流程：拼 user prompt → runClaude（readonly, cwd=workDir）→ 从 stdout 提取 draft.md 内容 → Stage 落盘。
+ * 流程：拼 user prompt → runClaude（readonly, cwd=chapterDir, system prompt=writer.md）
+ * → 从 stdout 提取 draft.md 内容 → Stage 落盘。
  *
- * **设计变更（原 Write 工具落盘 → stdout fence 提取）**：
- *   实测 claude headless 即便 --permission-mode bypassPermissions，处理复杂写作任务时
- *   高概率不调 Write 工具（停下来「等授权」或直接分析输出到 stdout）。改为让 Writer
- *   把 draft.md 全文以 ````markdown fence（4 反引号外层）输出到 stdout，agent 层用
- *   extractFence 提取后由 Stage 原子落盘。这与 Reader 的产物方式一致（design §5）。
- *   代价：不产 replica/ 可运行副本（原 ADR-0006）。Critic·Chapter 已降级，不强制可运行。
+ * **stdout fence 提取（不落盘 replica/）**：Writer 把 draft.md 全文以
+ * ````markdown fence（4 反引号外层）输出到 stdout，agent 层用 extractFence 提取后由
+ * Stage 原子落盘。这与 Reader 的产物方式一致（design §5）。演示代码内嵌在 draft 里，
+ * 不产独立的 replica/ 可运行副本。
  */
 export async function writer(opts: WriterOpts): Promise<WriterOutcome> {
   const { key, slug, model, spawn, feedback, chapterContext } = opts;
@@ -99,6 +96,7 @@ export async function writer(opts: WriterOpts): Promise<WriterOutcome> {
   // outline.json/research.md 在 workDir（cwd 之外），通过 --add-dir 声明可读。
   const cwd = chapterDir(key, slug);
   const wdir = workDir(key);
+  const systemPromptPath = promptPath("writer");
 
   // 章节上下文块：stage 已算好（位置 + 前后驱 + dependsOn 各章主题），插进 user prompt。
   // 省略时（stage 算不出）不插，Writer 不受影响——向后兼容。
@@ -119,104 +117,22 @@ export async function writer(opts: WriterOpts): Promise<WriterOutcome> {
       : "";
 
   const prompt = [
-    "你是技术文档撰写员。请基于源码事实摘录，撰写一章自底向上的中文教学文档。",
-    "",
-    "## ⚠️ 输出方式（最重要，违反则作废）",
-    "你的最终回复**必须且只能**是一个被 4 反引号 fence 包裹的 markdown 文本块。",
-    "即：以 ` ````markdown ` 开头，以 ` ```` ` 结尾，中间是 draft.md 的完整内容。",
-    "**绝对不要**调用 Write/Edit 工具（你没有写权限，调用只会失败）。",
-    "**绝对不要**在 fence 外写任何文字（「被拦截」「无法写入」「核查结论」等都会导致解析失败）。",
-    "fence 内直接写章节正文（markdown），内嵌的 ```ts 代码块不会被 4 反引号外层误判。",
-    "",
-    "正确示例（你的整个回复应该长这样）：",
-    "````markdown",
-    "# 章节标题",
-    "正文。内嵌代码：",
-    "```ts",
-    "const x = 1",
-    "```",
-    "更多正文...",
-    "````",
+    `你是 Writer（章节撰写员）。本章 slug: ${slug}。`,
     "",
     "## 输入",
-    "- 你的当前工作目录是本章目录（含 research.md）。",
-    "- 读 `research.md`（事实摘录，写正文的主要依据；若内容与标题不符，以源码为准）。",
-    "- 读 `../../../outline.json`（取本章 title/summary/layer/dependsOn/sourceFiles）。",
-    "- 需要时读 `../../../source/` 核对技术准确性。",
+    `- cwd: ${cwd}（含 research.md；相对 cwd 读 ../../../outline.json、../../../source/）`,
+    "- 写作规范的完整要求见 system prompt（文风、结构、关键权衡、演示、mermaid 等），这里只给运行时信息。",
     "",
-    "## 正文写作要求",
-    "- **markdown 格式**，中文；代码/标识符/字段名用英文。",
-    "",
-    "### 文体：通俗、像人说话（最高优先级文风要求）",
-    "- **这是教学文，不是论文摘要，不是源码导读。** 读者是「想搞懂原理的人」，不是「想背源码结构的人」。",
-    "- **每节正文必须以人话开头**：用一个具体场景、一句读者会说的话、或「想象一下」起手；",
-    "  **禁止**用「一句话概括底层原语……」「核心思想可以表述为……」这种定义式开场。",
-    "- **禁用生硬抽象词**（出现即换成日常说法或删掉）：原语、载体、归一/归一点、收口、",
-    "  载荷、地基层、占位(作动词)、汇成、叠在一起、确立、递送、归一化。",
-    "  （例：不写「以 pinia=指针收口」，写「最后都落到读指针」；不写「底层原语」，写「最底层的那块」或直接不提。）",
-    "- **抽象概念第一次出现时配一个类比**：全局指针 = 一块谁都能看到的公共留言板；",
-    "  依赖注入 = 按地址精准投递。类比只用一次点透，不滥用、不每段都打比方。",
-    "- **允许并鼓励过渡人话**：「说人话就是……」「换句话说……」「这个设计说白了是为了……」",
-    "  这类句子不算水，是教学必需，每节可有 1～2 句。",
-    "- **不要反复念叨同一句抽象概括**：核心思想点透一次即可，其余地方用具体例子或人话重述，",
-    "  不要每段都以「核心思想是……」「一句话概括……」起手。",
-    "",
-    "### 反 AI 腔（硬要求，违反即文体失败）",
-    "- **破折号节制**：同一段「——」作插入解释 ≤ 1 次；能用句号断开就别用破折号。破折号是强调，不是连接词。",
-    "- **反机械排比**：禁止「没有 A、没有 B、没有 C」「不 X、不 Y、不 Z」三连否定/肯定排比当修辞（穷举枚举 ≤ 2 项除外）。",
-    "- **过渡人话不重复**：「说白了」「换句话说」「说人话就是」全章 ≤ 3 次，禁止相邻段落连用。",
-    "- **类比不模板化、不跨章复读**：一章核心类比 ≤ 2 个、每个只点透一次；禁止跨章复用同一比喻骨架",
-    "  （如「公共留言板/公共白板」「喊一嗓子」），换仓库换说法或干脆不比喻。",
-    "- **收尾朴素**：小结用最直白的话收，禁止「一句话：……」「说白了：……」当固定收束句式（全章至多 1 次）；小标题朴素，不对仗押韵。",
-    "- 判断标准：把这段读给不知道是 AI 写的人听，他觉得「刻意/太整齐/像演讲」就回去改。自然 > 工整。",
-    "",
-    "### 结构：自底向上、原理驱动",
-    "- **自底向上**：先讲底层基本件，再讲组合机制；前置概念来自 dependsOn 章节。",
-    "- **章首承上（硬要求）**：正文开头（第 1 节之内）用 1～2 句承接紧邻上一章——点出上一章讲了什么、留下了哪个口子、本章接着它讲",
-    "  （用上面「章节上下文」里的「紧邻上一章」标题）。首章（无前驱）则说清「全书为什么从这一章开始」。措辞朴素承接，不堆套话。",
-    "- **跨章去重（硬要求）**：写「关键权衡/核心思想」前，先比对上面「章节上下文」里",
-    "  dependsOn 各章的主题。如果某个机制在前置章已被作为该章的**核心思想或关键权衡**讲透",
-    "  （典型信号：它出现在前置章的 summary 里、或它的「选择→换来→代价」已被前置章展开），",
-    "  本章提到它时**只用一句话回指**（如「这个时序第 N 章已展开，这里不重复」），**禁止重新演示",
-    "  同一原理**。你可以讲该机制「在本章语境下」的新侧面，但不能复述同一原理的同一面。",
-    "  这是为了避免读者连读相邻章时，同一原理被完整讲好几遍。",
-    "- **章末小结如要预告后续，只点名紧邻下一章**：用上面「章节上下文」里的 nextTitle，",
-    "  且**只点这一章**。禁止罗列多个后续章名（容易与真实 topoOrder 顺序错位、误导读者按图索骥）。",
-    "  末章（nextTitle 为空）则不预告，只收束本章原理。",
-    "- **必须有关键权衡（硬要求）**：**至少 1 条**高质量的「做了 X 选择 → 换来了 Y → 代价是 Z」，且权衡总篇幅 ≥ 演示篇幅。这是「学原理」的核心交付。",
-    "  权衡要具体可复述，不要泛泛说「做了合理权衡」「性能与可读性的平衡」。",
-    "  **讲透本质矛盾（硬要求）**：每条权衡除「选择/换来/代价」外，还要点透它化解的是哪两个对立需求在打架，",
-    "  让读者带走「这类问题的通解骨架」、能在别的框架里认出来（例：不只讲「选浅响应换来不深渲染」，",
-    "  更点透背后是「字段级细粒度更新 vs 一次导航只刷一次视图」这个普适矛盾）。**「代价」不许循环**",
-    "  （选择 X、代价却写「失去非 X」=换皮，须换成另一个真实维度的成本：维护/认知负担、边界情形、可测试性等）。",
-    "  机制丰富的章通常有 2～4 条；但**机制稀薄的章（如薄包装、纯配置）可只写 1 条**——前提是这 1 条真讲清了「为什么这么设计」，",
-    "  且你须在文中点明「本章机制集中，只展开这 1 条核心权衡」。**宁可 1 条讲透，不要为凑数硬编。**",
-    "- 配流程图（文字版 A → B → C）、步骤、输入输出示例。",
-    "- **可视化（可选，克制使用）**：当核心机制是「时序 / 微任务调度 / 状态机 / 多步流转」、用文字",
-    "  A→B→C 难以讲清时，可配一张 mermaid 图（时序图 sequenceDiagram、状态图 stateDiagram、流程图）。",
-    "  **判据：文字能讲透就别画图。** 宁可少画、不可画错——一个方向错乱或并行分支描述不准的 mermaid，",
-    "  比没有图更误导读者。纯单条权衡、单一数据结构、纯定义性概念的章节通常**不需要**图。",
-    "  VitePress 原生支持 mermaid 代码块，直接用 ```mermaid fence 即可。",
-    "- 内嵌最小演示代码演透原理——用你**自己写的、从零实现的演示**，**不要**贴大段原仓库源码逐行注释。",
-    "  **演示载体按 research.md 教学钩子里的「演示载体建议」选——优先 TS/JS**：",
-    "  只要本章核心功能能用 TS/JS 忠实演透（算法、数据结构、状态机、协议、设计模式……绝大多数机制都是），就用 TS/JS 写演示，",
-    "  配最小 `package.json` 使其能 `bun run`/`node` 跑（能跑最好，**非硬要求**）。本 Atlas 产物本身是 JS 生态的 VitePress 站点，TS/JS 对读者最友好。",
-    "  **仅当核心功能 TS/JS 讲不透时**（语言特有语义如 Rust 所有权/借用、Go goroutine/channel、Python 描述符/元类；或必须依赖原生运行时），",
-    "  才用原仓库语言及其惯用法（Go 用 `go run`、Rust 用 `cargo run`、Python 用 `python`）。",
-    "  VSCode 扩展/IDE 插件/需要宿主或图形界面的机制：能用 TS/JS 模拟的仍首选 TS/JS，否则演**机制骨架**（激活时序、消息流转）+ 文字执行轨迹即可，不强求真跑。",
-    "  一句话：**载体服务于「演透原理」，优先用读者最易跑通的 TS/JS；只有 TS/JS 讲不透时才退回原仓库语言。**",
-    "- **正文禁绝任何源码对照**：不写 `文件名:行号`、不写「源码位置」「见 xxx.ts」、不设「与真源差异 / 源码对照」小节。",
-    "  这是原理教学文，不是源码导读——读者学的是「为什么这么设计」，不需要被引去翻源码。",
-    "- 聚焦一个核心概念，不流水账。篇幅 100-300 行。",
-    "",
-    "### 再次强调输出方式",
-    "- **只输出 4 反引号 markdown fence，不要写任何 fence 外的文字。**",
+    "## 输出方式（提醒，完整规范见 system prompt）",
+    "- 只输出 4 反引号 markdown fence，fence 外不写任何文字。",
+    "- fence 内是 draft.md 的完整内容（章节正文 + 内嵌演示代码）。",
   ].join("\n") + contextBlock + feedbackBlock;
 
   const result = await runClaude({
     prompt,
-    // 不用 system prompt（writer.md 的 Write/replica 指令会让 claude 顽固尝试 Write 工具，
-    // 即便 user prompt 说"不要 Write"。实测无 system prompt 时 claude 更可能遵守 stdout 输出）。
+    // system prompt = writer.md（写作规范：文风、结构、权衡、mermaid 等）。
+    // user prompt 只含运行时变量（slug、cwd、章节上下文、Critic 反馈）。
+    systemPromptPath,
     cwd,
     tools: "readonly",
     model,

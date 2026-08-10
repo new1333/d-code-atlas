@@ -660,12 +660,12 @@ describe("05-write · 并发 + 每章对抗评审", () => {
     calls: SpawnCall[],
   ): SpawnFn {
     let criticIdx = 0;
-    // 用计数器区分 writer / critic 调用：看 prompt 含 "你是 Writer" 还是 "你是 Critic"。
+    // 用 prompt 内容区分 writer / critic 调用：看 prompt 含 "你是 Writer" 还是 "你是 Critic"。
     return async (args, opts) => {
       const call: SpawnCall = { args: [...args], cwd: opts.cwd };
       calls.push(call);
       const prompt = args[1] ?? "";
-      if (prompt.includes("技术文档撰写员")) {
+      if (prompt.includes("你是 Writer")) {
         // writer 从 stdout markdown fence 提取 draft（模拟）。
         return { exitCode: 0, stdout: mdFence(`# 草稿\n正文`), stderr: "" };
       }

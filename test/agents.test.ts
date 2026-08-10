@@ -490,8 +490,9 @@ describe("writer", () => {
     // cwd = chapterDir
     expect(calls[0].cwd).toBe(chapterDir("demo", "reactive-primitive"));
 
-    // 不用 system prompt。
-    expect(calls[0].args.includes("--append-system-prompt-file")).toBe(false);
+    // systemPromptPath → writer.md
+    const sysIdx = calls[0].args.indexOf("--append-system-prompt-file");
+    expect(calls[0].args[sysIdx + 1].endsWith("writer.md")).toBe(true);
 
     // draftMd 从 fence 提取成功。
     expect(r.draftMd).not.toBeNull();
