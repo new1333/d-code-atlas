@@ -14,7 +14,7 @@ import {
   type ClaudeRunOptions,
   type SpawnFn,
 } from "../src/lib/run-claude.ts";
-import { READONLY_TOOLS, WRITE_TOOLS, CLAUDE_BIN } from "../src/lib/config.ts";
+import { READONLY_TOOLS, WRITE_TOOLS, TOPIC_READONLY_TOOLS, CLAUDE_BIN } from "../src/lib/config.ts";
 
 // ---------------------------------------------------------------------------
 // 假 spawn 工厂：记录收到的 args/cwd/env，返回预设 {exitCode,stdout,stderr}
@@ -139,6 +139,39 @@ describe("buildCmd · model 与 systemPrompt", () => {
     );
     // 加了 system prompt，readonly 锚点仍在
     expect(cmd.includes("--allowedTools Read,Glob,Grep")).toBe(true);
+  });
+});
+
+describe("buildCmd · toolsOverride（task 13 topic 模式）", () => {
+  test("提供 toolsOverride 时优先于 tools 枚举（含 WebSearch）", () => {
+    const { cmd, args } = buildCmd({
+      prompt: "调研主题",
+      cwd: "atlas/x/",
+      tools: "readonly", // 基础枚举
+      toolsOverride: TOPIC_READONLY_TOOLS, // topic 模式覆盖：加 WebSearch
+    });
+    // override 值被采用：含 WebSearch，与纯 readonly 的锚点不同。
+    expect(cmd.includes("--allowedTools Read,Glob,Grep,WebSearch")).toBe(true);
+    expect(cmd.includes("--allowedTools Read,Glob,Grep,WebSearch")).toBe(true);
+    // 不应出现纯 readonly 锚点（被 override 取代）。
+    expect(args[args.indexOf("--allowedTools") + 1]).toBe("Read,Glob,Grep,WebSearch");
+  });
+
+  test("未提供 toolsOverride 时回退到 tools 枚举（向后兼容）", () => {
+    const { cmd, args } = buildCmd({
+      prompt: "hi",
+      cwd: ".",
+      tools: "readonly",
+      // 不传 toolsOverride
+    });
+    expect(cmd.includes("--allowedTools Read,Glob,Grep")).toBe(true);
+    expect(args[args.indexOf("--allowedTools") + 1]).toBe("Read,Glob,Grep");
+  });
+
+  test("TOPIC_READONLY_TOOLS 不含 Write/Edit（无逃生口，即便加 WebSearch）", () => {
+    expect(TOPIC_READONLY_TOOLS).not.toContain("Write");
+    expect(TOPIC_READONLY_TOOLS).not.toContain("Edit");
+    expect(TOPIC_READONLY_TOOLS).toContain("WebSearch");
   });
 });
 

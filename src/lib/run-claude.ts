@@ -73,6 +73,12 @@ export interface ClaudeRunOptions {
   cwd: string;
   /** 工具权限模式。readonly 必然产出 `--allowedTools Read,Glob,Grep`。 */
   tools: ToolMode;
+  /**
+   * 工具白名单覆盖（task 13 topic 模式）。提供时**优先于** `tools` 枚举映射——
+   * 用于 topic 模式把 WebSearch 加进只读白名单（`TOPIC_READONLY_TOOLS`）。
+   * agent 层 topic 模式传 `toolsOverride: TOPIC_READONLY_TOOLS`；repo 模式不传（走 `tools` 枚举）。
+   */
+  toolsOverride?: string[];
   /** 透传给 claude 的 model 别名/全名（如 "sonnet"）。可选。 */
   model?: string;
   /**
@@ -158,8 +164,9 @@ export interface ClaudeResult {
  *     `--allowedTools Read,Glob,Grep` 子串完整出现、可被 includes 命中。
  */
 export function buildCmd(opts: ClaudeRunOptions): { cmd: string; args: string[] } {
-  const tools = opts.tools === "write" ? WRITE_TOOLS : READONLY_TOOLS;
-  const toolsValue = tools.join(","); // readonly → "Read,Glob,Grep"
+  // toolsOverride（topic 模式加 WebSearch）优先于 tools 枚举映射；未提供时走枚举。
+  const tools = opts.toolsOverride ?? (opts.tools === "write" ? WRITE_TOOLS : READONLY_TOOLS);
+  const toolsValue = tools.join(","); // readonly → "Read,Glob,Grep"；topic → "Read,Glob,Grep,WebSearch"
 
   // 真实传给 spawn 的参数数组（不经 shell，无需转义）。
   // flag 名与值分作两个 arg（符合 commander 解析惯例：值是独立参数）。

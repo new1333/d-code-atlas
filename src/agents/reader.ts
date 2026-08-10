@@ -15,6 +15,7 @@
 import { runClaude } from "../lib/run-claude.ts";
 import { runDir } from "../lib/io.ts";
 import { extractFence } from "../lib/extract.ts";
+import { TOPIC_READONLY_TOOLS } from "../lib/config.ts";
 import { type ChapterContext } from "../lib/chapter-context.ts";
 import { promptPath, agentAddDirs, type AgentOutcome, type AgentCommonOpts } from "./types.ts";
 
@@ -24,6 +25,13 @@ export interface ReaderOpts extends AgentCommonOpts {
   key: string;
   /** 本章 slug（精读对象）。 */
   slug: string;
+  /**
+   * 运行模式（task 13 topic 模式）：
+   * - `"repo"`（默认）：读 sourceFiles 精读源码（仓库模式现状）。
+   * - `"topic"`：凭知识 + WebSearch 调研（不读 sourceFiles，用 topic-reader.md prompt + WebSearch 白名单）。
+   * 非破坏性扩展，默认 `"repo"` 向后兼容。
+   */
+  mode?: "repo" | "topic";
   /**
    * 章节上下文（可选，research stage 透传）。
    * 含本章在 topoOrder 的位置、前后驱标题、dependsOn 各章的 title/summary。
@@ -88,9 +96,10 @@ function validateHooksStructure(md: string | null): boolean {
  */
 export async function reader(opts: ReaderOpts): Promise<ReaderOutcome> {
   const { key, slug, model, spawn, sourcePath, chapterContext } = opts;
+  const mode = opts.mode ?? "repo";
 
   const cwd = runDir(key);
-  const systemPromptPath = promptPath("reader");
+  const systemPromptPath = promptPath(mode === "topic" ? "topic-reader" : "reader");
 
   // 章节上下文块：stage 已算好（位置 + 前后驱 + dependsOn 各章主题），插进 user prompt。
   // 让 Reader 在「设计动机」钩子里标注本章与前置章的复用关系，供 Writer 做跨章去重。
@@ -116,7 +125,55 @@ export async function reader(opts: ReaderOpts): Promise<ReaderOutcome> {
         ]
       : [];
 
-  const prompt = [
+  const prompt =
+    mode === "topic"
+      ? buildTopicPrompt(key, slug, cwd, contextLines)
+      : buildRepoPrompt(key, slug, cwd, contextLines);
+
+  const result = await runClaude({
+    prompt,
+    systemPromptPath,
+    cwd,
+    tools: "readonly",
+    // topic 模式用 WebSearch 白名单（在只读基础上加 WebSearch 做外部 grounding）。
+    ...(mode === "topic" ? { toolsOverride: TOPIC_READONLY_TOOLS } : {}),
+    model,
+    spawn,
+    // 本地源在 cwd 之外，必须 --add-dir 声明（否则 claude 读取源码被拦截）。
+    // topic 模式无源码目录，agentAddDirs(undefined) 只返回 promptsDir。
+    addDirs: agentAddDirs(sourcePath),
+    // reader 深度精读大仓库源码（如 pinia）单章可能超 15 分钟；给 25 分钟。
+    timeoutMs: 25 * 60 * 1000,
+    retries: 3,
+    // validate：reader 必须产出 4 反引号 markdown fence，且 fence 内教学钩子结构合格。
+    // 两层校验：① fence 可提取（claude 偶发不加 fence 或用 3 反引号）；② 钩子 8 子项齐全。
+    // 任一不过 → run-claude 重试（retries=3），挡住「fence 在但钩子漏填/敷衍」的残缺 research.md。
+    validate: (stdout) => {
+      const md = extractFence(stdout, "markdown");
+      return md !== null && validateHooksStructure(md);
+    },
+  });
+
+  // 从 stdout 提取 ```markdown fence 内文本（注意：Reader 不用 JSON，用 markdown fence）。
+  const researchMd = extractFence(result.stdout, "markdown");
+
+  return {
+    ok: result.ok && researchMd !== null,
+    cmd: result.cmd,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    exitCode: result.exitCode,
+    researchMd,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// user prompt 拼接（repo / topic 两套）
+// ---------------------------------------------------------------------------
+
+/** repo 模式 user prompt。 */
+function buildRepoPrompt(key: string, slug: string, cwd: string, contextLines: string[]): string {
+  return [
     "你是 Reader（源码精读员）。请针对指定章节的 sourceFiles 做精读，产出事实摘录 research.md。",
     "",
     "## 本次输入",
@@ -155,37 +212,51 @@ export async function reader(opts: ReaderOpts): Promise<ReaderOutcome> {
     "不会被误判为外层结束（CommonMark 规则：结束 fence 反引号数 ≥ 起始）。",
     "局部贴源码片段时用对应语言 fence 如 ```ts；**不要**用 ```json 包裹整个文档。",
   ].join("\n");
+}
 
-  const result = await runClaude({
-    prompt,
-    systemPromptPath,
-    cwd,
-    tools: "readonly",
-    model,
-    spawn,
-    // 本地源在 cwd 之外，必须 --add-dir 声明（否则 claude 读取源码被拦截）。
-    addDirs: agentAddDirs(sourcePath),
-    // reader 深度精读大仓库源码（如 pinia）单章可能超 15 分钟；给 25 分钟。
-    timeoutMs: 25 * 60 * 1000,
-    retries: 3,
-    // validate：reader 必须产出 4 反引号 markdown fence，且 fence 内教学钩子结构合格。
-    // 两层校验：① fence 可提取（claude 偶发不加 fence 或用 3 反引号）；② 钩子 8 子项齐全。
-    // 任一不过 → run-claude 重试（retries=3），挡住「fence 在但钩子漏填/敷衍」的残缺 research.md。
-    validate: (stdout) => {
-      const md = extractFence(stdout, "markdown");
-      return md !== null && validateHooksStructure(md);
-    },
-  });
-
-  // 从 stdout 提取 ```markdown fence 内文本（注意：Reader 不用 JSON，用 markdown fence）。
-  const researchMd = extractFence(result.stdout, "markdown");
-
-  return {
-    ok: result.ok && researchMd !== null,
-    cmd: result.cmd,
-    stdout: result.stdout,
-    stderr: result.stderr,
-    exitCode: result.exitCode,
-    researchMd,
-  };
+/**
+ * topic 模式 user prompt。
+ * 不读 sourceFiles，凭知识 + WebSearch 产 research.md；依据标注官方文档/规范而非源码位置。
+ */
+function buildTopicPrompt(key: string, slug: string, cwd: string, contextLines: string[]): string {
+  return [
+    "你是 Topic Reader（主题精读员）。请针对指定章节的概念，凭知识 + WebSearch 调研，",
+    "产出教学原料 research.md。",
+    "",
+    "## 本次输入",
+    `- Run key: ${key}`,
+    `- 本章 slug: ${slug}`,
+    `- cwd: ${cwd}（topic 模式无 source/，相对 cwd 只有 work/outline.json 可读）`,
+    "",
+    "## 读取范围",
+    "- work/outline.json：取出本章（按 slug）的 title/summary、dependsOn。",
+    "  （topic 模式下 sourceFiles 为空数组，**不读**——无源码。）",
+    "- **无 source/**（topic 模式无参考仓库）。",
+    "- **WebSearch 是你的外部 grounding**：用 WebSearch 查官方文档/规范/权威资料，",
+    "  核对关键技术断言的准确性。",
+    "",
+    "## research.md 结构硬门禁（违反即产物不合格，务必遵守）",
+    "research.md 的 fence 内有固定分区顺序，第一分区**必须**是「## 给 Writer 的教学钩子」，",
+    "且必须**先于**任何事实（概念要点/关键流程）出现。",
+    "教学钩子分区内的 **8 个子项必须全部填齐**（不是敷衍的一句话）：",
+    "  ① 用户痛点/场景  ② 一句话核心思想  ③ 设计动机（含与前置章的复用关系标注）",
+    "  ④ 关键权衡（机制丰富章 2~4 条，机制稀薄章至少 1 条讲透；每条「选择→换来→代价」三段式）",
+    "  ⑤ 最小心智模型（3~7 步）  ⑥ 最小原理演示（应演示/应省略/**演示载体建议**）",
+    "  ⑦ 正文不宜展开的细节  ⑧ 推荐的一个执行轨迹例子",
+    "钩子里**禁止出现文件名/行号/文档 URL**——先把机制抽象成原理。",
+    "依据标注（带 `依据:` 标注）只允许出现在后面的概念要点/关键流程分区。",
+    "",
+    "## 任务",
+    "1. **用 WebSearch 调研**本章概念：官方文档怎么说、规范怎么定义、有哪些已知权衡。",
+    "2. 事实抽取：官方文档/规范里**实际是什么**、**怎么用**、**为什么这么设计**（标注来源，不臆测）。",
+    "3. 每条关键论断后标注 `依据: <官方文档名/规范段落/知识来源描述>`。",
+    "4. 全程**只读**：禁止 Write/Edit。",
+    ...contextLines,
+    "## 输出契约（严格）",
+    "你的最终回复**只**包含一个被 fence 包裹的 markdown 文本块（research.md 的完整内容）。",
+    "fence 外**不写**任何正文/解释。agent 层会从 stdout 提取 fence 内文本后原子落盘。",
+    "**外层 fence 用 4 个反引号**（````markdown），以保证内层片段的 ```ts / ```js 代码块",
+    "不会被误判为外层结束（CommonMark 规则：结束 fence 反引号数 ≥ 起始）。",
+    "局部贴代码片段时用对应语言 fence 如 ```ts；**不要**用 ```json 包裹整个文档。",
+  ].join("\n");
 }

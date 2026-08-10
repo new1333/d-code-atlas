@@ -91,6 +91,18 @@ function expectReadonlyTools(cmd: string): void {
   expect(cmd.includes("--allowedTools Read,Glob,Grep")).toBe(true);
 }
 
+/**
+ * task 13 topic 模式工具断言：--allowedTools 值 == Read,Glob,Grep,WebSearch，不含 Write/Edit。
+ * topic 模式在只读基础上加 WebSearch 做外部 grounding。
+ */
+function expectTopicTools(cmd: string): void {
+  const v = toolsValueFromCmd(cmd);
+  expect(v).toBe("Read,Glob,Grep,WebSearch");
+  expect(v).not.toContain("Write");
+  expect(v).not.toContain("Edit");
+  expect(cmd.includes("--allowedTools Read,Glob,Grep,WebSearch")).toBe(true);
+}
+
 // ---------------------------------------------------------------------------
 // extractFence / extractJson / extractCriticVerdict 纯函数测试
 // ---------------------------------------------------------------------------
@@ -346,6 +358,45 @@ describe("architect", () => {
 });
 
 // ---------------------------------------------------------------------------
+// topic 模式（task 13）：architect/reader/critic/writer 的 mode/sourceMode 分支
+// 验证：system prompt 选 topic-*.md，tools 含 WebSearch，无 Write/Edit。
+// ---------------------------------------------------------------------------
+
+describe("topic 模式 · architect（mode=topic）", () => {
+  test("systemPromptPath 选 topic-architect.md；tools 含 WebSearch；prompt 不读 repo-map", async () => {
+    const calls: SpawnCall[] = [];
+    const out = JSON.stringify({
+      chapters: [
+        { slug: "a", title: "概念A", layer: "primitive", dependsOn: [], sourceFiles: [], summary: "原理A" },
+      ],
+    });
+    const spawn = spawnReturning("```json\n" + out + "\n```", calls);
+
+    const r = await architect({ key: "demo-topic", mode: "topic", spawn });
+
+    expect(r.ok).toBe(true);
+    // topic-architect.md（不是 architect.md）
+    const sysIdx = calls[0].args.indexOf("--append-system-prompt-file");
+    expect(calls[0].args[sysIdx + 1].endsWith("topic-architect.md")).toBe(true);
+    // tools = TOPIC_READONLY_TOOLS（含 WebSearch，无 Write/Edit）
+    expectTopicTools(r.cmd);
+    // topic prompt 应提到「主题」「WebSearch」「sourceFiles 填空数组」
+    expect(calls[0].args[1]).toContain("WebSearch");
+    expect(calls[0].args[1]).toContain("sourceFiles");
+  });
+
+  test("默认 mode（不传）= repo，仍用 architect.md + 纯只读工具（向后兼容）", async () => {
+    const calls: SpawnCall[] = [];
+    const out = JSON.stringify({ chapters: [{ slug: "a", title: "A", layer: "primitive", dependsOn: [], sourceFiles: ["x.ts"], summary: "s" }] });
+    const spawn = spawnReturning("```json\n" + out + "\n```", calls);
+    const r = await architect({ key: "demo", spawn });
+    const sysIdx = calls[0].args.indexOf("--append-system-prompt-file");
+    expect(calls[0].args[sysIdx + 1].endsWith("architect.md")).toBe(true);
+    expectReadonlyTools(r.cmd);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // critic（outline + chapter 双模式）
 // ---------------------------------------------------------------------------
 
@@ -467,6 +518,40 @@ describe("reader", () => {
   });
 });
 
+describe("topic 模式 · reader（mode=topic）", () => {
+  test("systemPromptPath 选 topic-reader.md；tools 含 WebSearch；validate 8 子项结构复用", async () => {
+    const calls: SpawnCall[] = [];
+    const research = [
+      "# 宏的注册 · 主题精读",
+      "",
+      "## 给 Writer 的教学钩子（必填，8 子项缺一不可）",
+      "- **用户痛点 / 场景**：手写样板累。",
+      "- **一句话核心思想**：编译期钩子改写 AST。",
+      "- **设计动机**：零运行时开销。",
+      "- **关键权衡**：编译期变换 → 换零开销 → 代价调试难。",
+      "- **最小心智模型（3～7 步）**：1. 注册 2. 拦截 3. 改写。",
+      "- **最小原理演示**：应演示钩子；演示载体建议 TS/JS。",
+      "- **正文不宜展开的细节**：sourcemap。",
+      "- **推荐的一个执行轨迹例子**：源码 → AST → 产物。",
+      "",
+      "## 概念要点",
+      "- 官方文档定义 依据: vue-macros 文档",
+    ].join("\n");
+    const stdout = "````markdown\n" + research + "\n````";
+    const spawn = spawnReturning(stdout, calls);
+
+    const r = await reader({ key: "demo-topic", slug: "macro-reg", mode: "topic", spawn });
+
+    expect(r.ok).toBe(true);
+    expect(r.researchMd).toBe(research);
+    const sysIdx = calls[0].args.indexOf("--append-system-prompt-file");
+    expect(calls[0].args[sysIdx + 1].endsWith("topic-reader.md")).toBe(true);
+    expectTopicTools(r.cmd);
+    // topic prompt 应提到 WebSearch 与「依据」标注（非源码位置）
+    expect(calls[0].args[1]).toContain("WebSearch");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // writer（写入类）
 // ---------------------------------------------------------------------------
@@ -500,9 +585,79 @@ describe("writer", () => {
   });
 });
 
+describe("topic 模式 · writer（mode=topic）", () => {
+  test("systemPromptPath 选 topic-writer.md；tools 含 WebSearch；addDirs 不含 sourceDir", async () => {
+    const calls: SpawnCall[] = [];
+    const spawn = makeFakeSpawn(calls, {
+      exitCode: 0,
+      stdout: "````markdown\n# macro 草稿\n正文\n````",
+      stderr: "",
+    });
+
+    const r = await writer({ key: "demo-topic", slug: "macro-reg", mode: "topic", spawn });
+
+    expect(r.ok).toBe(true);
+    expectTopicTools(r.cmd);
+    // topic-writer.md（不是 writer.md）
+    const sysIdx = calls[0].args.indexOf("--append-system-prompt-file");
+    expect(calls[0].args[sysIdx + 1].endsWith("topic-writer.md")).toBe(true);
+    // addDirs 不含 sourceDir（topic 无源码目录）：--add-dir 后只有 workDir + promptsDir，无 work/source
+    const addDirIdx = calls[0].args.indexOf("--add-dir");
+    expect(addDirIdx).toBeGreaterThanOrEqual(0);
+    const addDirValues: string[] = [];
+    for (let i = addDirIdx + 1; i < calls[0].args.length && !calls[0].args[i].startsWith("--"); i++) {
+      addDirValues.push(calls[0].args[i]);
+    }
+    expect(addDirValues.some((d) => d.includes("work/source"))).toBe(false);
+  });
+});
+
 // ---------------------------------------------------------------------------
-// assembler（写入类，需先落 outline 到 tmp runDir）
+// topic 模式 · critic（sourceMode=topic）
 // ---------------------------------------------------------------------------
+
+describe("topic 模式 · critic（sourceMode=topic）", () => {
+  test("outline + sourceMode=topic：选 topic-critic-outline.md；tools 含 WebSearch", async () => {
+    const calls: SpawnCall[] = [];
+    const out = JSON.stringify({ verdict: "approve", fixes: [] });
+    const spawn = spawnReturning("```json\n" + out + "\n```", calls);
+
+    const r = await critic({ key: "demo-topic", mode: "outline", sourceMode: "topic", spawn });
+
+    expect(r.ok).toBe(true);
+    expect(r.verdict).toBe("approve");
+    const sysIdx = calls[0].args.indexOf("--append-system-prompt-file");
+    expect(calls[0].args[sysIdx + 1].endsWith("topic-critic-outline.md")).toBe(true);
+    expectTopicTools(r.cmd);
+  });
+
+  test("chapter + sourceMode=topic：选 topic-critic-chapter.md；tools 含 WebSearch", async () => {
+    const calls: SpawnCall[] = [];
+    const out = JSON.stringify({ verdict: "reject", fixes: ["第 3 段技术陈述有误"] });
+    const spawn = spawnReturning("```json\n" + out + "\n```", calls);
+
+    const r = await critic({ key: "demo-topic", mode: "chapter", slug: "macro-reg", sourceMode: "topic", spawn });
+
+    expect(r.ok).toBe(true);
+    expect(r.verdict).toBe("reject");
+    expect(r.fixes.length).toBe(1);
+    const sysIdx = calls[0].args.indexOf("--append-system-prompt-file");
+    expect(calls[0].args[sysIdx + 1].endsWith("topic-critic-chapter.md")).toBe(true);
+    expectTopicTools(r.cmd);
+  });
+
+  test("默认 sourceMode（不传）= repo，outline 仍用 critic-outline.md（向后兼容）", async () => {
+    const calls: SpawnCall[] = [];
+    const out = JSON.stringify({ verdict: "approve", fixes: [] });
+    const spawn = spawnReturning("```json\n" + out + "\n```", calls);
+    const r = await critic({ key: "demo", mode: "outline", spawn });
+    const sysIdx = calls[0].args.indexOf("--append-system-prompt-file");
+    expect(calls[0].args[sysIdx + 1].endsWith("critic-outline.md")).toBe(true);
+    expectReadonlyTools(r.cmd);
+  });
+});
+
+
 
 describe("assembler", () => {
   let tmpRoot = "";

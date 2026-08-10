@@ -14,6 +14,7 @@
 
 import {
   keyFromRepo,
+  keyFromTopic,
   manifestPath,
   runDir,
   atlasRoot,
@@ -26,6 +27,7 @@ import {
   loadManifest,
   initManifest,
   saveManifest,
+  setStageStatus,
   STAGE_ORDER,
   type Manifest,
   type SourceInfo,
@@ -323,24 +325,27 @@ interface RunDeps {
 }
 
 /**
- * `atlas run <repo>`：算 key → 续跑或新建 → runPipeline。
+ * `atlas run <repo|url|主题>`：三分分流 + 算 key → 续跑或新建 → runPipeline。
  *
- * 流程顺序（task M11）：
- *   1. 算 key = keyFromRepo(repo)。
- *   2. **若 manifest 已存在 → 续跑**（source 从磁盘 manifest 读，忽略新算的 source）。
- *      这一判定优先于 source 解析——避免续跑时若用户传了略微不同的路径（或本地源已
- *      被移动）反而无法续跑。续跑只需 key 命中既有 Run 目录即可。
- *   3. 否则（新建）：判断 source（URL/本地）+ 校验本地存在 → initManifest + save → runPipeline。
+ * 流程顺序（task 13 topic 模式扩展）：
+ *   1. **三分分流 source**（先于 key 派生）：
+ *      - `http(s)://` / `git@` 开头 → `{kind:"url", ...}`。
+ *      - 否则 resolveLocalSource：存在 → `{kind:"local", ...}`；不存在 → `{kind:"topic", ...}`
+ *        （既非 URL 也非存在路径 → 按主题处理，task 13）。
+ *   2. **key 派生按 source.kind 分流**：topic 用 keyFromTopic，其余用 keyFromRepo。
+ *   3. **若 manifest 已存在 → 续跑**（source 从磁盘 manifest 读，忽略新算的 source）。
+ *   4. 否则（新建）：initManifest → topic 模式预置 acquire/survey=done → save → runPipeline。
  *
- * source 判定（design §10 / FR-1，仅新建路径走）：
+ * source 判定（design §10 / FR-1 + task 13 topic 扩展，仅新建路径走）：
  *   - `http(s)://` / `git@` 开头 → `{kind:"url", ref:repo, localPath:null}`。
  *   - 否则当本地路径 → resolveLocalSource（转绝对 + 校验存在）→
- *     `{kind:"local", ref:repo, localPath:absPath}`。不存在 → 报错退出码 1。
+ *     `{kind:"local", ref:repo, localPath:absPath}`。不存在 → **不再报错退出**，
+ *     而是置 `{kind:"topic", ref:repo, localPath:null}`（行为变更，task 13）。
  */
 async function cmdRun(parsed: ParsedArgs, deps: RunDeps): Promise<number> {
   const { positional, flags } = parsed;
   if (positional.length < 1) {
-    deps.err("用法: atlas run <repo> [flags]");
+    deps.err("用法: atlas run <repo|url|主题> [flags]");
     return 1;
   }
   const repo = positional[0];
@@ -348,7 +353,24 @@ async function cmdRun(parsed: ParsedArgs, deps: RunDeps): Promise<number> {
   // 转 RunPipelineFlags（可能抛错：stage 名/数值非法）。
   const pf = toPipelineFlags(flags);
 
-  const key = keyFromRepo(repo);
+  // ---- 三分分流：URL / 本地存在路径 / 主题串（task 13）----
+  // 注意顺序：source 判定**先于** key 派生，因 topic 的 key 由 keyFromTopic 算（其余由 keyFromRepo）。
+  let source: SourceInfo;
+  if (/^(https?:\/\/|git@)/i.test(repo)) {
+    source = { kind: "url", ref: repo, localPath: null };
+  } else {
+    // 先判本地路径是否存在；不存在则当主题（task 13）。
+    try {
+      const { absPath } = resolveLocalSource(repo);
+      source = { kind: "local", ref: repo, localPath: absPath };
+    } catch {
+      // 既非 URL 也非存在路径 → topic（纯主题教学）。
+      source = { kind: "topic", ref: repo, localPath: null };
+    }
+  }
+
+  // key 派生按 source.kind 分流：topic 用 keyFromTopic，其余用 keyFromRepo。
+  const key = source.kind === "topic" ? keyFromTopic(repo) : keyFromRepo(repo);
 
   // 1) 续跑优先：manifest 已存在 → source 从磁盘读。
   const mpath = manifestPath(key);
@@ -367,25 +389,19 @@ async function cmdRun(parsed: ParsedArgs, deps: RunDeps): Promise<number> {
     return 0;
   }
 
-  // 2) 新建：判断 source（URL 还是本地路径）。
-  let source: SourceInfo;
-  if (/^(https?:\/\/|git@)/i.test(repo)) {
-    source = { kind: "url", ref: repo, localPath: null };
-  } else {
-    try {
-      const { absPath } = resolveLocalSource(repo);
-      source = { kind: "local", ref: repo, localPath: absPath };
-    } catch (e) {
-      deps.err(`本地源路径不存在: ${repo}`);
-      deps.err(`  (${(e as Error).message})`);
-      return 1;
-    }
-  }
+  // 2) initManifest + save。
+  let m = initManifest(key, source);
 
-  // 3) initManifest + save → 再跑。
-  const m = initManifest(key, source);
+  // topic 模式预处理（task 13）：预置 acquire/survey=done，让 findNextPending 第一个命中 outline。
+  // topic 模式无参考仓库，acquire（clone/resolve）与 survey（repo-map）均无意义，直接跳过。
+  if (source.kind === "topic") {
+    deps.log(`[atlas] topic 模式：预置 acquire/survey=done，从 outline 起跑`);
+    m = setStageStatus(m, "acquire", "done", { cmd: "(topic 模式，无 acquire)" });
+    m = setStageStatus(m, "survey", "done", { cmd: "(topic 模式，无 survey)" });
+  }
   await saveManifest(key, m);
 
+  // 3) 跑流水线。
   const result = await deps.runPipeline({
     key,
     source,
@@ -698,11 +714,16 @@ function printUsageTo(err: (m: string) => void): void {
 const USAGE = `atlas 0.1.0 — Code Atlas CLI
 
 用法:
-  atlas run <repo>                              新建或自动续跑 Run
+  atlas run <repo|url|主题>                     新建或自动续跑 Run
   atlas resume <key> [--from <stage>] [--only <stage>] [--force]   续跑/重跑
   atlas list                                    列出已有 Run
   atlas clean <key> [-y]                        删除某 Run 的工作区
   atlas show <key>                              打印 manifest 摘要
+
+输入形式（atlas run）:
+  仓库 URL   https://github.com/owner/repo.git
+  本地路径   ./my-repo 或 D:/code/repo（须存在）
+  主题串     "怎么写一个 vue macro 宏"（既非 URL 也非存在路径 → 纯主题教学，无参考仓库）
 
 全局 flag（run/resume 生效）:
   --concurrency <n>     逐章并发上限（默认 ${DEFAULT_CONCURRENCY}）

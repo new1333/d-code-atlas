@@ -78,6 +78,7 @@ async function writeChapter(
   maxRounds: number,
   sourcePath?: string,
   chapterContext?: ChapterContext | null,
+  isTopic: boolean = false,
 ): Promise<ChapterWriteResult> {
   // 1) 确认 research.md 存在（缺料 → write failed）。
   const hasResearch = await pathExists(researchPath(key, slug));
@@ -110,6 +111,7 @@ async function writeChapter(
       spawn,
       feedback: prevFixes,
       chapterContext: chapterContext ?? undefined,
+      mode: isTopic ? "topic" : "repo",
     });
     lastCmd = writerOutcome.cmd;
 
@@ -130,7 +132,7 @@ async function writeChapter(
     // Writer 产物从 stdout 提取，Stage 原子落盘。
     await writeText(draftPath(key, slug), writerOutcome.draftMd);
 
-    const critOutcome = await critic({ key, mode: "chapter", slug, spawn, sourcePath });
+    const critOutcome = await critic({ key, mode: "chapter", slug, spawn, sourcePath, sourceMode: isTopic ? "topic" : "repo" });
 
     if (!critOutcome.ok || critOutcome.verdict === null) {
       // Critic 自身失败（claude 非 0 退出 / verdict 解析为 null）。
@@ -200,6 +202,8 @@ export async function write(ctx: StageContext): Promise<StageResult> {
   const maxRounds = ctx.reviewRounds ?? REVIEW_ROUNDS;
   // 本地源绝对路径：透传给 chapter critic 作 --add-dir（critic 需读源码做准确性抽查）。
   const sourcePath = manifest.source.kind === "local" ? (manifest.source.localPath ?? manifest.source.ref) : undefined;
+  // topic 模式（task 13）：writer/critic 走 topic prompt + WebSearch 白名单，无源码。
+  const isTopic = manifest.source.kind === "topic";
 
   // 读 outline。
   let outline: Outline;
@@ -244,7 +248,7 @@ export async function write(ctx: StageContext): Promise<StageResult> {
   const results = await mapPool(
     slugs,
     async (slug) =>
-      writeChapter(key, slug, spawn, model, maxRounds, sourcePath, buildChapterContext(outline, slug)),
+      writeChapter(key, slug, spawn, model, maxRounds, sourcePath, buildChapterContext(outline, slug), isTopic),
     concurrency,
   );
 

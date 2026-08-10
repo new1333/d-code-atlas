@@ -102,15 +102,17 @@ export const STAGE_ORDER: readonly StageName[] = [
  * design §8.3 source 字段：Run 的输入来源。
  * - url：`{ kind:"url", ref:<url>, localPath:null }`（git clone 场景）
  * - local：`{ kind:"local", ref:<原始输入>, localPath:<absPath> }`（原地只读直读，ADR-0005）
+ * - topic：`{ kind:"topic", ref:<主题串>, localPath:null }`（纯主题教学，无参考仓库；
+ *   task 13。acquire/survey 被预置为 done，流水线从 outline 起跑）。
  */
-export type SourceKind = "url" | "local";
+export type SourceKind = "url" | "local" | "topic";
 
 /** design §8.3 source：来源信息。 */
 export interface SourceInfo {
   kind: SourceKind;
-  /** url 场景为 URL 串；local 场景为用户原始输入路径。 */
+  /** url 场景为 URL 串；local 场景为用户原始输入路径；topic 场景为主题/问题串。 */
   ref: string;
-  /** local 场景为解析后的绝对路径；url 场景为 null。 */
+  /** local 场景为解析后的绝对路径；url / topic 场景为 null。 */
   localPath: string | null;
 }
 

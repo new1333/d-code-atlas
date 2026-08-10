@@ -15,6 +15,7 @@
 import { runClaude } from "../lib/run-claude.ts";
 import { runDir } from "../lib/io.ts";
 import { extractCriticVerdict, type CriticVerdict } from "../lib/extract.ts";
+import { TOPIC_READONLY_TOOLS } from "../lib/config.ts";
 import { promptPath, agentAddDirs, type AgentOutcome, type AgentCommonOpts } from "./types.ts";
 
 /** Critic 评审模式：outline（大纲）/ chapter（单章草稿）。 */
@@ -26,6 +27,14 @@ export interface CriticOpts extends AgentCommonOpts {
   key: string;
   /** 评审模式：outline 评大纲、chapter 评单章草稿。 */
   mode: CriticMode;
+  /**
+   * 来源模式（task 13 topic 模式）。
+   * ⚠️ 字段名是 `sourceMode` 而非 `mode`——`mode` 已被 `CriticMode="outline"|"chapter"` 占用。
+   * - `"repo"`（默认）：仓库模式现状（读 repo-map + 源码）。
+   * - `"topic"`：topic 模式（凭知识 + WebSearch 评审，用 topic-critic-*.md prompt + WebSearch 白名单）。
+   * 非破坏性扩展，默认 `"repo"` 向后兼容。
+   */
+  sourceMode?: "repo" | "topic";
   /** chapter 模式下必填：被评审章节的 slug。outline 模式不用。 */
   slug?: string;
 }
@@ -57,6 +66,7 @@ interface CriticVerdictPartial {
  */
 export async function critic(opts: CriticOpts): Promise<CriticOutcome> {
   const { key, mode, slug, model, spawn, sourcePath } = opts;
+  const sourceMode = opts.sourceMode ?? "repo";
 
   if (mode === "chapter" && !slug) {
     // chapter 模式缺 slug：直接返回失败（不调 claude，省一次调用）。
@@ -72,23 +82,37 @@ export async function critic(opts: CriticOpts): Promise<CriticOutcome> {
   }
 
   const cwd = runDir(key);
+  // system prompt 按 sourceMode × mode 双维度选：topic 模式用 topic-critic-*.md，repo 模式用 critic-*.md。
   const systemPromptPath = promptPath(
-    mode === "outline" ? "critic-outline" : "critic-chapter",
+    sourceMode === "topic"
+      ? mode === "outline"
+        ? "topic-critic-outline"
+        : "topic-critic-chapter"
+      : mode === "outline"
+        ? "critic-outline"
+        : "critic-chapter",
   );
 
   const prompt =
     mode === "outline"
-      ? buildOutlinePrompt(key, cwd)
-      : buildChapterPrompt(key, cwd, slug as string);
+      ? sourceMode === "topic"
+        ? buildTopicOutlinePrompt(key, cwd)
+        : buildOutlinePrompt(key, cwd)
+      : sourceMode === "topic"
+        ? buildTopicChapterPrompt(key, cwd, slug as string)
+        : buildChapterPrompt(key, cwd, slug as string);
 
   const result = await runClaude({
     prompt,
     systemPromptPath,
     cwd,
     tools: "readonly",
+    // topic 模式用 WebSearch 白名单（在只读基础上加 WebSearch 做外部 grounding）。
+    ...(sourceMode === "topic" ? { toolsOverride: TOPIC_READONLY_TOOLS } : {}),
     model,
     spawn,
     // 本地源在 cwd 之外，必须 --add-dir 声明（critic 需读源码做准确性抽查）。
+    // topic 模式无源码目录，agentAddDirs(undefined) 只返回 promptsDir。
     addDirs: agentAddDirs(sourcePath),
     // critic 对「评审」任务高概率产出 markdown 报告而非契约 JSON（实测，模型倾向问题）。
     // 给额外重试机会（3 次 = 共 4 次尝试）；全部失败时 outline stage 会降级接受草稿。
@@ -207,6 +231,103 @@ function buildChapterPrompt(key: string, cwd: string, slug: string): string {
     "     **不要因「少于 2 条」就机械 reject 机制稀薄章**——判断这 1 条是否真讲清了「为什么这么设计」。",
     "全过 → approve；任一不过 → reject + 具体可执行修改点（指明 draft 的哪一处 + 违反哪条标准 + 怎么改）。",
     "全程**只读**：禁止 Write/Edit；绝不自己生产 draft/replica 内容（只描述「Writer 应该怎么改」）。",
+    "",
+    "## 再次强调输出格式",
+    "**只输出 ```json fence 包裹的 {verdict, fixes} JSON，不写任何 markdown 正文。**",
+  ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// topic 模式 user prompt（sourceMode === "topic"）
+// ---------------------------------------------------------------------------
+
+/** topic 模式 outline 评审 user prompt。 */
+function buildTopicOutlinePrompt(key: string, cwd: string): string {
+  return [
+    "你是 Topic Critic（对抗评审员）· Outline 模式。请对 Architect 产出的主题大纲做对抗评审。",
+    "",
+    "## ⚠️ 输出格式（最重要，违反则本次评审作废）",
+    "你的最终回复**必须且只能**是一个 ```json fence 包裹的 JSON 对象，**fence 之外绝不写任何文字**。",
+    "不要写 markdown 报告、不要写「评审结论」「总体裁决」之类的标题或正文——那些会让解析失败。",
+    "你的所有评审意见都放进 JSON 的 fixes 数组（每条是一个字符串，可长可短）。",
+    "正确示例（approve）：",
+    "```json",
+    '{ "verdict": "approve", "fixes": [] }',
+    "```",
+    "正确示例（reject）：",
+    "```json",
+    '{ "verdict": "reject", "fixes": ["章节 X 违反标准①：dependsOn 引用未定义 slug...", "..."] }',
+    "```",
+    "",
+    "## 本次输入",
+    `- Run key: ${key}（key 由主题串 slugify 得来，是主题的提示）`,
+    `- cwd: ${cwd}（topic 模式无 repo-map.json、无 source/，相对 cwd 读 work/outline.json）`,
+    "",
+    "## 读取范围",
+    "- work/outline.json：被评审的大纲（含 chapters[]；topoOrder 可能尚未注入，你自己用 dependsOn 复算拓扑序做交叉校验）。",
+    "- **无 repo-map.json、无 source/**（topic 模式）。",
+    "- **WebSearch 是你的外部 grounding**：可用来调研主题的子问题结构（核对覆盖度）和关键概念是否存在。",
+    "",
+    "## 任务",
+    "按 4 条验收标准逐条判定（任一不过即 reject）：",
+    "  ① 自底向上可验证（DAG 无环、无自环、无未定义引用、dependsOn 闭包按拓扑序在其之前）。",
+    "  ② 覆盖度（主题的子问题是否拆全；可用 WebSearch 调研主题结构核对）。",
+    "  ③ 粒度（章数 8~20，无杂物箱章；summary 点出原理而非概念名罗列）。",
+    "  ④ 深度合理性（每章聚焦单一可理解概念，summary 点出设计原理/取舍而非功能描述）。",
+    "全过 → approve；任一不过 → reject + 具体可执行修改点。",
+    "全程**只读**：禁止 Write/Edit；绝不自己生产 outline 内容（只描述「Architect 应该怎么改」）。",
+    "",
+    "## 再次强调输出格式",
+    "**只输出 ```json fence 包裹的 {verdict, fixes} JSON，不写任何 markdown 正文。**",
+  ].join("\n");
+}
+
+/** topic 模式 chapter 评审 user prompt。 */
+function buildTopicChapterPrompt(key: string, cwd: string, slug: string): string {
+  return [
+    "你是 Topic Critic（对抗评审员）· Chapter 模式。请对 Writer 产出的单章草稿做对抗评审。",
+    "",
+    "## ⚠️ 输出格式（最重要，违反则本次评审作废）",
+    "你的最终回复**必须且只能**是一个 ```json fence 包裹的 JSON 对象，**fence 之外绝不写任何文字**。",
+    "不要写 markdown 报告、不要写「评审结论」「总体裁决」之类的标题或正文——那些会让解析失败。",
+    "你的所有评审意见都放进 JSON 的 fixes 数组（每条是一个字符串，可长可短）。",
+    "正确示例（approve）：",
+    "```json",
+    '{ "verdict": "approve", "fixes": [] }',
+    "```",
+    "正确示例（reject）：",
+    "```json",
+    '{ "verdict": "reject", "fixes": ["draft 第 X 段技术陈述有误：...应改为...", "..."] }',
+    "```",
+    "",
+    "## 本次输入",
+    `- Run key: ${key}`,
+    `- 本章 slug: ${slug}`,
+    `- cwd: ${cwd}（topic 模式无 source/，相对 cwd 读 work/...）`,
+    "",
+    "## 读取范围",
+    "- work/outline.json：取本章的 dependsOn/layer/title/summary（topic 模式 sourceFiles 为空数组，忽略）。",
+    `- work/chapters/${slug}/draft.md：被评审的章节草稿（含内嵌演示代码块）。`,
+    `- work/chapters/${slug}/research.md：Reader 的事实摘录（交叉核对依据）。`,
+    "- **无 source/**（topic 模式无参考仓库）。",
+    "- **WebSearch 是你的外部 grounding**：可用来核对 draft 关键技术断言是否与官方文档/常识一致。",
+    "",
+    "## 任务",
+    "按 6 条验收标准逐条判定（任一不过即 reject）：",
+    "  ① 准确（draft 技术陈述对照官方文档/常识可查证，不误导；可用 WebSearch 核对）。",
+    "  ② 衔接（用到的前置概念确实在 dependsOn 章节已讲解，或正文补足）。",
+    "  ③ 原理演示自洽（有从零实现的最小演示演透核心思想；topic 无原仓库，不适用「不重合 sourceFiles/不 import 原仓库」）。",
+    "     **优先 TS/JS**：能用 TS/JS 演透的就用 TS/JS；不强求 bun run。",
+    "  ④ 清晰（有动机/核心思想/心智模型/执行轨迹/输入输出之一组，不是流水账）。",
+    "  ⑤ 教学·非文档导读（文体硬标准）：叙事主轴不能是文档/API walkthrough；",
+    "     **正文出现任何文档式对照→直接 reject**（文档 URL/「见官方文档」/「文档对照」小节，一律禁止——依据只留 research.md）；",
+    "     API 签名/配置项罗列篇幅不得超「心智模型+关键权衡+原理演示」合计篇幅。",
+    "  ⑥ 原理·关键权衡（产品核心硬标准）：全章必须讲清「为什么这么设计」，有**至少 1 条**高质量的「做了 X 选择→换来 Y→代价 Z」关键权衡，",
+    "     且权衡篇幅 ≥ 演示篇幅。机制丰富章通常 2～4 条；机制稀薄章可只 1 条，但该条须真讲透设计动机。",
+    "     reject 条件：全章 0 条权衡、或仅有空话、或权衡篇幅<演示篇幅。",
+    "     **不要因「少于 2 条」就机械 reject 机制稀薄章**。",
+    "全过 → approve；任一不过 → reject + 具体可执行修改点（指明 draft 的哪一处 + 违反哪条标准 + 怎么改）。",
+    "全程**只读**：禁止 Write/Edit；绝不自己生产 draft 内容（只描述「Writer 应该怎么改」）。",
     "",
     "## 再次强调输出格式",
     "**只输出 ```json fence 包裹的 {verdict, fixes} JSON，不写任何 markdown 正文。**",

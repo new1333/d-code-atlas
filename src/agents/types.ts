@@ -29,7 +29,13 @@ export type PromptRole =
   | "reader"
   | "writer"
   | "assembler"
-  | "synthesizer";
+  | "synthesizer"
+  // topic 模式（task 13）专用 prompt 变体：纯主题教学，无参考仓库。
+  | "topic-architect"
+  | "topic-reader"
+  | "topic-critic-outline"
+  | "topic-critic-chapter"
+  | "topic-writer";
 
 /**
  * 解析角色 prompt 文件的绝对路径。

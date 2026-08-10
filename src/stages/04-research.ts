@@ -44,6 +44,8 @@ export async function research(ctx: StageContext): Promise<StageResult> {
   const concurrency = ctx.concurrency ?? DEFAULT_CONCURRENCY;
   // 本地源绝对路径：透传给 reader 作 --add-dir（cwd 之外的源目录需声明才可读）。
   const sourcePath = manifest.source.kind === "local" ? (manifest.source.localPath ?? manifest.source.ref) : undefined;
+  // topic 模式（task 13）：reader 走 topic prompt + WebSearch 白名单，无源码。
+  const isTopic = manifest.source.kind === "topic";
 
   // 读 outline（含 chapters + topoOrder）。
   // 若 outline.json 缺失/解析失败：这是上游异常（outline stage 应已 done），置 failed。
@@ -97,6 +99,7 @@ export async function research(ctx: StageContext): Promise<StageResult> {
         model,
         spawn,
         sourcePath,
+        mode: isTopic ? "topic" : "repo",
         chapterContext: buildChapterContext(outline, slug) ?? undefined,
       }),
     concurrency,

@@ -188,6 +188,41 @@ export function keyFromRepo(repo: string): string {
   return key === "" ? "repo" : key;
 }
 
+/**
+ * 把主题串 slugify 成 Run key（task 13 topic 模式）。
+ *
+ * 与 `keyFromRepo` 同级导出，唯一调用点是 `src/bin/atlas.ts` cmdRun 的 topic 分支。
+ * 规则：
+ *   1. 截断：保留前 40 字符（按 codePoint，避免把一个 emoji/汉字切成两半）；
+ *   2. slugify：转小写 → 非 `[a-z0-9]` 折叠为单个 `-` → 去首尾 `-`；
+ *   3. 防碰撞：末尾追加 `-` + 原始主题串长度的 base36 表示（同主题多次跑复用 key
+ *      是预期续跑语义；不同主题但前缀相同需靠长度 hash 区分）。
+ *   4. 空输入 → `"topic"`。
+ */
+export function keyFromTopic(topic: string): string {
+  const input = (topic ?? "").trim();
+  if (input === "") return "topic";
+
+  // 1) 截断（按 codePoint，避免拆半个汉字/emoji）。
+  const chars = Array.from(input);
+  const truncated = chars.slice(0, 40).join("");
+
+  // 2) slugify：与 keyFromRepo 第 3 步同样的折叠规则。
+  let key = truncated
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  // 3) 防碰撞：追加原始主题串长度的 base36。
+  const lenTag = input.length.toString(36);
+  if (key === "") {
+    key = `topic-${lenTag}`;
+  } else {
+    key = `${key}-${lenTag}`;
+  }
+  return key;
+}
+
 // ---------------------------------------------------------------------------
 // 文件系统原语
 // ---------------------------------------------------------------------------

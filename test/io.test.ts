@@ -18,6 +18,7 @@ import {
   replicaDir,
   joinPath,
   keyFromRepo,
+  keyFromTopic,
   ensureDir,
   pathExists,
   readJson,
@@ -113,6 +114,66 @@ describe("keyFromRepo", () => {
   test("空串 / 纯非法 → 兜底 repo", () => {
     expect(keyFromRepo("")).toBe("repo");
     expect(keyFromRepo("???")).toBe("repo");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// keyFromTopic（task 13 topic 模式）
+// ---------------------------------------------------------------------------
+
+describe("keyFromTopic", () => {
+  test("中文主题：ASCII 段保留 + 中文折叠 + 长度 hash", () => {
+    // "怎么写一个 vue macro 宏"：非 ASCII 折叠为 -，vue/macro 保留
+    const key = keyFromTopic("怎么写一个 vue macro 宏");
+    expect(key.startsWith("vue-macro-")).toBe(true);
+    expect(key).toMatch(/^[-a-z0-9]+$/);
+  });
+
+  test("英文主题：保留可读 slug + 长度 hash 后缀", () => {
+    const key = keyFromTopic("how to write a vue macro");
+    expect(key.startsWith("how-to-write-a-vue-macro")).toBe(true);
+    // 末尾追加 -<length base36>（长度 24 → base36 = "o"）
+    expect(key).toBe("how-to-write-a-vue-macro-o");
+  });
+
+  test("特殊字符折叠为 -", () => {
+    const key = keyFromTopic("vue@macro!!!");
+    // @ 与 ! 折叠为 -，长度 13 → base36 = "d"
+    expect(key.startsWith("vue-macro")).toBe(true);
+  });
+
+  test("超长主题截断到 40 字符再 slugify", () => {
+    const long = "a".repeat(100);
+    const key = keyFromTopic(long);
+    // 截断后 40 个 a，slug = "aaaa..."(40 个) + "-" + length(100).toString(36) = "2s"
+    expect(key.startsWith("a".repeat(40))).toBe(true);
+    expect(key.endsWith("-2s")).toBe(true); // 100 → base36 = "2s"
+  });
+
+  test("空输入 → topic", () => {
+    expect(keyFromTopic("")).toBe("topic");
+    expect(keyFromTopic("   ")).toBe("topic");
+  });
+
+  test("纯非 ASCII（无英文残留）→ topic-<lenTag>", () => {
+    // 纯中文，折叠后 slug 为空，回退为 topic-<lenTag>
+    const key = keyFromTopic("宏");
+    expect(key).toBe("topic-1"); // 长度 1 → base36 = "1"
+  });
+
+  test("同前缀不同长度的主题 key 不同（防碰撞）", () => {
+    const a = keyFromTopic("vue macro");
+    const b = keyFromTopic("vue macro basics");
+    // 长度不同 → lenTag 不同 → key 不同
+    expect(a).not.toBe(b);
+    expect(a.startsWith("vue-macro")).toBe(true);
+  });
+
+  test("emoji 不被拆成两半（按 codePoint 截断）", () => {
+    // emoji 是代理对；按 codePoint 截断不会拆坏
+    const key = keyFromTopic("🚀".repeat(45));
+    // 纯 emoji 折叠为空 slug → topic-<lenTag>；45 按 codePoint 计数
+    expect(key.startsWith("topic-")).toBe(true);
   });
 });
 

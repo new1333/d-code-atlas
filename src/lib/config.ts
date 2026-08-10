@@ -25,6 +25,13 @@ export const READONLY_TOOLS = ["Read", "Glob", "Grep"];
 export const WRITE_TOOLS = ["Read", "Glob", "Grep", "Write", "Edit"];
 
 /**
+ * topic 模式只读角色工具白名单：在只读基础上加 WebSearch（task 13）。
+ * topic 模式无参考仓库，reader/architect/critic/writer 凭知识 + WebSearch 做外部 grounding
+ * （查官方文档/规范作准确性兜底）。writer topic 模式同样用这份（writer 本是 readonly）。
+ */
+export const TOPIC_READONLY_TOOLS = ["Read", "Glob", "Grep", "WebSearch"];
+
+/**
  * 把 `claude`（npm 全局装的 shell 包装脚本）解析到真正的可执行文件路径。
  *
  * **核心问题（Windows 上的根因）**：`npm i -g @anthropic-ai/claude-code` 在 Windows 装出

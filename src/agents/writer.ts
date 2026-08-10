@@ -16,6 +16,7 @@
 import { runClaude } from "../lib/run-claude.ts";
 import { workDir, chapterDir, sourceDir } from "../lib/io.ts";
 import { extractFence } from "../lib/extract.ts";
+import { TOPIC_READONLY_TOOLS } from "../lib/config.ts";
 import { type ChapterContext } from "../lib/chapter-context.ts";
 import { promptPath, type AgentOutcome, type AgentCommonOpts } from "./types.ts";
 
@@ -25,6 +26,14 @@ export interface WriterOpts extends AgentCommonOpts {
   key: string;
   /** 本章 slug（写作对象）。 */
   slug: string;
+  /**
+   * 运行模式（task 13 topic 模式）：
+   * - `"repo"`（默认）：仓库模式现状（system prompt=writer.md，addDirs 含 sourceDir）。
+   * - `"topic"`：topic 模式（system prompt=topic-writer.md，addDirs 去掉 sourceDir，
+   *   toolsOverride 加 WebSearch 让 writer 也能查证）。
+   * 非破坏性扩展，默认 `"repo"` 向后兼容。
+   */
+  mode?: "repo" | "topic";
   /**
    * 对抗评审反馈（可选，M09 write stage 透传）。
    * 上一轮 Critic reject 时给出的 fixes 列表；Writer 据此修订 draft/replica。
@@ -89,6 +98,7 @@ function buildChapterContextBlock(ctx: ChapterContext): string {
  */
 export async function writer(opts: WriterOpts): Promise<WriterOutcome> {
   const { key, slug, model, spawn, feedback, chapterContext } = opts;
+  const mode = opts.mode ?? "repo";
 
   // cwd = chapterDir（chapters/{slug}/），让 claude 在自己的章节目录里写 draft.md 最自然。
   // 实测 cwd=workDir 时 claude 对"写 chapters/{slug}/ 子目录"产生权限幻觉（声称被拦但不真尝试）；
@@ -96,7 +106,8 @@ export async function writer(opts: WriterOpts): Promise<WriterOutcome> {
   // outline.json/research.md 在 workDir（cwd 之外），通过 --add-dir 声明可读。
   const cwd = chapterDir(key, slug);
   const wdir = workDir(key);
-  const systemPromptPath = promptPath("writer");
+  // system prompt 按 mode 选：topic 模式用 topic-writer.md（删改 topic 不适用规则），repo 模式用 writer.md。
+  const systemPromptPath = promptPath(mode === "topic" ? "topic-writer" : "writer");
 
   // 章节上下文块：stage 已算好（位置 + 前后驱 + dependsOn 各章主题），插进 user prompt。
   // 省略时（stage 算不出）不插，Writer 不受影响——向后兼容。
@@ -120,7 +131,7 @@ export async function writer(opts: WriterOpts): Promise<WriterOutcome> {
     `你是 Writer（章节撰写员）。本章 slug: ${slug}。`,
     "",
     "## 输入",
-    `- cwd: ${cwd}（含 research.md；相对 cwd 读 ../../../outline.json、../../../source/）`,
+    `- cwd: ${cwd}（含 research.md；相对 cwd 读 ../../../outline.json${mode === "topic" ? "" : "、../../../source/"}）`,
     "- 写作规范的完整要求见 system prompt（文风、结构、关键权衡、演示、mermaid 等），这里只给运行时信息。",
     "",
     "## 输出方式（提醒，完整规范见 system prompt）",
@@ -130,17 +141,20 @@ export async function writer(opts: WriterOpts): Promise<WriterOutcome> {
 
   const result = await runClaude({
     prompt,
-    // system prompt = writer.md（写作规范：文风、结构、权衡、mermaid 等）。
+    // system prompt = writer.md（repo 模式）/ topic-writer.md（topic 模式）：写作规范的单一权威。
     // user prompt 只含运行时变量（slug、cwd、章节上下文、Critic 反馈）。
     systemPromptPath,
     cwd,
     tools: "readonly",
+    // topic 模式用 WebSearch 白名单（在只读基础上加 WebSearch，让 writer 也能查证）。
+    ...(mode === "topic" ? { toolsOverride: TOPIC_READONLY_TOOLS } : {}),
     model,
     spawn,
-    // workDir（outline.json/research.md 在此）+ sourceDir（claude 读源码核对技术准确性）。
+    // workDir（outline.json/research.md 在此）+ sourceDir（repo 模式：claude 读源码核对技术准确性）。
     // 实测 claude 的 --add-dir 不递归：只声明 workDir 时，读 work/source/ 下源码会被拦，
     // 导致 writer 卡在"等授权读源码"。必须显式声明 sourceDir。
-    addDirs: [wdir, sourceDir(key)],
+    // topic 模式无源码目录，去掉 sourceDir（加了反而触发 claude 的「等授权读」幻觉）。
+    addDirs: mode === "topic" ? [wdir] : [wdir, sourceDir(key)],
     timeoutMs: 15 * 60 * 1000,
     // retries：claude headless 偶发「声称被拦」/空回复（不产 fence）→ validate 触发重试。
     // 历史为 0（无重试），导致偶发失败直接判 fail（pinia run 的 diagnostics/pinia-instance 两章即如此）。

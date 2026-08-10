@@ -1,7 +1,8 @@
 # Task 13 · Topic 模式（无参考仓库、纯主题教学）
 
-> 状态：**待执行**（计划已审定，尚未实现）
+> 状态：**已实现**（2026-08-10，第 1~6 层落地，tsc + atlas 全量测试通过；端到端冒烟待用户在本机跑）
 > 关联：无（新里程碑）。与 `prompt-optimization` 同属引擎能力扩展。
+> 修订（2026-08-10）：依代码核查修正若干断言——writer.md 现已被注入为 system prompt（提交 `2c865c9`）、`PromptRole` 需扩展、critic 字段名冲突、第 4 层改动面被低估、若干行号漂移；详见文末 §8。
 
 ## 1. 目标
 
@@ -60,7 +61,7 @@ export type SourceKind = "url" | "local" | "topic";
 
 #### 3.1.2 `src/lib/io.ts` — 新增 `keyFromTopic(topic)`
 
-紧邻 `keyFromRepo`（`io.ts:131`）新增兄弟函数：
+紧邻 `keyFromRepo`（`io.ts:158`——提交 `0e7544e` 抽出 `urlPathSegments` 后下移）新增兄弟函数：
 
 ```typescript
 export function keyFromTopic(topic: string): string
@@ -85,7 +86,7 @@ writer topic 模式仍用 `TOPIC_READONLY_TOOLS`（writer 本就是 readonly，�
 
 ### 第 2 层：Prompt 文件（独立文件，无依赖）
 
-新增 4 个 topic prompt 文件。每份对应一个 agent 的 topic 变体，**只写 topic 相关指令，零源码依赖逻辑**。repo 模式现有 prompt 文件零改动。
+新增 5 个 topic prompt 文件。每份对应一个 agent 的 topic 变体（含 writer，见 §3.2.5），**只写 topic 相关指令，零源码依赖逻辑**。repo 模式现有 prompt 文件零改动（两套解耦）。
 
 #### 3.2.1 `src/prompts/topic-architect.md`
 
@@ -126,16 +127,31 @@ writer topic 模式仍用 `TOPIC_READONLY_TOOLS`（writer 本就是 readonly，�
 | ✅ 保留 | ⑤ 教学·非源码导读（正文禁源码引用） | 通用（topic 无源码更天然成立） |
 | ✅ 保留 | ⑥ 原理·关键权衡（至少 1 条「选择→换来→代价」） | 产品核心硬标准，通用 |
 
-> **writer 不新建 prompt 文件**：writer.ts 的 inline prompt 直接加 topic 分支（见 3.3.4）。遵循现有架构契约——writer.md 不注入，实际指令在 writer.ts inline（`writer.ts:6-14` 注释明确说明）。
+#### 3.2.5 `src/prompts/topic-writer.md`
+
+> ⚠️ **本节相对原计划的重大修正**：提交 `2c865c9`（"eliminate Writer dual-track system, reinject writer.md as system prompt"）之后，`writer.md` **已经作为 system prompt 被注入**（`writer.ts:99` `promptPath("writer")` → `:135` `systemPromptPath`），`writer.ts` 的 inline user prompt 极简、只承载运行时变量。原计划「writer 不新建 prompt 文件、inline prompt 加 topic 分支」基于已失效的旧认知，**作废**。
+
+从 `writer.md`（352 行）派生一份 `topic-writer.md`，删改 topic 模式不适用的规则：
+
+| writer.md 位置 | 规则 | topic 模式处理 |
+|---|---|---|
+| `:50`（§2 工具约束） | 用 Read/Glob/Grep 读源码核对技术准确性 | 删「读源码」；改「凭 research.md + WebSearch 核对」 |
+| `:164`/`:181`/`:348`（§5.2/§5.3/§7） | 正文禁绝源码对照 | 保留（topic 无源码，天然成立） |
+| `:189`（§5.4） | 不 import 原仓库、不与 sourceFiles 重合 >50% | 删（无原仓库） |
+| `:193`（§5.4） | 演示载体：优先 TS/JS，讲不透才用原仓库主语言 | 改为「演示载体首选 TS/JS（读者最易跑通），无原仓库语言约束」 |
+
+writer 的文风宪法（§5.1-5.8、生硬抽象词表、正反例、自检清单）整体保留——topic 模式同样需要。writer.ts 侧改动见 §3.3.4。
 
 ### 第 3 层：Agent 层（按 source.kind 选 prompt + tools）
 
 每个 agent 新增可选 `mode?: "repo" | "topic"` 入参，默认 `"repo"`（非破坏性扩展，向后兼容）。`mode === "topic"` 时：
 
-- `promptPath` 指向 topic 变体（通过 `src/agents/types.ts` 的 `promptPath(name)`，name 传 `"topic-architect"` 等）。
+- **前置：扩展 `PromptRole`**（`src/agents/types.ts:24-32`）。当前 `promptPath(role: PromptRole)` 的 `role` 是受限联合枚举（`"surveyor" | "architect" | "critic-outline" | "critic-chapter" | "reader" | "writer" | ...`），**不含 topic 角色**。必须先把 `"topic-architect" | "topic-reader" | "topic-critic-outline" | "topic-critic-chapter" | "topic-writer"` 加进 `PromptRole`，否则 `tsc --noEmit` 直接报错。这是所有 agent 共用的前置。
+- `promptPath` 指向 topic 变体（扩展后的 `PromptRole` 传 `"topic-architect"` 等）。
 - `runClaude` 的 `tools` 字段无法直接传 topic 工具集（现有 `tools: ToolMode = "readonly" | "write"` 是枚举）——**需要扩展 `ClaudeRunOptions`**（见 3.3.0）。
 - 不声明 `sourceDir` 的 `--add-dir`。
 - user prompt 砍掉「读 source/repo-map」指令，改为「凭知识 + WebSearch」。
+- ⚠️ **critic 不能用 `mode` 这个字段名**（见 §3.3.3）：`CriticMode = "outline" | "chapter"` 已占用 `mode`。critic 的 topic/repo 信号改用 `sourceMode`。
 
 #### 3.3.0 `src/lib/run-claude.ts` — 扩展 tools 支持 topic 白名单
 
@@ -163,34 +179,41 @@ writer topic 模式仍用 `TOPIC_READONLY_TOOLS`（writer 本就是 readonly，�
 
 #### 3.3.3 `src/agents/critic.ts`
 
-`CriticOpts` 加 `mode?`。topic 模式：
+⚠️ **字段名冲突**：`CriticOpts.mode` 已是 `CriticMode = "outline" | "chapter"`（`critic.ts:21,28`），语义是「评大纲/评单章」。topic/repo 信号**不能用 `mode`**，改用新字段 `sourceMode?: "repo" | "topic"`（默认 `"repo"`）。
 
-- `systemPromptPath` 指向 `topic-critic-outline` 或 `topic-critic-chapter`（按 mode + critic mode 双维度选）。
+topic 模式（`sourceMode === "topic"`）：
+
+- `systemPromptPath` 按**双维度**选（`sourceMode` × `mode`）：`promptPath(sourceMode === "topic" && mode === "outline" ? "topic-critic-outline" : sourceMode === "topic" ? "topic-critic-chapter" : mode === "outline" ? "critic-outline" : "critic-chapter")`。
 - `toolsOverride: TOPIC_READONLY_TOOLS`。
-- user prompt（`critic.ts:142-144` outline / `188-190` chapter）砍掉「源码」读取范围段。
+- user prompt（`critic.ts:139-144` outline「读取范围」/ `183-191` chapter「读取范围」）砍掉「源码」读取段。
 
 #### 3.3.4 `src/agents/writer.ts`
 
-`WriterOpts` 加 `mode?`。**inline prompt**（`writer.ts:121-214`）加 topic 分支：
+> ⚠️ **原方案作废**（基于旧认知「writer.md 不注入」）。现状（提交 `2c865c9` 之后）：`writer.md` 已作为 system prompt 注入（`writer.ts:99` `promptPath("writer")` → `:135` `systemPromptPath`）；inline user prompt（`:119-129`）极简，只承载 slug/cwd/章节上下文/Critic 反馈等运行时变量。原计划引用的 `writer.ts:145/200-207/208/227` 全部对不上——那些规则在 `writer.md`，不在 inline prompt。
 
-- 删掉「读 `../../../source/` 核对技术准确性」（`writer.ts:145`）。
-- 删掉「演示载体按原仓库语言」「不 import 原仓库」「与 sourceFiles 重合」段（`writer.ts:200-207`）。
-- 改为「凭 research.md 里的知识写演示；演示载体首选 TS/JS（读者最易跑通）」。
-- `addDirs`（`writer.ts:227`）topic 模式去掉 `sourceDir(key)`，只留 `wdir`。
-- 「正文禁绝源码对照」（`writer.ts:208`）在 topic 模式下天然成立（无源码可对照），保留不删。
+`WriterOpts` 加 `mode?: "repo" | "topic"`（默认 `"repo"`）。topic 模式按 mode **选 system prompt 文件**（与 architect/reader 同模式）：
+
+- `systemPromptPath = promptPath(mode === "topic" ? "topic-writer" : "writer")`（`writer.ts:99` 改）。`PromptRole` 须先加 `"topic-writer"`（见 §3.3 前置）。
+- topic-writer.md 的内容见 §3.2.5（从 writer.md 派生，删改 topic 不适用规则）。
+- inline user prompt（`:119-129`）**无需加 topic 分支**——它只承载运行时变量，本来就没有「读 source/演示载体语言/不 import 原仓库」这类规范指令（那些在 system prompt 里）。
+- `addDirs`（`writer.ts:143`，当前 `[wdir, sourceDir(key)]`）topic 模式去掉 `sourceDir(key)`，只留 `wdir`——topic 无源码目录，加了反而触发 claude 的「等授权读」幻觉。推荐按 `mode` 决定（`mode === "topic" ? [wdir] : [wdir, sourceDir(key)]`），比新增 sourcePath 透传链路更简单。
 - topic 模式 `toolsOverride: TOPIC_READONLY_TOOLS`（writer 本是 readonly，加 WebSearch 让它也能查证）。
 
-> **文档同步**：若改动 `writer.md`（权威文档），必须同步落 `writer.ts` inline（`writer.md:12-14` 维护契约）。本任务的 writer topic 分支只加在 `writer.ts` inline；`writer.md` 可补一节「topic 模式差异」说明，但不影响运行（writer.md 不注入）。
+> **文档同步契约已变**：旧契约「writer.md 改动必须同步 writer.ts inline」（dual-track）已在 `2c865c9` 消除——现在 writer.md 是单一权威且实际注入，无 dual-track。topic 模式只需维护 topic-writer.md 一份。
 
-### 第 4 层：Stage 层（透传 mode，单行改动）
+### 第 4 层：Stage 层（透传 mode + 补签名）
 
-每处加一行 `mode: manifest.source.kind === "topic" ? "topic" : "repo"`：
+> ⚠️ 原计划「每处加一行 mode」低估了改动面：architect/reader/writer 的 `Opts` 当前**没有 mode 字段**，必须先在第 3 层扩签名后，stage 才能透传。critic 用 `sourceMode`（非 mode）。行号层面 `03:76`/`03:128`/`04:94`/`05:writeChapter` 全部已核查精确命中。
 
-- `src/stages/03-outline.ts:76`（architect 调用）+ `:128`（critic 调用）。
-- `src/stages/04-research.ts:94`（reader 调用）。
-- `src/stages/05-write.ts`（writeChapter 内 writer + critic 调用）。
+每处调用补传（critic 传 `sourceMode`，其余传 `mode`）：
 
-`sourcePath` 派生（`03:58` / `04:46` / `05:202`）**无需改**——topic 的 `source.kind !== "local"` 自动 yield `undefined`。
+- `src/stages/03-outline.ts:76`（architect 调用，加 `mode`）+ `:128`（critic 调用，加 `sourceMode`）。
+- `src/stages/04-research.ts:94`（reader 调用，加 `mode`）。
+- `src/stages/05-write.ts` writeChapter 内：writer 调用（`:106-113`，加 `mode`）+ critic 调用（`:133`，加 `sourceMode`）。
+
+⚠️ **额外**：`05-write.ts:106-113` 的 writer 调用当前**没透传 `sourcePath`**（现状靠 `writer.ts:143` 的 `addDirs:[wdir, sourceDir(key)]` 硬算 sourceDir）。topic 模式按 §3.3.4 推荐——writer 内部按 `mode` 决定 addDirs，无需新增 sourcePath 透传链路。
+
+`sourcePath` 派生（`03:58` / `04:46` / `05:202`）**无需改**——topic 的 `source.kind !== "local"` 自动 yield `undefined`（已核查三处三元精确命中）。
 
 ### 第 5 层：CLI 入口 + topic 预处理
 
@@ -215,7 +238,9 @@ if (/^(https?:\/\/|git@)/i.test(repo)) {
 
 key 派生相应分流：`source.kind === "topic" ? keyFromTopic(repo) : keyFromRepo(repo)`。
 
-> **注意现状差异**：当前 cmdRun 在本地路径不存在时直接报错退出（`atlas.ts:378-382`）。本任务把它改成「路径不存在 → 当主题」，不再报错。这是行为变更，需在 USAGE 文案说明。
+> ⚠️ **顺序点**：当前 cmdRun 里 key 在 `atlas.ts:351` 算，**早于** source 判定（`:370+`）。若 key 派生要依赖 `source.kind`，需把 source/topic 判定提前到 key 派生之前，或先判 topic 再分别算 key。落地时调整这段顺序即可（非阻塞）。
+
+> **注意现状差异**：当前 cmdRun 在本地路径不存在时 `deps.err + return 1` 退出（`atlas.ts:378-382`，已核查）。本任务把 catch 分支从「报错退出」改成「置 `source.kind = "topic"`」，不再报错。这是行为变更，需在 USAGE 文案说明。
 
 #### 3.5.2 topic 预处理：预置 acquire/survey=done
 
@@ -263,9 +288,9 @@ atlas run <repo|url|主题>   新建或自动续跑 Run
 
 ## 5. 实施顺序
 
-1. **第 1 层**（类型/常量）→ `bunx tsc --noEmit` 过
-2. **第 2 层**（4 个 topic prompt 文件）
-3. **第 3 层**（agent 层 mode 分支 + run-claude toolsOverride）→ `bunx tsc --noEmit` 过
+1. **第 1 层**（类型/常量：SourceKind、`keyFromTopic`、`TOPIC_READONLY_TOOLS`、**`PromptRole` 扩展**）→ `bunx tsc --noEmit` 过
+2. **第 2 层**（5 个 topic prompt 文件，含 topic-writer.md）
+3. **第 3 层**（agent 层 mode / `sourceMode` 分支 + run-claude `toolsOverride`）→ `bunx tsc --noEmit` 过
 4. **第 4 层**（stage 透传 mode）→ `bunx tsc --noEmit` 过
 5. **第 5 层**（CLI 分流 + 预置）→ `bunx tsc --noEmit` 过
 6. **第 6 层**（测试）→ `bun test` 全绿
@@ -282,9 +307,57 @@ atlas run <repo|url|主题>   新建或自动续跑 Run
 
 ## 7. 验收标准
 
-- [ ] `bunx tsc --noEmit` 通过（strict）。
-- [ ] `bun test` 全绿（含新增 topic 测试）。
-- [ ] `atlas run "怎么写一个 vue macro 宏" --skip-build` 端到端跑通，产出 `atlas/<key>/site/` 含 VitePress 结构。
-- [ ] 产物含 8~20 章，每章有 draft.md（非空、有教学钩子结构）。
-- [ ] repo 模式（`atlas run <repo>`）行为不变（回归冒烟）。
-- [ ] `atlas show <topic-key>` 正常显示 stage 状态（acquire/survey 显示 done + topic 说明）。
+- [x] `bunx tsc --noEmit` 通过（strict）。
+- [x] `bun test` 全绿（含新增 topic 测试；141 个 Path parser 失败为既有、与本任务无关，见 `project-test-suite-known-failures`）。
+- [ ] `atlas run "怎么写一个 vue macro 宏" --skip-build` 端到端跑通，产出 `atlas/<key>/site/` 含 VitePress 结构。（**待本机冒烟**——需真实 claude + WebSearch）
+- [ ] 产物含 8~20 章，每章有 draft.md（非空、有教学钩子结构）。（**待本机冒烟**）
+- [x] repo 模式（`atlas run <repo>`）行为不变（回归：architect/reader/critic/writer 默认 mode=repo、sourceMode=repo，prompt/tools 与改动前一致；stages.test 全绿）。
+- [x] `atlas show <topic-key>` 正常显示 stage 状态（acquire/survey 显示 done + topic 说明——cmd 字段记 `(topic 模式，无 acquire/survey)`）。
+
+## 8. 修订记录（2026-08-10 代码核查）
+
+依当前 `dev` 分支代码对原计划逐条核验后的修正（4 个核查 agent 并行覆盖类型/常量层、agent/run-claude 层、stage/orchestrator 层、CLI 层）。
+
+### 8.1 阻塞性修正
+
+| # | 原计划断言 | 现状 | 修正 |
+|---|---|---|---|
+| 1 | §3.3.4「writer.md 不注入、指令在 writer.ts inline（`:6-14` 注释）」 | 提交 `2c865c9` 后 **writer.md 已作为 system prompt 注入**（`writer.ts:99/:135`）；inline（`:119-129`）极简 | §3.3.4 整段重写 + 新增 §3.2.5 `topic-writer.md`；prompt 文件 4→5 |
+| 2 | `promptPath(name)` 传 `"topic-architect"` 等 | `PromptRole`（types.ts:24-32）是受限枚举，不含 topic 角色 | §3.3 前言加前置：必须先扩 `PromptRole` |
+
+### 8.2 改动面修正
+
+| # | 原计划 | 实际 | 修正位置 |
+|---|---|---|---|
+| 3 | critic 加 `mode?` | `mode` 已被 `CriticMode="outline"\|"chapter"` 占用（critic.ts:21,28） | §3.3.3 改用 `sourceMode` |
+| 4 | 第 4 层「单行 mode 透传」 | architect/reader/writer 的 Opts 无 mode 字段，需先扩签名 | §3.4 标题与说明改写 |
+| 5 | `05-write.ts` writer 调用透传 mode 即可 | 该调用当前**未透传 sourcePath**（靠 writer.ts:143 硬算 sourceDir） | §3.3.4/§3.4 推荐 writer 按 mode 决定 addDirs |
+
+### 8.3 顺序点
+
+| # | 原计划 | 实际 | 修正 |
+|---|---|---|---|
+| 6 | §3.5.1 key 派生与 source 判定同分支 | key 在 `atlas.ts:351` 算，**早于** source 判定（`:370+`） | §3.5.1 加顺序说明 |
+
+### 8.4 行号漂移（无方案影响，已就地更新）
+
+| 位置 | 原计划 | 实际 |
+|---|---|---|
+| `keyFromRepo` | io.ts:131 | io.ts:158（`0e7544e` 抽出 `urlPathSegments` 下移） |
+| critic outline「读取范围」 | :142-144 | :139-144 |
+| critic chapter「读取范围」 | :188-190 | :183-191 |
+| writer.ts inline | :121-214 | :119-129（极简） |
+| writer tools | :221 | :137 |
+| writer addDirs | :227 | :143 |
+
+### 8.5 经核查完全成立的核心假设（方案地基无误）
+
+- `findNextPending`（manifest.ts:520-556）状态驱动跳过 acquire/survey → 第一个命中 outline。
+- orchestrator（orchestrator.ts）零改动：纯状态驱动、不读 source.kind、不硬编码 acquire/survey。
+- `sourcePath` 三元（`03:58`/`04:46`/`05:202`）topic 自动 yield `undefined`。
+- `resolveLocalSource`（io.ts:277）同步 throw，try/catch 判 topic 成立。
+- 预置插入点（atlas.ts:388，initManifest 后 / runPipeline 前）可行。
+- `ClaudeRunOptions`（run-claude.ts:67-106）无 `toolsOverride`，方案 A 干净可行。
+- `validateHooksStructure` 8 关键词（reader.ts:61-81）对 topic 复用成立。
+- 06-assemble / 07-build 完全 source-agnostic。
+- 5 个新 topic prompt 文件均无重名。

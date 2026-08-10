@@ -3,9 +3,9 @@
 // 不真调 claude/git/build（task M11 单测纪律）。
 //
 // 核心断言锚点（AC-6 / FR-8 / design §13）：
-//   - argv 解析正确：run <url> → source.kind=url；run <localpath> → kind=local。
+//   - argv 解析正确：run <url> → source.kind=url；run <localpath> → kind=local；run <主题> → kind=topic（task 13）。
 //   - 全局 flag 透传：--concurrency/--skip-build/--model/--from/--only/--force。
-//   - 5 个子命令的 happy path + 主要错误路径（key 不存在 / 未知命令 / 源不存在）。
+//   - 5 个子命令的 happy path + 主要错误路径（key 不存在 / 未知命令）。
 //   - list / show 输出含期望字段（list 列各 key；show 含 AC-6 review 行）。
 //   - clean -y 删目录；clean 默认（confirm stub 返回 false）不删。
 //   - --version → atlas 0.1.0；未知命令 → 退出码 1。
@@ -171,13 +171,36 @@ describe("atlas run", () => {
     expect(call.source.localPath).toBe(localDir);
   });
 
-  test("run <localpath 不存在>：报错、退出码 1、不调 runPipeline", async () => {
+  test("run <既非 URL 也非存在路径>：按 topic 模式处理（task 13 行为变更）", async () => {
+    // task 13：本地路径不存在的 catch 分支从「报错退出」改为「置 source.kind=topic」。
     const c = makeDeps();
-    const code = await runCli(["run", join(tmpRoot, "nope-not-exist")], c.deps);
+    const code = await runCli(["run", "怎么写一个 vue macro 宏"], c.deps);
 
-    expect(code).toBe(1);
-    expect(c.pipelineCalls.length).toBe(0);
-    expect(c.errs.some((e) => e.includes("本地源路径不存在"))).toBe(true);
+    expect(code).toBe(0);
+    expect(c.pipelineCalls.length).toBe(1);
+    const call = c.pipelineCalls[0];
+    expect(call.source.kind).toBe("topic");
+    expect(call.source.ref).toBe("怎么写一个 vue macro 宏");
+    expect(call.source.localPath).toBeNull();
+    // key 应由 keyFromTopic 产出（含长度 hash），不是 keyFromRepo 的「repo」兜底。
+    expect(call.key).not.toBe("repo");
+    // topic 预处理日志应出现。
+    expect(c.logs.some((l) => l.includes("topic 模式"))).toBe(true);
+  });
+
+  test("run <topic> 预置 acquire/survey=done（落盘 manifest 可查）", async () => {
+    // topic 模式应在 initManifest 后把 acquire/survey 置 done，让 findNextPending 命中 outline。
+    const c = makeDeps();
+    const code = await runCli(["run", "vue macro 宏"], c.deps);
+
+    expect(code).toBe(0);
+    // 读落盘 manifest 校验 acquire/survey=done。
+    const { readJson } = await import("../src/lib/io.ts");
+    const m = await readJson<Manifest>(manifestPath(c.pipelineCalls[0].key));
+    expect(m.stages.acquire.status).toBe("done");
+    expect(m.stages.survey.status).toBe("done");
+    // outline 仍 pending（findNextPending 应命中它）。
+    expect(m.stages.outline.status).toBe("pending");
   });
 
   test("run manifest 已存在 → 续跑，source 从磁盘读", async () => {
@@ -186,11 +209,13 @@ describe("atlas run", () => {
     // 先落盘一个 manifest（模拟已有 Run）。
     await writeManifest(key, initManifest(key, src));
 
+    // 造一个真实存在的本地目录（basename = existing-run），让 keyFromRepo 算出同一 key。
+    // 这样「manifest 已存在」分支优先命中，source 来自磁盘 manifest（url）而非新算（local）。
+    const localExisting = join(tmpRoot, "subdir", "existing-run");
+    await mkdir(localExisting, { recursive: true });
+
     const c = makeDeps();
-    // 传一个能算出同一 key 的本地路径（basename = existing-run），
-    // 但目录不存在——验证「manifest 已存在」优先级高于本地源存在性校验，
-    // source 来自磁盘 manifest 而非新算。
-    const code = await runCli(["run", join(tmpRoot, "subdir", "existing-run")], c.deps);
+    const code = await runCli(["run", localExisting], c.deps);
 
     expect(code).toBe(0);
     expect(c.pipelineCalls.length).toBe(1);
