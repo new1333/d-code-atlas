@@ -4,7 +4,7 @@ name: Deploy Atlas Sites
 # 也可在 Actions 页手动触发（Run workflow）。
 on:
   push:
-    branches: [dev]
+    branches: [master]
     paths:
       - "atlas/**/site/**"
   workflow_dispatch:
