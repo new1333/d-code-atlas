@@ -422,7 +422,23 @@ describe("critic · chapter 模式", () => {
 describe("reader", () => {
   test("从 markdown fence 提取 research.md；cmd readonly", async () => {
     const calls: SpawnCall[] = [];
-    const research = "# 响应式原子 · 源码精读\n\n## 概念要点\n- ref 源码位置: src/ref.ts:12";
+    // research.md 必须含教学钩子 8 子项（reader validate 结构校验，对应 reader.md §4 硬门禁）。
+    const research = [
+      "# 响应式原子 · 源码精读",
+      "",
+      "## 给 Writer 的教学钩子（必填，8 子项缺一不可）",
+      "- **用户痛点 / 场景**：直接改值不通知依赖。",
+      "- **一句话核心思想**：读时收集、写时通知。",
+      "- **设计动机**：需要自动依赖追踪。",
+      "- **关键权衡**：选全局栈 → 换来自动追踪 → 代价是写入遍历。",
+      "- **最小心智模型（3～7 步）**：1. 读 2. 收集 3. 写 4. 通知。",
+      "- **最小原理演示**：应演示 signal+effect；应省略边界；演示载体建议 TS/JS。",
+      "- **正文不宜展开的细节**：scheduler 优化。",
+      "- **推荐的一个执行轨迹例子**：set → 触发 → 重跑。",
+      "",
+      "## 概念要点",
+      "- ref 源码位置: src/ref.ts:12",
+    ].join("\n");
     // 外层用 4 反引号（与 reader user prompt 契约一致），内层若有代码块不会被误闭合。
     const stdout = "````markdown\n" + research + "\n````";
     const spawn = spawnReturning(stdout, calls);

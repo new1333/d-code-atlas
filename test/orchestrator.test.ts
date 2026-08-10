@@ -111,6 +111,26 @@ function mdFence(text: string): string {
   return "````markdown\n" + text + "\n````";
 }
 
+/** 造一份结构合法的 research.md（含教学钩子 8 子项），通过 reader 的 validate。 */
+function validResearchMd(slug: string): string {
+  return [
+    `# ${slug} · 源码精读`,
+    "",
+    "## 给 Writer 的教学钩子（必填，8 子项缺一不可）",
+    "- **用户痛点 / 场景**：没有这个机制会撞上什么问题。",
+    "- **一句话核心思想**：核心机制的本质。",
+    "- **设计动机（为什么需要它）**：解决什么矛盾。",
+    "- **关键权衡**：选 X → 换来 Y → 代价 Z。",
+    "- **最小心智模型（3～7 步）**：1. 读 2. 处理 3. 写。",
+    "- **最小原理演示**：应演示核心思想；演示载体建议 TS/JS。",
+    "- **正文不宜展开的细节**：类型边角。",
+    "- **推荐的一个执行轨迹例子**：输入 → 输出。",
+    "",
+    "## 概念要点",
+    `- 要点 源码位置: src/${slug}.ts:12`,
+  ].join("\n");
+}
+
 function makeMockSpawn(o: MockSpawnOpts): SpawnFn {
   let criticIdx = 0;
   const criticVerdict = o.criticVerdict ?? [];
@@ -168,7 +188,7 @@ function makeMockSpawn(o: MockSpawnOpts): SpawnFn {
       const slug = slugMatch ? slugMatch[1] : "x";
       return {
         exitCode: 0,
-        stdout: mdFence(`# ${slug} 研究\n事实摘录\n\n源码位置: src/${slug}.ts:1`),
+        stdout: mdFence(validResearchMd(slug)),
         stderr: "",
       };
     }
@@ -841,7 +861,7 @@ describe("失败终止（design §15）", () => {
           // 返回非 markdown → reader 解析失败 → 该章 research failed。
           return { exitCode: 0, stdout: "not markdown", stderr: "" };
         }
-        return { exitCode: 0, stdout: mdFence(`# ${slug} 研究`), stderr: "" };
+        return { exitCode: 0, stdout: mdFence(validResearchMd(slug)), stderr: "" };
       }
       if (prompt.includes("技术文档撰写员")) {
         const slugMatch = opts.cwd.match(/chapters\/([a-z0-9-]+)\/?$/);

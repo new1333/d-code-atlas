@@ -45,6 +45,42 @@ export interface ReaderOutcome extends AgentOutcome {
 }
 
 /**
+ * 校验 research.md 的教学钩子结构（8 子项硬门禁，对应 reader.md §4 + reader.ts user prompt）。
+ *
+ * 只做**轻量关键词存在性检查**——挡住「LLM 漏填/敷衍整段子项」这类最明显的残缺，
+ * 不评内容质量（那是下游 Writer/Critic 的事）。检查项：
+ *   1. fence 内第一分区是「## 给 Writer 的教学钩子」（先于任何源码事实分区）；
+ *   2. 8 个子项标题关键词全部出现。
+ *
+ * 检查是「钩子分区在源码事实之前」的弱近似：只要「教学钩子」标题的字符位置先于
+ * 「概念要点」等事实分区标题，即视为通过。严格顺序校验交给真实 Critic（若未来引入）。
+ *
+ * @param md 已从 stdout 提取的 research.md 全文（null 时返回 false）
+ * @returns 结构是否合格
+ */
+function validateHooksStructure(md: string | null): boolean {
+  if (!md) return false;
+  // 8 个子项的标志性标题词（与 reader.md §4 钩子模板逐一对应）。
+  const required = [
+    "痛点", // ① 用户痛点/场景
+    "核心思想", // ② 一句话核心思想
+    "设计动机", // ③ 设计动机
+    "关键权衡", // ④ 关键权衡
+    "心智模型", // ⑤ 最小心智模型
+    "原理演示", // ⑥ 最小原理演示
+    "不宜展开", // ⑦ 正文不宜展开的细节
+    "执行轨迹", // ⑧ 推荐的一个执行轨迹例子
+  ];
+  // 第一分区必须是教学钩子：它的标题位置必须先于第一个事实分区标题。
+  const hooksIdx = md.search(/##\s*给 Writer 的教学钩子/);
+  if (hooksIdx < 0) return false;
+  const factsIdx = md.search(/##\s*(概念要点|关键调用链|源码摘录|易混淆)/);
+  if (factsIdx >= 0 && factsIdx < hooksIdx) return false; // 事实分区先于钩子 = 顺序错
+  // 8 子项关键词必须全部出现（在钩子分区内即可，不强求全文唯一，降低误杀）。
+  return required.every((kw) => md.includes(kw));
+}
+
+/**
  * 调起 Reader agent：精读本章 sourceFiles，产出 research.md 内容。
  *
  * 流程：拼 user prompt → runClaude（readonly, cwd=runDir）→ 从 stdout 提取 markdown fence。
@@ -94,6 +130,18 @@ export async function reader(opts: ReaderOpts): Promise<ReaderOutcome> {
     "  · git 克隆场景：源在 work/source/。",
     "  · 本地源场景：见 repo-map.json 的 root 字段（绝对路径，只读）。",
     "",
+    "## research.md 结构硬门禁（违反即产物不合格，务必遵守）",
+    "research.md 的 fence 内有固定分区顺序，第一分区**必须**是「## 给 Writer 的教学钩子」，",
+    "且必须**先于**任何源码事实（概念要点/调用链/源码摘录）出现。",
+    "教学钩子分区内的 **8 个子项必须全部填齐**（不是敷衍的一句话）：",
+    "  ① 用户痛点/场景  ② 一句话核心思想  ③ 设计动机（含与前置章的复用关系标注）",
+    "  ④ 关键权衡（机制丰富章 2~4 条，机制稀薄章至少 1 条讲透；每条「选择→换来→代价」三段式）",
+    "  ⑤ 最小心智模型（3~7 步）  ⑥ 最小原理演示（应演示/应省略/**演示载体建议**）",
+    "  ⑦ 正文不宜展开的细节  ⑧ 推荐的一个执行轨迹例子",
+    "钩子里**禁止出现文件名/行号/源码符号名**（如 store.ts、_s.set、:859）——先把机制抽象成原理。",
+    "源码引用（带 `源码位置:` 标注）只允许出现在后面的概念要点/调用链/源码摘录分区。",
+    "**全文源码摘录累计 ≤ 30 行**，每段摘录必须在钩子里有对应的原理用途说明，否则删掉。",
+    "",
     "## 任务",
     `1. **必须覆盖** work/outline.json 中本章 sourceFiles[] 的**全部**文件（逐个 Read）。`,
     "2. 事实抽取：源码里**实际有什么**、**怎么连接**、**为什么这么写**（从代码与注释推断，不臆测）。",
@@ -120,9 +168,13 @@ export async function reader(opts: ReaderOpts): Promise<ReaderOutcome> {
     // reader 深度精读大仓库源码（如 pinia）单章可能超 15 分钟；给 25 分钟。
     timeoutMs: 25 * 60 * 1000,
     retries: 3,
-    // validate：reader 必须产出 ```markdown fence（4 反引号外层）。
-    // claude 偶发不加 fence 或用 3 反引号（与内层代码块冲突）→ 触发重试。
-    validate: (stdout) => extractFence(stdout, "markdown") !== null,
+    // validate：reader 必须产出 4 反引号 markdown fence，且 fence 内教学钩子结构合格。
+    // 两层校验：① fence 可提取（claude 偶发不加 fence 或用 3 反引号）；② 钩子 8 子项齐全。
+    // 任一不过 → run-claude 重试（retries=3），挡住「fence 在但钩子漏填/敷衍」的残缺 research.md。
+    validate: (stdout) => {
+      const md = extractFence(stdout, "markdown");
+      return md !== null && validateHooksStructure(md);
+    },
   });
 
   // 从 stdout 提取 ```markdown fence 内文本（注意：Reader 不用 JSON，用 markdown fence）。

@@ -90,13 +90,22 @@ function generateMermaidGraph(outline: Outline): string {
 }
 
 /**
- * 确保 prologue 含一个有效的脉络图块：若 LLM 未画或只留空壳，用程序化 mermaid 补/换。
- * LLM 已画 mermaid 则尊重其产物；否则程序化生成（始终忠实于 outline.dependsOn）。
+ * 确保 prologue 含一个**程序化生成**的脉络图块（100% 忠于 outline.dependsOn）。
+ *
+ * 设计取舍（review 2026-08-10）：程序化图是依赖图的确定性投影，不需要 LLM 推理；
+ * 而 LLM 自画的依赖图可能漏边/错边/末尾截断成空壳。因此**始终用程序化图覆盖**——
+ * 不论 Synthesizer 有没有自己画 mermaid，最终产物里的脉络图都是程序化那一份。
+ * Synthesizer 写的引言文字（图的导读）保留，只替换/补上图本身。
+ *
+ * 三种情况：
+ *   1. 无「## 全书脉络图」标题 → 补完整块（标题 + 说明 + 程序化图）；
+ *   2. 有标题、LLM 已画 mermaid → 删掉 LLM 的图块，保留标题与引言，接上程序化图；
+ *   3. 有标题、无 mermaid → 保留引言，末尾接程序化图。
  */
 function ensurePrologueGraph(prologueMd: string, outline: Outline): string {
   const graph = generateMermaidGraph(outline);
   const headerIdx = prologueMd.search(/##\s*全书脉络图/);
-  // 无脉络图标题：补完整块（标题 + 说明 + 图）。
+  // 情况 1：无脉络图标题 → 补完整块（标题 + 说明 + 图）。
   if (headerIdx < 0) {
     const block =
       "## 全书脉络图\n\n" +
@@ -105,16 +114,23 @@ function ensurePrologueGraph(prologueMd: string, outline: Outline): string {
       `${graph}\n`;
     return prologueMd.replace(/\s+$/, "") + "\n\n" + block;
   }
-  // 有标题：检查 Synthesizer 是否已画 mermaid。
+  // 情况 2 & 3：有标题。先剥掉 LLM 自画的 mermaid 块（若有），只保留标题 + 引言文字。
+  // 引言 = 从标题起到第一个 ```mermaid 块之前的内容（LLM 按契约只写引言不画图，但也可能画了）。
   const afterHeader = prologueMd.slice(headerIdx);
-  if (/```mermaid/.test(afterHeader)) {
-    return prologueMd; // 已有 mermaid（Synthesizer 自画），尊重之。
-  }
-  // 有标题但无 mermaid：Synthesizer 按新契约只写了引言、没画图。
-  // 保留其引言，仅在末尾追加程序化 mermaid（脉络图是第四块即末块，追加在其后自然衔接）。
-  const graphNote =
-    "下图由 outline 的 `dependsOn` + `topoOrder` 程序化生成（箭头方向：前置 → 后继）：\n\n";
-  return prologueMd.replace(/\s+$/, "") + "\n\n" + graphNote + graph + "\n";
+  const mermaidIdx = afterHeader.search(/```mermaid/);
+  const introText =
+    mermaidIdx >= 0 ? afterHeader.slice(0, mermaidIdx).replace(/\s+$/, "") : afterHeader.replace(/\s+$/, "");
+  // 把标题 + 引言拼回去，再统一接上程序化图。图前加一句说明（若引言已有类似说明，重复无害）。
+  const before = prologueMd.slice(0, headerIdx).replace(/\s+$/, "");
+  return (
+    before +
+    "\n\n" +
+    introText +
+    "\n\n" +
+    "下图由 outline 的 `dependsOn` + `topoOrder` 程序化生成（箭头方向：前置 → 后继）：\n\n" +
+    graph +
+    "\n"
+  );
 }
 
 /**

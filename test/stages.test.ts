@@ -165,6 +165,29 @@ function mdFence(text: string): string {
 }
 
 /**
+ * 造一份结构合法的 research.md（含教学钩子 8 子项 + 概念要点），通过 reader 的 validate。
+ * 对应 reader.md §4 硬门禁 + reader.ts validateHooksStructure。slug 用于区分不同章。
+ */
+function validResearchMd(slug: string): string {
+  return [
+    `# ${slug} · 源码精读`,
+    "",
+    "## 给 Writer 的教学钩子（必填，8 子项缺一不可）",
+    "- **用户痛点 / 场景**：没有这个机制会撞上什么问题。",
+    "- **一句话核心思想**：核心机制的本质。",
+    "- **设计动机（为什么需要它）**：解决什么矛盾。",
+    "- **关键权衡**：选 X → 换来 Y → 代价 Z。",
+    "- **最小心智模型（3～7 步）**：1. 读 2. 处理 3. 写。",
+    "- **最小原理演示**：应演示核心思想；应省略边界；演示载体建议 TS/JS。",
+    "- **正文不宜展开的细节**：类型边角、兼容分支。",
+    "- **推荐的一个执行轨迹例子**：输入 → 中间态 → 输出。",
+    "",
+    "## 概念要点",
+    `- 要点 源码位置: src/${slug}.ts:12`,
+  ].join("\n");
+}
+
+/**
  * 造一个 3 章 DAG chapters（用于 architect 预设 stdout）。
  * A ← B（B dependsOn A），C 独立。期望 topoOrder 以 A 开头。
  */
@@ -497,17 +520,17 @@ describe("04-research · 并发 + 单点隔离", () => {
         // 从 prompt 里抽出 slug（prompt 含 "本章 slug: xxx"）。
         const slugMatch = call.args[1].match(/本章 slug: ([a-z]+)/);
         const slug = slugMatch ? slugMatch[1] : "x";
-        return { exitCode: 0, stdout: mdFence(`# ${slug} 研究\n事实摘录`), stderr: "" };
+        return { exitCode: 0, stdout: mdFence(validResearchMd(slug)), stderr: "" };
       },
       (call) => {
         const slugMatch = call.args[1].match(/本章 slug: ([a-z]+)/);
         const slug = slugMatch ? slugMatch[1] : "y";
-        return { exitCode: 0, stdout: mdFence(`# ${slug} 研究`), stderr: "" };
+        return { exitCode: 0, stdout: mdFence(validResearchMd(slug)), stderr: "" };
       },
       (call) => {
         const slugMatch = call.args[1].match(/本章 slug: ([a-z]+)/);
         const slug = slugMatch ? slugMatch[1] : "z";
-        return { exitCode: 0, stdout: mdFence(`# ${slug} 研究`), stderr: "" };
+        return { exitCode: 0, stdout: mdFence(validResearchMd(slug)), stderr: "" };
       },
     ]);
 
@@ -527,7 +550,7 @@ describe("04-research · 并发 + 单点隔离", () => {
     const chapters = sampleChapters();
     const m = await prepManifestThroughOutline(key, chapters);
 
-    // beta 章 reader 返回非 markdown（失败）；alpha/gamma 正常。
+    // beta 章 reader 返回非 markdown（失败）；alpha/gamma 正常（合法钩子结构）。
     const spawn = makeSeqSpawn([], [
       (call) => {
         const slugMatch = call.args[1].match(/本章 slug: ([a-z]+)/);
@@ -535,7 +558,7 @@ describe("04-research · 并发 + 单点隔离", () => {
         if (slug === "beta") {
           return { exitCode: 0, stdout: "not markdown", stderr: "" };
         }
-        return { exitCode: 0, stdout: mdFence(`# ${slug} ok`), stderr: "" };
+        return { exitCode: 0, stdout: mdFence(validResearchMd(slug)), stderr: "" };
       },
       (call) => {
         const slugMatch = call.args[1].match(/本章 slug: ([a-z]+)/);
@@ -543,7 +566,7 @@ describe("04-research · 并发 + 单点隔离", () => {
         if (slug === "beta") {
           return { exitCode: 0, stdout: "not markdown", stderr: "" };
         }
-        return { exitCode: 0, stdout: mdFence(`# ${slug} ok`), stderr: "" };
+        return { exitCode: 0, stdout: mdFence(validResearchMd(slug)), stderr: "" };
       },
       (call) => {
         const slugMatch = call.args[1].match(/本章 slug: ([a-z]+)/);
@@ -551,7 +574,7 @@ describe("04-research · 并发 + 单点隔离", () => {
         if (slug === "beta") {
           return { exitCode: 0, stdout: "not markdown", stderr: "" };
         }
-        return { exitCode: 0, stdout: mdFence(`# ${slug} ok`), stderr: "" };
+        return { exitCode: 0, stdout: mdFence(validResearchMd(slug)), stderr: "" };
       },
     ]);
 
@@ -588,7 +611,7 @@ describe("04-research · 并发 + 单点隔离", () => {
       calls.push(call);
       const slugMatch = args[1].match(/本章 slug: ([a-z]+)/);
       const slug = slugMatch ? slugMatch[1] : "";
-      return { exitCode: 0, stdout: mdFence(`# ${slug} ok`), stderr: "" };
+      return { exitCode: 0, stdout: mdFence(validResearchMd(slug)), stderr: "" };
     };
 
     const next = await research(ctxFor(key, m, spawn));
