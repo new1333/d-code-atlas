@@ -117,30 +117,57 @@ export function replicaDir(key: string, slug: string): string {
  * 对应 CONTEXT.md「Run」术语：同名仓库共用同一 Run 目录。
  *
  * 规则：
- * - URL（http(s):// 或 git@）：取最后一段，去 `.git` 后缀。
+ * - URL（http(s)://、git@、ssh://）：取 `{owner}-{repo}` 两段，去 `.git` 后缀，
+ *   避免不同 owner 下的同名仓库（如 a/react 与 b/react）落到同一 Run 目录。
  * - 本地路径：取 basename（支持正反斜杠）。
  * - 安全转义：转小写、kebab-case，仅保留 `[a-z0-9-]`，其余折叠为单个 `-`，
  *   去掉首尾 `-`，空串兜底 `"repo"`。
  *
  * 例：
- *   `https://github.com/o/My_Repo.git` → `my-repo`
- *   `D:\code\foo.bar`                  → `foo-bar`
- *   `./a/b/`                           → `b`
- *   `""` / `???`                       → `repo`
+ *   `https://github.com/o/My_Repo.git`    → `o-my-repo`
+ *   `https://github.com/facebook/react.git` → `facebook-react`
+ *   `git@github.com:o/r.git`              → `o-r`
+ *   `D:\code\foo.bar`                     → `foo-bar`
+ *   `./a/b/`                              → `b`
+ *   `""` / `???`                          → `repo`
  */
+/**
+ * 提取 git URL 的路径段（去 query/hash、去尾斜杠、去 `.git` 后缀）。
+ * 不做完整 URL 语法解析，仅按 `/` 切分；各段保留原样（不做转义）。
+ *
+ * 例：
+ *   `https://github.com/facebook/react.git` → `["facebook", "react"]`
+ *   `git@github.com:o/r.git`                → `["o", "r"]`
+ *   `ssh://git@github.com/o/r`              → `["o", "r"]`
+ */
+function urlPathSegments(url: string): string[] {
+  const noQuery = url.split(/[?#]/)[0];
+  const trimmed = noQuery.replace(/\/+$/, ""); // 去尾斜杠
+  const segs = trimmed.split("/").filter((s) => s !== "");
+  // 首段若是 `git@github.com:o` 这类 SCP 式主机，拆出冒号后的部分。
+  if (segs.length > 0 && segs[0].includes(":")) {
+    const [, ...rest] = segs[0].split(":");
+    const tail = rest.join(":");
+    return [tail, ...segs.slice(1)]
+      .filter((s) => s !== "")
+      .map((s) => s.replace(/\.git$/i, ""));
+  }
+  return segs.map((s) => s.replace(/\.git$/i, ""));
+}
+
 export function keyFromRepo(repo: string): string {
   const input = (repo ?? "").trim();
   if (input === "") return "repo";
 
-  // 1) 取末端名称段。
+  // 1) 取名称段（URL 取 owner+repo 两段；本地路径取 basename）。
   let name = "";
   const isUrl = /^(https?:\/\/|git@|ssh:\/\/)/i.test(input);
   if (isUrl) {
-    // URL：去 query/hash，按 `/` 取最后一段。
-    const noQuery = input.split(/[?#]/)[0];
-    const trimmed = noQuery.replace(/\/+$/, ""); // 去尾斜杠
-    const seg = trimmed.split("/").pop() ?? "";
-    name = seg;
+    const segs = urlPathSegments(input);
+    // 取末两段：owner + repo；不足两段（无 owner）则退化为仅 repo。
+    const repoSeg = segs[segs.length - 1] ?? "";
+    const ownerSeg = segs.length >= 2 ? segs[segs.length - 2] : "";
+    name = ownerSeg !== "" ? `${ownerSeg}-${repoSeg}` : repoSeg;
   } else {
     // 本地路径：支持反斜杠；先按 `\` 拆，再按 `/` 拆，取末段。
     const normalized = input.replace(/\\/g, "/").replace(/\/+$/, "");

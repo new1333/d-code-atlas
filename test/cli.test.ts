@@ -148,7 +148,7 @@ describe("atlas run", () => {
     expect(code).toBe(0);
     expect(c.pipelineCalls.length).toBe(1);
     const call = c.pipelineCalls[0];
-    expect(call.key).toBe("react-mini");
+    expect(call.key).toBe("owner-react-mini");
     expect(call.source.kind).toBe("url");
     expect(call.source.ref).toBe("https://github.com/owner/react-mini.git");
     expect(call.source.localPath).toBeNull();

@@ -77,12 +77,24 @@ describe("路径约定", () => {
 // keyFromRepo
 // ---------------------------------------------------------------------------
 describe("keyFromRepo", () => {
-  test("URL（含 .git）→ repo 段小写", () => {
-    expect(keyFromRepo("https://github.com/o/repo.git")).toBe("repo");
+  test("URL（含 .git）→ owner-repo 两段小写", () => {
+    expect(keyFromRepo("https://github.com/o/repo.git")).toBe("o-repo");
   });
 
-  test("URL（大写 + 下划线）→ kebab-case", () => {
-    expect(keyFromRepo("https://github.com/o/My_Repo.git")).toBe("my-repo");
+  test("URL（大写 + 下划线）→ owner-repo kebab-case", () => {
+    expect(keyFromRepo("https://github.com/o/My_Repo.git")).toBe("o-my-repo");
+  });
+
+  test("URL（facebook/react）→ owner-repo，避免同名重名", () => {
+    expect(keyFromRepo("https://github.com/facebook/react.git")).toBe("facebook-react");
+  });
+
+  test("URL（git@ SCP 式）→ owner-repo", () => {
+    expect(keyFromRepo("git@github.com:owner/react-mini.git")).toBe("owner-react-mini");
+  });
+
+  test("URL（ssh:// 形式）→ owner-repo", () => {
+    expect(keyFromRepo("ssh://git@github.com/owner/react.git")).toBe("owner-react");
   });
 
   test("本地路径（反斜杠）→ basename + 折叠非法字符", () => {
