@@ -1,246 +1,202 @@
+---
+title: RouterLink 与激活态判定
+---
+
 # RouterLink 与激活态判定
 
-你打开任何一个后台管理系统，左侧都会有一排菜单链接：「用户」「订单」「设置」。你此刻停在「用户详情」页，那一排菜单里「用户」这一项就该高亮起来——告诉用户「你现在在用户这片区域里」。
+> 本章属于 composite 层。前置：Router 核心与导航主循环。
+> 学完你能：用一句话讲清「为什么激活态判定必须落在 matched 链 + 参数子集上，而不是 URL 字符串前缀」。
 
-这件事听起来简单，做起来却坑多得离谱。最直觉的做法是：拿当前 URL 跟每个链接的地址比一下，看是不是「开头一样」。但只要你用了带参数的路由、嵌套子页面、或者别名，这套字符串比较就开始胡说八道：
+## 1. 为什么需要它
 
-- 当前在 `/users/123`，「用户列表」链接指向 `/users`——前缀对上了，该亮。可如果当前是 `/users/123/posts/456` 呢？「用户列表」按前缀也算对上，但这是用户列表吗？不是，是某篇文章。
-- 两个不同路径指向同一个界面（别名），比如 `/me` 和 `/users/me`——它们该一起亮，可字符串前缀根本看不出来它们是「一回事」。
-- 参数 `:id` 是 `123` 还是 `['123']`，解码前和解码后字符串长不一样，比较结果也会跟着抖。
+几乎每个多页应用都有一排「我现在在哪儿」的指示灯：顶部 Tab、侧边菜单、面包屑、分页器。它们都共享同一个问题——给定一个链接，怎么判断它是不是「当前正在显示的页面」。
 
-说人话就是：**使用者要的不是「URL 字符串长得像」，而是「我此刻确实落在这个链接所代表的那片界面范围内」。** 字符串是给人眼和浏览器看的扁平表象，而路由在内部是个带父子层级、带结构化参数、还可能带别名的立体对象。拿扁平字符串去比立体对象，必然失真。这一章要讲的就是：怎么把这个判定从「比字符串」换成「比结构」，以及由此换来的一切好处和代价。
+最朴素的写法是拿当前 URL 跟链接地址做字符串前缀比较：当前在 `/users/123`，链接是 `/users`，前缀命中，亮。但这种判法在真实路由系统里几乎处处翻车：
 
-## 先看清楚：链接手里的「位置」到底是什么形状
+- 当前在 `/users/123/posts/456`，那个指向 `/users/123` 的链接该不该亮？字符串前缀会说该亮，但点过去其实是跳到了「父页面」，跟「我在这一页」不是一回事。
+- 别名路由（同一组件挂多个路径）怎么算？字符串前缀完全无法识别两条路径指向同一界面。
+- 路径参数是 `'123'` 还是 `['123']`、是不是被 URL 编码过，字符串层面千差万别，但语义上是同一个值。
 
-要理解激活判定，得先知道一个链接的目标在被用之前，会被路由核心**解析成一个结构化的位置**。这个解析过程（把字符串地址或位置对象变成结构化结果）是上一章「Router 核心与导航主循环」已经做好的事，链接只是个消费者，拿现成结果来用。本章只盯着「消费侧」这个新角度。
+矛盾的根源在于：**URL 字符串是给浏览器/人看的扁平表象，路由位置在内部是立体的**，它带着父子层级的 matched 链、带结构化参数、还可能带别名指针。拿扁平字符串去比立体对象，必然丢信息。
 
-解析出来的位置长这样，记住这三件东西，后面全靠它们：
+> 上一章 RouterView 把 matched 链当成「渲染到第几层」的标尺，凭注入的 depth 选出该画的组件。本章复用这把标尺，但换个方向用：不问「我渲染到第几层」，而问「这条链接的目标，是不是当前层或它的祖先」。
 
-- **一条匹配记录链（matched）**：从根到叶子排好序的记录数组。比如 `/users/123/posts/456` 解析出来是 `[users, user, post]` 三层——「用户区 → 某个用户 → 某篇文章」。这条链就是路由的**父子层级坐标**。
-- **一组参数（params）**：解码后的结构化键值对，比如 `{ id: '123', postId: '456' }`。
-- **一个 href**：最终渲染进 `<a href>` 的字符串，给人眼看的。
+## 2. 核心思想
 
-打个比方：URL 字符串像是把地址写成一行 `/users/123/posts/456`，而结构化位置像是把地址拆成「第几街区（users）→ 第几栋（user）→ 第几间（post）」的层级坐标，外加每层的门牌号（params）。要判断「我现在是不是在这片区域」，比坐标层级显然比比字符串前缀靠谱得多。
+不再问「URL 长得像不像」，而问「这条链接的目标位置，在 matched 树上是不是当前位置自身或它的一个祖先；如果是，再问目标参数是不是当前参数的一个子集」。
 
-上一章还讲过一件事：判断两个位置是不是「同一个」，靠的是「匹配记录链上对应记录引用相等 + 参数结构相等」——那章用它来做**重复导航的短路**（你要去的地方就是你现在的位置，就别导航了）。本章正是在这套「相等」判定的基础上，做一个关键的松绑：把「必须全等」放宽成「可以是子集」，从而表达「祖先/包含」关系。这是本章唯一的新原理，下面围绕它展开。
+判定从「字符串同形」变成了「结构上被包含」。
 
-## 两档松紧：active 与 exactActive
+## 3. 心智模型
 
-有了结构化位置，激活判定就被拆成松紧两档，对应两种常见的 UX 需求：
+链接判定有五个关键数据：
 
-- **松档（active）**：只要这个链接的末端记录**出现在当前匹配链上**，且链接的参数是当前参数的**子集**，就算激活。这一档让「祖先链接」自动亮——你现在在「某篇文章」里，那「用户列表」「某个用户」这些父级链接全都算激活，整条面包屑路径都能高亮。
-- **紧档（exactActive）**：在松档基础上，额外要求链接的末端记录**正好在当前链的最后一格**，且参数**完全相等**。这一档只让真正命中的那个叶子链接亮。
+- **target**：使用者给链接的目标，可以是字符串（`'/users/123'`）或位置对象（`{ name: 'user', params: { id: '123' } }`）。
+- **resolved location**：target 经路由解析后得到的结构化位置，包含一条 matched 记录链 + 一组 params + 一个 href 字符串。解析器是前置章的内容，本章只把它当黑盒。
+- **currentRoute**：当前正在显示的路由，同样有自己的 matched 链和 params。
+- **activeRecordIndex**：resolved location 的 matched 链末端那条记录，在 `currentRoute.matched` 里的下标。`-1` 表示「不在当前链上」。
+- **isActive / isExactActive**：两档布尔判定结果，松档表达「在范围内」，紧档表达「精准命中」。
 
-文字流程长这样：
+判定的流程是一条窄管道：
 
 ```
-链接目标 (to)
-   │  路由核心 resolve（上一章已实现）
-   ▼
-结构化位置：matched 链 + params + href
-   │
-   │  取链接末端记录，去当前 matched 链里找下标 idx
-   ▼
-idx < 0 ？──是──▶ 不在链上：active=false, exactActive=false
-   │ 否（在链上）
-   ▼
-paramsCover(当前params, 链接params) ？   ← 子集判定（松档）
-   │ 是                       │ 否
-   ▼                          ▼
-active = true             active = false, exactActive = false
-   │
-   │  idx 是否正好在链末端 && paramsEqual ？  ← 全等判定（紧档）
-   ▼
-是 → exactActive=true        否 → exactActive=false
+target
+  → resolve → { matched 末端 record, params }
+  → 在 currentRoute.matched 里 findIndex → activeRecordIndex
+  → isActive      = index > -1 && 当前参数包含目标参数（子集）
+  → isExactActive = index > -1 && index 在链末端 && 参数全等
 ```
 
-光看流程还是抽象，下面用一段从零写的最小演示把它跑给你看。
+子集判定的方向很重要：遍历的是**目标**参数，要求**当前**参数逐键匹配得上，但允许当前参数多带一些键。所以「链接只关心 `id`，当前还带着 `postId`」是成立的，这正是祖先链接亮的根因。
 
-## 原理演示：结构化子集匹配
+记录比较时还有个别名归一的小机关：`isSameRouteRecord` 比的是 `(a.aliasOf || a) === (b.aliasOf || b)`，所有别名都回溯到原始记录再做引用相等。别名路由因此不会因为路径不同就被误判成「不同的界面」。
 
-这段代码不依赖任何路由库，纯数据结构加比较函数，演透「松紧两档 + 别名回溯 + 子集 vs 全等」这一整组核心思想。保存为 `demo.ts`，用 `bun run demo.ts`（或 `npx tsx demo.ts`）即可运行。配套的最小 `package.json` 只需 `{ "type": "module" }`。
+> 「两个位置怎么算完全相等」是前置章『路由位置与 URL 解析』为导航短路建立的判定；本章只在它基础上松绑出「子集」这一档来表达「祖先/包含」关系，不重述全等的定义。
+
+## 4. 关键权衡
+
+### 结构化匹配换别名与嵌套的正确性
+
+把目标先 resolve 成结构化位置，再用 matched 链 + 参数做判定，绕开了字符串前缀的所有坑：别名通过 `aliasOf` 归一到同一记录、参数是数组还是单值都走同一套比较逻辑、父子嵌套关系直接由链上位置决定。
+
+**换来**的是「别名路由天然正确、参数形态无关、嵌套父子精确」这三件事一起成立。
+
+**代价**是判定不能纯靠两个字符串算出来。必须先调一次 `router.resolve` 把目标展开成结构化位置，还必须从注入上下文拿到 currentRoute。脱离路由实例，链接什么也算不出。
+
+**这条权衡化解的本质矛盾**：扁平字符串表象 vs 立体路由对象。前者是 URL 给浏览器的接口，后者是路由系统的内部表示；任何判定如果停在字符串层，就注定吃掉所有结构信息。把判定下沉到结构层，是这个矛盾的通解。
+
+### 激活松、精确激活紧的两档设计
+
+把判定拆成松紧两档：
+
+- **松档（isActive）**：记录在链上 + 当前参数**包含**目标参数（子集）。祖先链接天然成立。
+- **紧档（isExactActive）**：在松档基础上，要求记录正好在链的**末端**、且参数**完全相等**。
+
+**换来**的是「我在这一片」与「我精准在这一格」两种 UX 需求用同一组数据自然表达。菜单条只要高亮当前大类、面包屑末端要精确标记当前页，同一个链接同时给出两个布尔，使用方按需取用。
+
+**代价**有两层。一是维护两套比较函数（子集 vs 全等），使用方要分别理解。二是这两套函数对「单值 vs 长度 1 数组」**刻意**做了不同处理：松档的子集比较要求严格同形态，单值和 `[v]` 视作不等；紧档的全等比较走更宽松的「等价数组」判定，单值和 `[v]` 视作等价。这种细微差异是为了让两档分别贴合各自的语义——松档要严守「父级不能凭参数形态蒙混成激活」，紧档要兼容「路径里单个参数在编码层被规整成数组」的常见情形。
+
+**这条权衡化解的本质矛盾**：「范围归属感」vs「精确身份」。同一个链接在不同 UI 语境下要回答的不是同一个问题。菜单关心范围，面包屑关心精确身份；强行用一档布尔回答两个问题，必然有一边别扭。两档松紧就是把这两个问题显式拆开。
+
+### 全部逻辑塞进组合式函数，组件退成薄壳
+
+把「解析、判定、点击导航」全部塞进一个对外暴露的 `useLink` 组合式函数，组件本体只做一层 reactive 包装 + 渲染分叉。再加一个 `custom` 开关，连这层锚点壳也扒掉，把判定结果以插槽参数交还给使用者。
+
+**换来**的是完全自定义渲染的能力：想把链接画成 `<li>`、画成按钮、画成带图标的卡片，都不必 fork 组件。
+
+**代价**是组件 API 变成「函数 + 渲染」双形态。类型层得分叉处理：`custom: true` 时 props 不接受锚点属性（因为根本不画 `<a>`），`custom: false` 时透传 `target`、`rel` 等但禁止覆盖 `href`。使用者的认知成本因此分成两半——要么用默认壳，要么完全接管。
+
+**这条权衡化解的本质矛盾**：「开箱即用」vs「完全可控」。任何 UI 组件都会撞上这对矛盾：给一套合理的默认值，就让深度定制者受限；完全裸露 internals，又让简单场景的使用者写一堆样板。把 headless 函数和薄壳组件并列对外暴露，是 Vue 生态里这对矛盾的标准解法。
+
+## 5. 最小原理演示
+
+下面这段几十行的实现，只演「结构化子集匹配」这一核心思想：matched 链查找、别名归一、子集与全等两档比较。点击拦截、视图过渡、类名优先级、aria-current 都不演。
 
 ```ts
-// === 数据形状 ===
-type ParamValue = string | string[]
-interface RouteRecord { name: string; aliasOf?: RouteRecord } // aliasOf：别名指向原始记录
-interface RouteLocation {
-  matched: RouteRecord[]                       // 匹配记录链（根→叶子）
-  params: Record<string, ParamValue>           // 解码后的结构化参数
+type RouteRecord = { path: string; aliasOf?: RouteRecord }
+type Params = Record<string, string | string[]>
+
+// 别名归一：所有别名都回溯到原始记录再做引用相等
+function isSameRouteRecord(a: RouteRecord, b: RouteRecord): boolean {
+  return (a.aliasOf || a) === (b.aliasOf || b)
 }
 
-// === (b) 两条记录算不算「同一条」：别名要回溯到原始记录再比 ===
-function sameRecord(a: RouteRecord, b: RouteRecord): boolean {
-  return (a.aliasOf ?? a) === (b.aliasOf ?? b)
-}
-
-// === (c) 子集比较（松档 active 用） ===
-// 遍历【目标】参数，要求【当前】参数逐键匹配；当前可以多带键（这就是祖先链接成立的根因）。
-// 标量直接全等；数组则要求当前也是同长度数组且逐元素相等——刻意不做「单值 ≡ 长度1数组」退化。
-function paramsCover(
-  current: Record<string, ParamValue>,
-  target: Record<string, ParamValue>,
-): boolean {
-  for (const key of Object.keys(target)) {
-    const need = target[key]
-    const have = current[key]
-    if (typeof need === 'string') {
-      if (need !== have) return false            // 标量：直接全等
+// 松档子集比较：遍历目标参数（inner），要求当前参数（outer）逐键匹配；
+// 标量直接全等；数组必须同长度逐元素相等，刻意不做「单值 ≡ [v]」的退化
+function includesParams(outer: Params, inner: Params): boolean {
+  for (const key in inner) {
+    const innerValue = inner[key]
+    const outerValue = outer[key]
+    if (typeof innerValue === 'string') {
+      if (innerValue !== outerValue) return false
     } else {
-      // need 是数组：have 也必须是同长度数组，且逐元素相等
-      if (!Array.isArray(have) || have.length !== need.length) return false
-      if (need.some((v, i) => String(v) !== String(have[i]))) return false
+      if (!Array.isArray(outerValue)) return false
+      if (outerValue.length !== innerValue.length) return false
+      if (innerValue.some((v, i) => v !== outerValue[i])) return false
     }
   }
   return true
 }
 
-// 单值与「长度1数组」视作等价（仅紧档全等比较用，松档上面刻意不这么做）
-function sameParamValue(a: ParamValue | undefined, b: ParamValue | undefined): boolean {
-  const av = Array.isArray(a) ? a : [a as string]
-  const bv = Array.isArray(b) ? b : [b as string]
-  return av.length === bv.length && av.every((v, i) => String(v) === String(bv[i]))
-}
-
-// 全等比较（紧档 exactActive 用）：先比键数，再逐键比
-function paramsEqual(
-  current: Record<string, ParamValue>,
-  target: Record<string, ParamValue>,
-): boolean {
-  const ck = Object.keys(current), tk = Object.keys(target)
-  if (ck.length !== tk.length) return false
-  return tk.every(k => sameParamValue(current[k], target[k]))
-}
-
-// === (d) 两档激活判定 ===
-function computeActive(current: RouteLocation, link: RouteLocation) {
-  const tip = link.matched[link.matched.length - 1]   // 链接匹配链的末端记录
-  const idx = current.matched.findIndex(r => sameRecord(r, tip)) // 在当前链里找下标
-  const onChain = idx > -1
-  return {
-    idx,
-    isActive: onChain && paramsCover(current.params, link.params),
-    isExactActive:
-      onChain &&
-      idx === current.matched.length - 1 &&          // 必须正好在链末端
-      paramsEqual(current.params, link.params),
+// 紧档全等比较：键集合必须相同，但「单值 ≡ [v]」视作等价
+function isSameRouteLocationParams(a: Params, b: Params): boolean {
+  const aKeys = Object.keys(a)
+  const bKeys = Object.keys(b)
+  if (aKeys.length !== bKeys.length) return false
+  for (const key of aKeys) {
+    const av = a[key]
+    const bv = b[key]
+    const arrA = Array.isArray(av) ? av : [av]
+    const arrB = Array.isArray(bv) ? bv : [bv]
+    if (arrA.length !== arrB.length) return false
+    if (arrA.some((v, i) => v !== arrB[i])) return false
   }
+  return true
 }
 
-// === 断言场景 ===
-// 三条记录（用引用相等保证 matched 链复用同一实例——这是「记录引用相等」判定的前提）
-const users: RouteRecord = { name: 'users' }
-const user: RouteRecord = { name: 'user' }
-const post: RouteRecord = { name: 'post' }
+// 一条链接的判定全部状态
+function useLinkActive(
+  target: { matched: RouteRecord[]; params: Params },
+  currentRoute: { matched: RouteRecord[]; params: Params }
+) {
+  // 取目标 matched 链末端记录，在当前链里找下标
+  const endRecord = target.matched[target.matched.length - 1]
+  let activeRecordIndex = currentRoute.matched.findIndex(r =>
+    isSameRouteRecord(r, endRecord)
+  )
+  // 退化分支：找不到末端时试父记录（处理空子路由或同级兄弟的边界）
+  if (activeRecordIndex < 0 && target.matched.length >= 2) {
+    const parentRecord = target.matched[target.matched.length - 2]
+    activeRecordIndex = currentRoute.matched.findIndex(r =>
+      isSameRouteRecord(r, parentRecord)
+    )
+  }
 
-// 当前路由 /users/123/posts/456
-const current: RouteLocation = {
-  matched: [users, user, post],
-  params: { id: '123', postId: '456' },
+  const isActive =
+    activeRecordIndex > -1 &&
+    includesParams(currentRoute.params, target.params)
+
+  const isExactActive =
+    activeRecordIndex > -1 &&
+    activeRecordIndex === currentRoute.matched.length - 1 &&
+    isSameRouteLocationParams(currentRoute.params, target.params)
+
+  return { activeRecordIndex, isActive, isExactActive }
 }
-
-// 链接 1：指向祖先 user
-const linkToUser: RouteLocation = { matched: [users, user], params: { id: '123' } }
-const r1 = computeActive(current, linkToUser)
-console.log(r1) // => { idx: 1, isActive: true, isExactActive: false }
-console.assert(r1.isActive === true, '祖先链接应 active')
-console.assert(r1.isExactActive === false, '祖先链接不应 exact active')
-
-// 链接 2：指向叶子 post（精确命中）
-const linkToPost: RouteLocation = { matched: [users, user, post], params: { id: '123', postId: '456' } }
-const r2 = computeActive(current, linkToPost)
-console.log(r2) // => { idx: 2, isActive: true, isExactActive: true }
-console.assert(r2.isExactActive === true, '叶子且参数全等应 exact active')
-
-// 链接 3：末端是别名，sameRecord 回溯到 user 后仍命中
-const linkToAlias: RouteLocation = {
-  matched: [users, { name: 'me', aliasOf: user }], // /me 是 /users/:id 的别名
-  params: { id: '123' },
-}
-const r3 = computeActive(current, linkToAlias)
-console.log(r3.isActive) // => true（别名不破坏判定）
-console.assert(r3.isActive === true, '别名末端回溯到原始记录后应 active')
 ```
 
-把上面三个断言跑通，就验证了三件事：**祖先链接 active 但非 exact**（`r1`）、**叶子且参数全等才 exact**（`r2`）、**别名自动归到原始记录**（`r3`）。
+这段实现演了三件事：matched 链上的下标查找演「结构化匹配」、`includesParams` 演子集方向（outer 容许比 inner 多键）、`isSameRouteLocationParams` 演紧档对键集合的严格要求。两档对单值/数组的差异也写在代码里。
 
-## 跟着演示走一遍执行轨迹
+## 6. 执行轨迹
 
-把链接 1 那个场景掰开看，每一步都对应演示里的一行：
+走一个具体例子。当前路由是 `/users/123/posts/456`，路由表里这条路径解析出：
 
 ```
-当前路由  /users/123/posts/456
-   ├─ matched 链：[users, user, post]          （3 层）
-   └─ params：   { id: '123', postId: '456' }
-
-链接     { name: 'user', params: { id: '123' } }
-   └─ 解析后 matched 链：[users, user]          （2 层）
-   └─ params：   { id: '123' }
-
-第 1 步：取链接末端记录 user，在当前链 [users, user, post] 里 findIndex
-        → idx = 1（≥ 0，确认「在链上」）
-
-第 2 步：激活（松档）
-        paramsCover({id:'123',postId:'456'}, {id:'123'})
-        遍历【目标】{id:'123'}：need='123' 标量，have='123' 全等 → 通过
-        当前多带的 postId 根本没被遍历到，不影响 → 子集成立
-        → isActive = (idx>-1) && true = true
-
-第 3 步：精确激活（紧档）
-        idx(1) === matched.length-1(2) ？  → 1 ≠ 2 → false
-        → isExactActive = false
-
-结论：该链接 active，但不是 exact active。
-      —— 这正是「祖先链接算激活」的预期行为：你在文章页，
-         指向「用户」的链接亮着（你在用户这片区域里），
-         但它不是你「精确所在」的那一页。
+currentRoute.matched = [users, user, post]
+currentRoute.params   = { id: '123', postId: '456' }
 ```
 
-## 关键权衡
+页面上有一个链接，目标写成 `{ name: 'user', params: { id: '123' } }`，经 `router.resolve` 后展开成：
 
-原理看懂了，真正值得带走的是这几个「为什么这么选」。这一章机制比较集中，下面三条权衡是它全部的设计张力所在。
+```
+target.matched = [users, user]
+target.params  = { id: '123' }
+```
 
-### 权衡一：用结构化匹配，而不是 URL 字符串前缀
+判定流程一步步走：
 
-**选择**：判定激活时，不比两个 URL 字符串，而是比「链接的末端记录是否出现在当前 matched 链里 + 链接参数是否是当前参数的子集」。
+1. **找末端记录下标**：`target.matched` 末端是 `user`，在 `currentRoute.matched` 里 `findIndex` 命中下标 `1`。
+2. **算松档 isActive**：`1 > -1` 成立；`includesParams({ id: '123', postId: '456' }, { id: '123' })` 遍历目标参数只有 `id`，当前参数逐键匹配 → `true`。**isActive = true**。
+3. **算紧档 isExactActive**：`1 > -1` 成立；`1 === 3 - 1` 不成立（下标 1 不是链末端）。**isExactActive = false**。
 
-**换来**：
-- **别名天然正确**。`/me` 和 `/users/me` 哪怕字符串毫无相似，只要它们解析出同一条记录（或别名回溯到同一条），判定就一致。字符串前缀对这种「同一界面的多入口」完全束手无策。
-- **参数的数组/编码形态不影响判定**。因为比的是解码后的结构化值（`id` 是 `'123'` 还是 `['123']` 是数据形状问题），而不是 URL 里那串被编码过的字符。编码方式的差异在解析层就被抹平了，根本走不到判定这一步。
-- **嵌套父子关系精确**。靠的是 matched 链的真实拓扑（谁真的是谁的祖先），而不是「路径字符串碰巧以你开头」这种脆弱近似——`/users` 和 `/users-management` 字符串前缀重合，但根本不是一个祖宗，结构化匹配绝不会误判。
+结果：这个指向父级 `user` 的链接 active 但不是 exact active，正是「祖先链接算激活」的预期行为。如果改成链接指向 `/users/123/posts/456` 本身（末端 `post`、参数全等），两档都会同时成立。
 
-**代价**：
-- **不能凭两个字符串就算出来**。必须先把链接 `resolve` 成结构化位置（跑一次匹配、反推出记录链和参数），这比 `startsWith` 贵得多。
-- **必须依赖路由上下文**。判定要用到「当前 matched 链」「当前 params」，这些只能从路由核心 `install` 时注入的上下文里拿。脱离了路由体系（比如在路由还没装好的地方），这套判定根本无从谈起——它不是个独立的小工具，而是整个路由状态机的一个视图。
+## 7. 教学简化说明
 
-### 权衡二：激活拆成「子集」和「全等+末端」两档松紧
+上面的演示故意省略了一组不表达核心思想的细节：点击事件对修饰键/新标签/非左键的拦截（决定要不要把点击交还浏览器）、`router.push` 与 `router.replace` 的选择、视图过渡（`document.startViewTransition` 的可选包装）、devtools 把激活态暴露给 Vue 调试面板、`aria-current` 的取值规则、类名「prop > 全局 > 默认」的三级优先级，以及条件类型把「是否渲染原生 `<a>`」反映到 props 类型分叉的那一层。这些是工程完整度，不是激活判定的原理。
 
-**选择**：不做一个「激活」了事，而是做两档。松档只要「在链上 + 子集」，紧档额外要「在末端 + 全等」。
+## 8. 小结
 
-**换来**：
-- **两种 UX 需求用同一套数据自然表达**。「范围高亮」（菜单里「用户」整条栏目在你进用户区时都亮）和「精确命中」（只有你真正停在那个叶子页时才亮）是两个极为常见又互相冲突的需求。一套 matched/params 数据，配上两档判定，两边都照顾到了，使用者不用自己再发明一套比较逻辑。
-- **祖先链接自动成立是「子集」的副产品**。子集判定遍历的是目标参数、允许当前多带键，所以「当前在更深的叶子、链接指向更浅的祖先」天然为真——不用为祖先关系写任何特例代码。
+激活态判定的灵魂不在「比 URL」，而在「比结构」——把目标先 resolve 到 matched 链 + 参数的层面，再用「链上 + 子集」表达范围、用「链末端 + 全等」表达精确。两档松紧、别名归一、单值与数组的差异处理，都是为了让结构化判定在真实路由的别名、嵌套、参数形态面前不翻车。
 
-**代价**：
-- **要维护两套比较函数**，而且它们对同一组参数的行为**有细微差异**，使用者必须分别理解：
-  - 松档（`paramsCover`）刻意**不做**「单值 ≡ 长度1数组」的退化——目标是数组时，当前也必须是同长度数组逐元素相等；
-  - 紧档（`paramsEqual`）反而**做**这个退化——单值和长度1数组视作等价。
-  - 这意味着同一条链接，在「参数恰好是 `['x']` 而当前是 `'x'`」时，松档判 false、紧档判 true 的情况是可能出现的。这是个真实的认知陷阱，文档得专门提醒。
-- **两档语义都需要使用者正确选用**。该用 `exact-active-class` 的地方用了 `active-class`，就会出现「整条祖先链都亮」的迷惑效果；反之该亮的范围没亮。松紧是给使用者的一把双刃剑，灵活但容易误用。
-
-### 权衡三：把全部逻辑抽成 headless 组合式函数，而不是塞进组件
-
-**选择**：把「解析、激活判定、点击导航」全部塞进一个对外暴露的组合式函数（`useLink`），组件本体退成一层薄壳——只负责把判定结果渲染成一个原生 `<a>`；再开一个 `custom` 开关，连这层薄壳也扒掉，把判定结果原样交回给使用者的插槽自己画。
-
-**换来**：
-- **完全自定义渲染而不必 fork 组件**。想要把链接画成按钮、列表项、带图标的复杂结构，甚至根本不是 `<a>` 标签，都不用改 RouterLink 源码——直接用 `useLink` 拿到 `{ route, href, isActive, isExactActive, navigate }`，自己组装。激活判定的全部复杂度都被封装在函数里，对自定义渲染者是不可见的负担。
-
-**代价**：
-- **API 变成「函数 + 组件」双形态**。同一件事有两种入口（用 `<RouterLink>` 还是调 `useLink`），使用者在选型时要理解它们的边界。
-- **类型得为「是否渲染原生 `<a>`」单独分叉**。`custom: true` 时，props 就不该再接受 `target`、`rel` 这些锚点属性（因为根本不画 `<a>`）；`custom: false` 时又要透传这些属性（但禁止覆盖 `href`）。这套「是否渲染锚点」反映到类型上的条件分叉，是 headless 设计带来的额外类型复杂度——不过这套类型推导怎么安全地组织起来，是下一章「类型安全路由的编译期推导」的主题了。
-
-## 小结
-
-这一章只讲了一件事：**把「当前是否在这个链接上」从「URL 字符串前缀比较」换成「结构化位置的子集判定」**。它的全部精妙都建立在上一章已经搭好的两块地基上——把链接解析成 matched 链 + params 的结构化位置，以及用「记录引用相等 + 参数结构」判定两个位置的关系。本章在这之上做的唯一新动作，就是把「全等」松绑成「子集」，于是「祖先也算激活」这个行为自然涌现，再加上「末端且全等」的紧档补上「精确命中」，两种高亮需求就齐了。别名靠记录回溯到原始记录自动归队，参数的数组/编码差异在解析层就被抹平——这些都是「比结构而非比字符串」顺带送对的，不用专门写规则。
-
-下一章我们会从「运行时怎么判定」跳到「编译期怎么保证你写的链接目标本身就是合法的」——也就是类型安全路由的编译期推导。
+下一章换轨：从「运行期怎么判定」转到「编译期怎么推导」——看类型系统怎么从路由表里反推出每个 `name` 对应的 params 形状，把拼写错误前移到 IDE 红波浪线。

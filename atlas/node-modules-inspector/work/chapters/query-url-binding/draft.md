@@ -1,282 +1,178 @@
 # URL ↔ 状态双向绑定
 
-## 一个让你抓狂的场景
+> 本章属于 composite 层。前置：过滤器与搜索：声明式 schema + 字段 DSL。
+> 学完你能：用一句话讲清"为什么 URL 和状态要双向锁死、双向必然震荡怎么破、什么变化该进历史什么变化只该静默替换"。
 
-想象你正在用依赖分析器排查一个 monorepo 的依赖问题。你勾上了「只看 ESM」、搜索了 `license:MIT`、点开了 `vite@5.0.0` 这个包，视图里高亮了它的依赖链。这时候你想把当前视图发给同事——你复制了浏览器地址栏的链接。
+## 1. 为什么需要它
 
-如果这套机制没做对，链接打开后是空的：筛选没了、选中的包没了、所有上下文都丢了。或者更糟——你自己按一下 F5 刷新，刚才调好的视图也全没了。
+上一章把 rawPayload 按筛选条件逐级缩小成 main → excluded → available → filtered 四层 computed Payload，筛选条件改一下，整张图瞬时跟着变。但留了一个口子没补：**筛选条件本身存在哪里**？默认情况下它们存内存里，一刷新页面就全没了。如果你调好一组筛选、点开某个包，想把当前视图分享给同事，或者自己刷新一下、按一下后退键还希望看到一模一样的画面，单靠内存里的 reactive 对象做不到。
 
-这一章讲的就是怎么让「刷新页面」「分享链接」「按浏览器后退」这三件事都正常工作。核心办法是：**把整个 UI 状态塞进 URL 的 hash 里**，让 URL 成为状态唯一可信的来源。
+办法看起来很直接：把这些状态写进 URL。可一旦真这么做，立刻撞上一个矛盾——
 
-## URL 像一块公共留言板
+状态来源必须**单一**才不会自相矛盾。如果"内存里的 reactive 对象"和"URL"是两份独立数据，刷新时以谁为准？用户改 URL 时怎么让内存跟上？用户在 UI 里勾选时怎么让 URL 跟上？只要有两份数据，就有自相矛盾的可能。
 
-打个比方。内存里的状态对象就像你桌上的便签纸——只有你能看到，关掉浏览器就没了。URL 像走廊上一块谁都能看到的公共留言板——刷新还在，发给别人也能看到。
+本章的设计立场是：**URL 是唯一真源**，内存对象只是它的一份易用副本。所有读写最终都收敛到 URL 上，刷新/分享/后退用的都是同一份 URL，矛盾自然消失。
 
-要做的就是把「桌上的便签」和「走廊上的留言板」用两条方向相反的监听锁死：便签上写新东西就同步抄到留言板；留言板被别人改了（比如你按了后退键）就抄回便签。这样两边永远一致。
+## 2. 核心思想
 
-听起来简单，但实现里有四个零件得拼对，下面一个个拆。
+把整个 UI 状态对象当成 `location.hash` 的"内存镜像"，用两条方向相反的监听把双方锁死，任意一边变了，另一边就跟上。
 
-## 零件一：一个扁扁的状态对象
+听起来简单，难的是"任意一边变了"——你立刻会陷入"我改了 A 通知 B、B 又改了通知 A"的无限回环。本章后面大半篇幅都在讲：怎么让两条监听互相"消音"，以及哪些变化该当作"翻新一页"记进浏览器历史、哪些只该原地静默替换。
 
-要做绑定，先得有「东西」可绑。这套机制的第一个零件，是一个能完整描述「当前视图」的对象。这个对象刻意被做得很扁——所有字段都是字符串，数组也压成逗号串。这是为了 URL 友好：URL 的 query string 本质上就是字符串字典，对象嵌套越浅，序列化越不容易出错。
+## 3. 心智模型
 
-字段大概长这样（伪代码，名称简化过）：
+先看那个内存状态对象长什么样。它是一个 plain reactive 容器，固定 8 个键：选中的节点规格、要安装的输入、维护者操作面板的一组开关（全选/排序/是否带 publint/是否只看最新）、维护者作者筛选、当前激活的 action。所有键都是字符串（数组压成 `+` 连接），刻意扁平化，这样 URL 才友好。
+
+URL 这一侧，键名走 kebab-case（`selected-action`），内存里走 camelCase（`selectedAction`），两条小正则互镜像。数组写时用 `+` 连接，读时同时支持 `,` 和 `+`（URL 里 `+` 是空格的标准编码，又对人眼可读）。
+
+启动期做三件事：从 `location.hash` 反序列化出状态对象（kebab 转 camel）；按 schema 拆开（数组切分、`'true'` 还原成布尔）写回筛选器集合；装上三条运行期监听。
+
+运行期是三条监听在撑：
+
+- **状态 → URL**：内存里任何字段变了，序列化进 hash。
+- **URL → 状态**：浏览器前进/后退、外部链接跳进来，hash 变了，反序列化回写状态。
+- **筛选器集合 → 状态对象**：用 200ms 防抖聚合，让连续勾选不会每次都打 URL。
+
+还有一条小规则：**默认值不写进 URL**。值等于默认时序列化成 `undefined`，键直接缺席。这让 URL 短小、可读、对比友好。代价是默认值在配置里一改，旧链接的语义会跟着"漂"（链接没显式记原默认）。
+
+## 4. 关键权衡
+
+### 给每条同步边装"消音器"
+
+这是整套机制的心脏。
+
+**选择**：在自身触发的回写里包一层忽略器，让反方向监听在这一轮暂时"失忆"。
+**换来**：状态→URL→状态、URL→状态→URL 不形成无限回环，同步只走一轮就停。
+**代价**：开发调试时日志会断片。你在控制台打 query 的 watch 触发，但部分更新被静默吞掉了，看不到完整因果链；要复现 bug 时得手动模拟"忽略器"语义。
+
+**本质矛盾**：双向监听要求"任一端变化都自动同步到对端"，可"自动同步到对端"这个动作本身就会触发对端的反向监听，从而再次同步回来。这是所有双向绑定的结构性宿命。消音器把"我主动写"和"我被同步写"两个事件区分开——前者要触发对端，后者要静默。任何双向绑定场景（前端表单 vs 数据模型、IDE 设置 vs 配置文件、文档编辑器 vs 撤销栈）都逃不开这个模式。
+
+### 选中节点也走 URL
+
+通常 URL 只装筛选条件（哪些复选框勾了、搜了什么词）。本章选择把"我点了哪个包"也序列化进 URL——用包规格字符串 `name@version` 承载。
+
+**选择**：让"选中哪个节点"和筛选条件一起进 URL。
+**换来**：链接可以表达"打开这个工具，过滤出 MIT 包，并选中 lodash@4.17.21"——一个完整的视图快照。同事点开链接就能看到和你一模一样的画面。
+**代价**：反向解析时要拿规格字符串去当前数据集里查节点。如果该包不在当前数据集中（版本漂移、卸载、跑的是另一个 monorepo），就查不到，链接"半失效"——不报错，但选中态变空。用户看到"链接像是有效，但没选中任何东西"，比直接报错更难诊断。
+
+**本质矛盾**：状态的可分享性 vs 数据集是会变的。链接是"快照"，但被快照的"指针"指向一个会变化的目标。这是个无解矛盾，本章选择"宁可半失效也要可分享"。
+
+### 导航语义二分：push 还是 replace
+
+这是这套机制最容易被写错、也最精巧的一处。
+
+**选择**：监听 `() => [query, query.selected]` 这个二元组，回调里对比新旧 selected——只有"选中项"变化才算"导航事件"，走 `router.push` 产生一条历史条目；其它变化（纯筛选/开关）走 `history.replaceState` 原地替换。
+**换来**：浏览器后退键的语义符合直觉。用户点开一个包，按后退回到"还没点这个包"的视图（筛选条件仍在）；再后退才回到"还没勾 license:MIT"的视图。如果反过来把每次筛选都 push，后退键就会变成"逐个撤销复选框"，每按一次只撤一个勾，体验崩溃。
+**代价**：开发者必须显式区分"哪种状态变化算导航"。实现上把"选中项"在监听列表里单列出来对比新旧，逻辑不复杂，但任何新增"算导航的状态字段"都得改这条 watch，是个隐式扩展点。
+
+**本质矛盾**：URL 必须承载全部状态（保证分享/刷新一致）vs 浏览器历史栈要符合"后退一步 = 回到上一个动作"的人体直觉。两个目标对"什么算一步"的定义不同——URL 视角下任何状态变化都是"一步"，但人脑把"切换选中"视为一个动作、把"调一组筛选"视为另一个动作。push/replace 二分就是把这两个"步"切开。
+
+### 筛选→URL 用防抖、URL→筛选立即
+
+**选择**：筛选状态变化后等 200ms 才回写 URL；URL→筛选方向立即生效。
+**换来**：用户连续勾选复选框、拖滑块、敲键盘搜索时，不会每次击键都触发 `history.replaceState`，避免性能浪费和地址栏抖动。
+**代价**：URL 短暂滞后于内存状态，最多 200ms。在这 200ms 里复制链接，可能拿到旧 URL。
+
+**本质矛盾**：交互层的高频变化 vs URL 写入有性能/视觉成本。防抖用"延迟聚合"换"低频写入"，是经典的去抖动模式。但放在双向同步里要小心：防抖只装在"筛选→URL"这条边，反向不装，否则用户按后退键后还要等 200ms 才看到画面变化，体验崩坏。
+
+## 5. 最小原理演示
+
+下面的演示只演两条核心原理：**消音器**和 **push/replace 二分**。其它细节（kebab/camel 转换、schema 驱动、防抖、规格反查节点）都故意省略，避免喧宾夺主。这段代码可以直接粘到浏览器 console 里跑：
 
 ```ts
-const query = {
-  selected: 'vite@5.0.0',          // 当前点中的包，用「包名@版本」表达
-  excludes: 'foo+bar',             // 排除项数组用 + 连接
-  license: 'MIT',                  // 许可证筛选
-  selectedAction: 'migrate',       // 维护者操作面板当前激活的标签
-  actionAll: 'true',               // 一组布尔开关也用字符串
-  // ...更多字段
-}
-```
-
-注意几件事：
-
-- **布尔值用 `'true'` / `'false'` 字符串表达**——URL 没有 boolean 类型，省得另搞编码。
-- **数组用 `+` 连接**——因为 URL 里 `+` 就是空格的标准编码，既能让人读（`a+b` 比 `a%20b` 舒服），又不破坏 URL 语义。
-- **键名**：内存里用 camelCase（`selectedAction`），URL 里用 kebab-case（`selected-action`）。这只是一个镜像对称的正则转换，但它是双向流动的基础——必须有可逆的命名规则。
-
-## 零件二：序列化与反序列化
-
-把状态对象变成 URL 字符串（再变回来）这件事，拆开看要解决三个具体问题：转键名、数组字符串互转、**默认值省略**。
-
-第三点是 URL 短小可读的关键。比如 `actionAll` 默认是 `false`，那 URL 里就根本不出现这个键；只有当用户勾上「全选」时，URL 才多出一个 `action-all=true`。读回来时，键缺席就当作默认值。两个链接一对比，差异部分一目了然——而不是被一堆 `=false`、`=default` 这种「等于没说」的字段淹没。
-
-反向解析就是镜像：遍历 URL 里的键，按字段元数据（标注了每个字段是 Array / Boolean / String）分别走 split / `=== 'true'` / 原值的还原分支。
-
-## 零件三：双向监听与消音器（最容易写错的地方）
-
-现在到了整章最核心、也最容易写错的地方——**两条方向相反的监听**。
-
-- **A 路：状态 → URL**。监听 `query` 对象，任何字段一变就重新序列化写回 `location.hash`。
-- **B 路：URL → 状态**。监听 URL，浏览器后退/前进触发时就反序列化赋回 `query`。
-
-问题来了。假设用户改了 `query.selected`：
-
-1. A 路触发，写 `location.hash = '#selected=vite@5.0.0'`。
-2. hash 变了，B 路触发，把 `vite@5.0.0` 又赋回 `query.selected`。
-3. `query.selected` 又「变了」（其实只是被赋了同值），A 路又触发……
-4. 死循环。
-
-**解法是给一条路装上「消音器」**：B 路在赋值时，包一层「忽略器」，让 A 路在这一轮临时失忆。
-
-```js
-// 消音器的本质就这么几行
-let isInternalUpdate = false
-
-// A 路：状态 → URL
-function onStateChanged() {
-  if (isInternalUpdate) return     // 是 B 路触发我的？那我不干活
-  location.hash = stringify(query)
-}
-
-// B 路：URL → 状态
-function onUrlChanged() {
-  isInternalUpdate = true          // 张贴「自己人」告示
-  Object.assign(query, parse(location.hash))
-  isInternalUpdate = false         // 撤告
-}
-```
-
-实际工程代码里这个布尔标志被一个叫 `ignorableWatch` 的工具函数包成了 `ignoreUpdates(callback)`——但它本质就是这个布尔标志。**记住这一点**：双向同步的标配是给至少一条边装消音器。
-
-## 零件四：push 还是 replace？这是个语义问题
-
-到这里还有个细节没解决。写 URL 有两种方式：
-
-- `router.push(hash)`：**新增**一条历史记录。用户按浏览器后退能回到上一个状态。
-- `history.replaceState(..., hash)`：**原地替换**当前历史记录。后退不会回到上一个状态。
-
-哪种该用？要看「状态变化算不算导航事件」。
-
-- 用户**点了一个新包** → 这是一次「导航」——他想后退回到「还没点这个包」的状态。用 **push**。
-- 用户**勾了一个筛选条件** → 这是「调整当前视图」，不是导航。如果每次勾选都 push，按一下后退只能撤销一次勾选，得按十几次才能回到上一个真正不同的视图。用 **replace**。
-
-判定逻辑很简单：监听一个二元组 `[query, query.selected]`，回调里对比新旧值的第二项（也就是 `selected`）——变了走 push，没变走 replace。换句话说，「哪些字段算导航字段」是一个**显式的、小而硬的列表**，目前只有 `selected` 一个。
-
-## 演示：从零写一个最小双向绑定
-
-把上面四块拼起来。下面这段演示你可以粘到浏览器 console 跑（不需要 Vue、不需要任何框架）。它演的是「权衡 1（消音器）+ 权衡 3（push/replace 二分）」这两个最容易写错的点：
-
-```js
-// ============ 状态对象（用 Proxy 模拟响应式）============
-const _query = { selected: '', esmOnly: false }
-let lastSelected = ''
-const query = new Proxy(_query, {
-  set(t, k, v) { t[k] = v; syncToUrl(); return true }
+// 内存状态：用 Proxy 让每次赋值都触发同步（Vue reactive 的最小等价）
+const state = new Proxy({ selected: '', license: '' }, {
+  set(t, k, v) { (t as any)[k] = v; if (!isInternal) syncToUrl(); return true },
 })
 
-// ============ 序列化 / 反序列化（默认值省略）============
-function stringify(q) {
-  const out = []
-  if (q.selected) out.push('selected=' + q.selected)
-  if (q.esmOnly)  out.push('esm-only=true')
-  return out.join('&')
-}
-function parse(hash) {
-  const o = { selected: '', esmOnly: false }
-  for (const kv of hash.replace(/^#/, '').split('&').filter(Boolean)) {
-    const [k, v] = kv.split('=')
-    if (k === 'selected') o.selected = v
-    if (k === 'esm-only') o.esmOnly = v === 'true'
-  }
-  return o
-}
+// 模拟浏览器历史栈
+const stack: string[] = []
+let cursor = -1
+function push(h: string)    { stack.splice(cursor + 1); stack.push(h); cursor++ }
+function replace(h: string) { if (cursor === -1) push(h); else stack[cursor] = h }
 
-// ============ 关键：消音器 ============
+// 消音器：本轮主动赋值时置 true，让反向监听跳过
 let isInternal = false
+let lastSelected = state.selected
 
-// A 路：状态 → URL
+// 状态 → URL
 function syncToUrl() {
-  if (isInternal) return              // ← B 路本轮触发我？退出
-  const hash = '#' + stringify(_query)
-  if (_query.selected !== lastSelected) {
-    history.pushState(null, '', hash)    // 选中变了 → 导航事件
-    console.log('[A] push   ', hash)
-  } else {
-    history.replaceState(null, '', hash) // 仅筛选变 → 原地替换
-    console.log('[A] replace', hash)
-  }
-  lastSelected = _query.selected
+  const hash = `#selected=${state.selected}&license=${state.license}`
+  if (state.selected !== lastSelected) push(hash)     // 选中变了 → 进新历史条目
+  else                                  replace(hash) // 纯筛选变化 → 原地静默替换
+  lastSelected = state.selected
+
+  isInternal = true                                   // 主动写了 URL，本轮静默反向监听
+  location.hash = hash
+  setTimeout(() => { isInternal = false })
 }
 
-// B 路：URL → 状态
-function syncFromUrl() {
-  isInternal = true                   // ← 消音器开启：让 A 路本轮静默
-  const parsed = parse(location.hash)
-  Object.keys(parsed).forEach(k => query[k] = parsed[k])
-  // ↑ 通过 Proxy 赋值会触发 syncToUrl，但被消音器挡下
-  lastSelected = _query.selected
-  isInternal = false                  // ← 消音器关闭
-  console.log('[B] synced ', JSON.stringify(_query))
-}
-
-// 让 push/replace 也通知 B 路（模拟 Vue Router 的 route.hash 响应式，
-// 默认 pushState/replaceState 不触发任何事件，只有 popstate 会）
-;['pushState', 'replaceState'].forEach(fn => {
-  const orig = history[fn]
-  history[fn] = function (...args) { orig.apply(this, args); syncFromUrl() }
+// URL → 状态（浏览器前进/后退、外部链接）
+window.addEventListener('hashchange', () => {
+  if (isInternal) return                              // 消音器命中，本轮跳过
+  const params = new URLSearchParams(location.hash.slice(1))
+  isInternal = true                                   // 反向赋值同样要静默，避免再触发 syncToUrl
+  state.selected = params.get('selected') ?? ''
+  state.license  = params.get('license')  ?? ''
+  setTimeout(() => { isInternal = false })
 })
-window.addEventListener('hashchange', syncFromUrl)
-window.addEventListener('popstate', syncFromUrl)
 ```
 
-**玩一下**：
+不到 30 行落了两条原理：
 
-1. 在 console 里执行 `query.esmOnly = true`。你会看到两条日志：`[A] replace #esm-only=true` 和 `[B] synced {"selected":"","esmOnly":true}`。A 写完 URL，B 立刻读回来同步——但 A 没被再次触发（被消音器挡住）。
-2. 执行 `query.selected = 'vite@5.0.0'`。这次 A 走的是 `push`。
-3. 把代码里 `if (isInternal) return` 这一行注释掉重跑步骤 1。console 会无限打印 `[A] replace` 和 `[B] synced` 直到标签页卡死——这就是没装消音器的后果。
+- **消音器**：`isInternal` 标志位。任何主动写——不管是状态写 URL、还是 URL 反向写状态——都先置 true，本轮反向监听跳过；下个 tick 复位。
+- **push/replace 二分**：对比 `state.selected` 的旧值，变了 push，没变 replace。
 
-第 3 步是关键的「反面教材」：消音器不是可选的优化，是必需的。
+你可以手动跑这两个场景验证：
 
-## 关键权衡（这一章的核心交付）
+```ts
+// 场景 A：用户勾选 license=MIT，紧接着点节点
+state.license = 'MIT'                  // → replace（selected 没变）
+state.selected = 'lodash@4.17.21'      // → push（selected 变了）
 
-这套机制做了 5 个有意思的设计选择。下面一条条拆开讲——每条都是「做了 X 选择 → 换来了 Y → 代价是 Z」的结构。
-
-### 权衡 1：消音器换无回环，代价是调试困难
-
-**选择**：在反向赋值（URL → 状态）那一步包一层「忽略器」，让正向监听（状态 → URL）暂时失忆。
-
-**换来**：「状态→URL→状态→URL→……」不会形成无限回环。这是双向同步的命门——没有消音器，浏览器会在一瞬间被无限写 hash 卡死。演示里的步骤 3 已经让你眼见为实了。
-
-**代价**：开发调试时因果链被截断。比如你打日志想知道「为什么 URL 被多写了一次」，但有些更新是被静默吞掉的（因为它们发生在忽略器作用域内），日志看不到完整的「谁触发了谁」。排查 bug 时要多绕几步：要么临时关掉消音器重现回环、要么手动加打印看实际经过的赋值。这是个隐性的开发税，平时感觉不到，出问题时会让人挠头。
-
-### 权衡 2：选中节点也序列化进 URL，代价是链接可能「半失效」
-
-**选择**：让「我点了哪个包」也走 URL，用包规格字符串（`name@version`）承载。
-
-**换来**：分享链接不仅传达「对方该勾什么筛选」，还传达「对方该看哪个包」。同事点开链接，自动滚动到、自动高亮你看到的那一个节点。这是「分享精确视图」的标配——没有它，分享链接打开后只看到筛选后的列表，还得手动找你说的那个包。
-
-**代价**：反向解析时要把 `vite@5.0.0` 这个字符串去当前依赖数据集里查节点对象。如果对方的项目里没有这个包（被卸载了、或者版本漂移到 `5.0.1` 了），就查不到——链接不会报错，但「选中态」是空的。这是一种**软失败**：链接看起来正常打开，但用户看不到预期的高亮，得自己摸索。换来的好处太大，所以团队接受了这个代价。
-
-### 权衡 3：push 与 replace 二分，代价是「导航字段」要显式维护
-
-**选择**：把「切换选中节点」判为导航事件，走路由 push（产生可前进/后退的历史条目）；把「调筛选条件」判为视图调整，走原地 replace（不污染历史）。
-
-**换来**：浏览器后退键的语义符合直觉。用户按一下后退，回到「刚才看的那一个包」；再按一下，回到「上一个包」。如果筛选也用 push，用户在某次会话里勾了 10 次复选框，按后退就得连按 10 次才能跳过这次会话——这是糟糕的体验，用户的主观感受是「我什么都没干，为什么后退键没反应」。
-
-**代价**：开发者必须显式区分「哪种状态变化算导航」。当前实现是用一个二元组监听 `[query, query.selected]`，靠对比新旧 `selected` 来判定——但这意味着「哪些字段算导航字段」是一个**硬编码的、隐藏的列表**。如果未来想新增一个「也算导航」的字段（比如切换 tab），得回去改这个监听源，而且很容易忘。这是一个小但真实的耦合点。
-
-### 权衡 4：筛选→URL 防抖，URL→筛选立即
-
-**选择**：用户在筛选面板里连续勾选复选框、拖滑块时，状态变化先攒着，200ms 没新动作才回写 URL；反过来，URL 变了（按后退）要立即应用到状态。
-
-**换来**：用户连续操作时不会每下都触发 `history.replaceState`。`replaceState` 不便宜——浏览器要序列化历史状态、可能触发滚动位置记忆，连续触发会引起肉眼可见的卡顿。攒 200ms 写一次就把高频操作压成一两次历史写入。
-
-**代价**：URL 在那 200ms 内是滞后的。如果用户在 200ms 窗口内复制了链接，拿到的是旧 URL（缺少他刚勾的筛选）。这是一个很小的代价——人手动复制链接的反应时间通常远超 200ms，所以实际几乎不会被踩到——但理论上存在，值得知道。
-
-### 权衡 5：默认值不写入 URL，代价是默认值会「漂」
-
-**选择**：序列化时，如果某个字段的值等于它的默认值，就写 `undefined`，让 URL 里干脆不出现这个键。
-
-**换来**：URL 短、可读、对比友好。前面已经说过：两个链接一对比，差异部分一目了然，而不是被一堆 `=false` 这种「等于没说」的字段淹没。这个收益看似小，但对于「分享链接、对比链接」这种高频场景，体验提升是实打实的。
-
-**代价**：如果哪天配置里改了某个字段的默认值（比如 `actionAll` 从 `false` 改成 `true`），所有旧链接里这个键都是缺席的——按新默认值解释，语义就跟着变了。换句话说，旧链接的语义依赖「当时的默认值」，而默认值没有被显式记录在 URL 里。这是一种**隐式约定**：链接的稳定性建立在「默认值不变」的前提上。如果默认值频繁调整，老链接会逐渐失真。
-
-## 一条完整的执行轨迹
-
-把所有零件串起来，看一次真实操作的全过程：
-
-**操作 1**：用户在筛选面板勾上「只看 MIT」。
-
-```
-勾选 → query.license = 'MIT'
-     → 等 200ms（防抖窗口）
-     → 序列化：license=MIT（其它默认值省略）
-     → selected 没变 → history.replaceState
-     → URL 静默替换为 #license=MIT
+// 场景 B：模拟浏览器后退到上一条历史
+location.hash = '#selected=&license=MIT'
+// hashchange 触发 → 反序列化回写 state.selected = '' → 消音器防止再次 syncToUrl
+// 视图回到"还没点这个包"，但 license=MIT 仍在
 ```
 
-**操作 2**：用户接着点击 `vite@5.0.0` 包节点。
+## 6. 执行轨迹
 
-```
-点击 → query.selected = 'vite@5.0.0'
-     → 监听器检测到 selected 新旧不同
-     → 走 router.push（产生历史条目）
-     → URL 变为 #license=MIT&selected=vite@5.0.0
-```
+把上面的演示代入真实场景。
 
-**操作 3**：用户按浏览器后退。
+**输入 1**：用户在筛选面板里勾选 `license:MIT`。
 
-```
-popstate 事件触发
-  → URL 变回 #license=MIT
-  → B 路监听触发
-  → ignoreUpdates(() => Object.assign(query, parse(hash)))
-       ↳ 消音器开启
-       ↳ query.selected 被赋回 ''
-       ↳ A 路在这轮被静默，不再写 URL
-       ↳ 消音器关闭
-  → 视图回到「还没点 vite」的状态，筛选仍在
-```
+1. 内存筛选器对象更新（`filters.license = ['MIT']`）。
+2. 200ms 防抖定时器启动——这一刻 URL 还没变。
+3. 200ms 到，`filtersToQuery` 把 filters 序列化进 `query`（数组用 `+` 连接、默认值省略成 `undefined`）。
+4. `query` 那条 watch 触发，对比新旧 selected——相等，走 `history.replaceState`。
+5. URL 静默替换为 `#license=MIT`，地址栏变化但不产生新历史条目。
 
-**操作 4**：再按一次后退。
+**输入 2**：用户紧接着点击某个包节点。
 
-```
-popstate → URL 变回 ''
-  → query.license 被赋回 ''（默认值）
-  → 视图回到「还没勾 MIT」的初始状态
-```
+1. 包的规格字符串 `lodash@4.17.21` 被赋给 `query.selected`。
+2. watch 触发，对比新旧 selected——不等，走 `router.push`。
+3. 浏览器历史栈多一条：`#selected=lodash@4.17.21&license=MIT`。
 
-整个语义符合直觉：每按一次后退，撤销一次「用户主观上的一个动作」，而不是撤销一次「代码层面的字段赋值」。这正是权衡 3 想要的效果。
+**输出**：用户按浏览器后退键。
 
-## 小结
+hash 变回 `#license=MIT`（上一条历史）。hashchange 触发反向 watch，在 `ignoreUpdates` 里反序列化回写 `query.selected = ''`。因为包了忽略器，本轮回写不会触发"query→hash"那条 watch 再写一次 URL，回环被切断。视图回到"还没点这个包"的状态，但 license=MIT 筛选仍在。
 
-这一章讲的是怎么让 URL 成为状态唯一可信的来源。拆开看是四个零件：
+再按一次后退：hash 变回最初始的空状态，license=MIT 也撤掉。整套语义符合"后退一步 = 回到上一个动作"——切换选中算一步，调一组筛选算另一步。
 
-1. 一个扁平的状态对象（所有字段都是 URL 友好的字符串）
-2. 一对镜像的序列化/反序列化函数（含默认值省略）
-3. 两条方向相反的监听 + 消音器防循环
-4. push / replace 的语义二分（哪些状态变化算导航）
+## 7. 教学简化说明
 
-加上一些工程细节（防抖、kebab/camel 转换、数组用 `+` 连接），就构成了整套机制。
+本章演示故意省略了这些：
 
-核心原理只有两条，所有「URL ↔ 状态」绑定都会遇到，不限于这个项目、不限于 Vue、不限于任何框架：
+- **kebab/camel 案式互转**：两条小正则，字符层细节，与双向同步原理无关。
+- **schema 驱动的字段迭代**：真实代码用一份 `FILTERS_SCHEMA` 元数据驱动序列化（按字段类型分 split / `=== 'true'` / 原值），新增筛选维度时 URL 序列化是自动的。演示里写死字段，省掉这层。
+- **200ms 防抖**：真实代码用 `debouncedWatch` 把"筛选→URL"那条边防抖；演示里去掉防抖以突出主线（消音器 + push/replace）。
+- **规格字符串反查节点对象**：选中态从 URL 反序列化回来后，要去主载荷 Map 里查 `name@version` 对应的节点对象——这是消费侧逻辑，与绑定机制本身无关。
 
-- **双向同步必然震荡，所以给一条边装消音器**。
-- **语义不同的状态变化要走不同的历史 API**——「导航」用 push，「调整」用 replace。
+另外，设置类偏好（侧栏折叠、配色、徽章开关）**故意不走 URL**，而走 `localStorage`——那是"个人长期偏好通道"，与"可分享视图"正交，本章不展开。
 
-把这两点想通，剩下都是工程实现的细节。
+## 8. 小结
+
+把 URL 当唯一真源、把内存状态当它的一份易用副本——"状态存在哪"这个看似工程的小决定，做成了"刷新/分享/后退"三种用户行为都收敛到同一处的设计选择。这一章把"状态搬到 URL"做完整了：双向监听 + 消音器让同步只走一轮不回环，push/replace 二分让后退键符合人体直觉。
+
+下一章换到完全不同的方向：当状态要跨进程同步（前端 ↔ 后端 node 服务）时，怎么把同一份 handler 函数适配到 websocket / 静态 dump / MCP 三种传输上。

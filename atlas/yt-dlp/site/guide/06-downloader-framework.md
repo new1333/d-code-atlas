@@ -1,311 +1,180 @@
 # 协议字段驱动的下载策略分派
 
-## 编排器不想知道"这个视频怎么下"
+> 本章属于 composite 层。前置：info_dict 数据总线与提取器骨架。
+> 学完你能：用一句话讲清"为什么编排器不需要 `if/else` 判断协议、却又不可避免地长出了另一片条件分支"。
 
-想象你是那个负责"把视频从网上拿下来"的编排器。同样一句话"下载这个视频"，背后可能是：一个普普通通的 HTTP 文件、一份 HLS 播放列表（一长串小切片）、一条 RTMP 直播流、一段被切片的 DASH 流，甚至要分别拉一条纯视频流和一条纯音频流、边下边合并。
+## 1. 为什么需要它（设计动机）
 
-如果你的做法是：
+上一章把站点下发的签名/混淆脚本在进程内解出来——那是 info_dict 在被送进下载阶段之前的一次前置加工。现在 URL 备好了，字典终于要被交到那个真正把字节写到磁盘的环节。但这里马上冒出一个矛盾。
+
+同样是"下载一个视频"，背后可能是普通的 HTTP 文件、一条 HLS 播放列表、一个 RTMP 直播流、一段被切片的 DASH 流，甚至需要把分离的音视频两条流边下边合并。每种姿势完全不同：HLS 要按 m3u8 文件里的分片列表逐个 GET，RTMP 要走 Adobe 的握手协议，DASH 要解析 MPD manifest。如果编排器自己写 `if 是 HLS … else if 是 RTMP …`，它就会被无穷无尽的协议细节淹没，而且每新增一种协议都要回去改核心流程。
+
+使用者真正想要的只是"给我这个视频文件"，至于用哪种姿势拿到——那是下载阶段自己的事，不该泄漏到上层。这套机制要解决的矛盾就是"下载实现的高度多样性"与"编排器想保持简单稳定"之间的张力。
+
+## 2. 核心思想
+
+让数据自带"我该被怎么下载"的标签，再用一张分派表把标签翻译成具体的下载策略——分派方退化成查表，编排器对下载细节完全无感。新增一种协议，编排器一行代码都不用改。
+
+## 3. 心智模型
+
+把整个分派流程拆成六步看：
+
+1. 编排器拿到 info_dict，调一句 `get_suitable_downloader(info)`。
+2. 先算协议字段：优先读字典里已填好的 `protocol`，否则按 URL 兜底——`rtmp` 前缀→`rtmp`；扩展名 `.m3u8` 时直播走 `m3u8`、非直播走 `m3u8_native`；`.f4m`→`f4m`；最后退回 URL 的 scheme（http/https/ftp）。
+3. 协议字段可能含 `+`（说明目标由多种协议拼接，例如分离的音视频两条流），按 `+` 拆开**逐个**查表。
+4. 对每段协议：若用户配了外部下载器（aria2c/ffmpeg/curl…），先问它 "你 `available` 且 `supports` 吗"——能就让它接管；否则落到分派表里的默认原生下载器。
+5. 合并各段选出的下载器：若都是那个"既能下又能合并"的多面手 FFmpeg 且条件满足，就交给它一次性边下边合；若只选出一个就直接用；否则返回 `None`（没有单一下载器能整体搞定，交还上层另走"分别下、后处理合"的路径）。
+6. 选定下载器后，编排器把进度钩子挂上去，调它的公共 `download()`——基类先做完"已存在就跳过 / 续传 / sleep 限速"等横切流程，最后才委托给子类的 `real_download` 钩子。
+
+## 4. 关键权衡
+
+### 字段驱动换编排器零侵入，代价是分派函数沦为特例分支海洋
+
+选择：让 info_dict 自带 `protocol` 字段驱动策略选择。
+换来：编排器对下载细节完全无感，新增一种协议只要在 `PROTOCOL_MAP` 里加一行映射。
+代价：协议→下载器之间所有"字段不足以表达"的特例——`section_start/end` 时间区间裁剪、`m3u8` 直播、`hls_prefer_native` 偏好、`http_dash_segments` 直播——全部以裸 `if` 堆叠在同一个分派函数里，没有任何对象模型。每出现一种新情况就补一个分支，分派函数事实上承担了"协议字段之外的二次策略裁决"，可读性随协议增多持续劣化。
+
+**本质矛盾**：声明式的字段驱动想用一张平表表达"什么协议用哪个下载器"，但现实的下载策略包含大量上下文相关、用户偏好相关、合并可行性相关的动态决策——平表表达不了动态，于是动态部分只能漏到分派函数里退化成条件分支。这是「用静态字段表达动态策略」这一类问题的通病：字段驱动越纯粹，能表达的越少；为了让它能扛住复杂现实，就要不停地往分派函数里塞例外。
+
+### 内置与外置下载器共用同一套抽象，换无差别路由
+
+选择：把外部可执行程序（aria2c / ffmpeg / curl / wget）也实现成 `ExternalFD` 子类，和原生内置下载器（HttpFD / HlsFD）继承自同一个基类。
+换来：编排器无差别对待"调子进程拉文件"和"进程内下载"——一行 `--downloader aria2c` 就能切换，路由代码完全不知道差别。
+代价：外部下载器必须做两件原生下载器不用做的事——把数据字典翻译成对方能理解的命令行参数（每个工具一套适配，写在 `_make_cmd` 里），并自己探测"我能不能下这个"。代价薄到不展开，主要是多一层命令行翻译。
+
+**本质矛盾**：能力异构的下载后端在路由层看起来必须同形——一个是进程内的字节流写盘、另一个是 fork 一个外部进程并喂命令行参数。否则编排器就要为每种后端写专属分支，统一抽象的代价就是把"翻译成对方能理解的形式"强行加到外部一侧。
+
+### 能力自报换可插拔与优雅降级
+
+选择：把"我能下吗"做成下载器自报能力——每个外部下载器声明 `SUPPORTED_PROTOCOLS` / `SUPPORTED_FEATURES`，分派方用 `can_download = available and supports` 逐个询问。
+换来：多后端可插拔、能优雅降级到下一个候选——aria2c 没装？试试 ffmpeg；都不行？退回原生 HttpFD。
+代价：每个下载器都必须老实声明自己的能力边界，否则要么被错误启用（声明过度，下载到一半才发现搞不定），要么永远没机会上场（声明过窄）。
+
+> 这条与第 1 章『传输层』的 `validate / UnsupportedRequest` 能力探测同构——一个是请求处理器层、一个是下载器层，本质都是"用自报能力换可插拔"。这里只点一句，不展开。
+
+### 横切关注点收进基类，换子类只填一个钩子
+
+选择：把限速（`slow_down`）、断点续传、临时 `.part` 文件（`temp_name`）、文件访问重试（`wrap_file_access`）、进度钩子、多行进度条这些和具体协议无关的横切关注点全部收进 `FileDownloader` 基类的 `download()` 公共流程。
+换来：每个具体下载器子类只需实现"真正把字节写下来"这一个钩子——`real_download(filename, info_dict)`，几十行就够。
+代价：基类日益臃肿到几百行，且子类与基类之间通过一个巨大的 params 选项字典做隐式耦合（`nopart` / `ratelimit` / `sleep_interval` / `file_access_retries` 等几百个键全靠文档约定，无编译期契约）。基类还通过 `_set_ydl` 把编排器的 `report_error` / `to_screen` / `trouble` 等方法 setattr 到自己身上——子类写 `self.to_screen(...)` 时不必每次穿过 `self.ydl`，但下载器实例和编排器之间就此形成隐式的双向耦合。
+
+> "基类吸收横切样板"这个分工思想在第 4 章『info_dict 数据总线与提取器骨架』的 InfoExtractor 基类上已讲透。本章不再重讲抽象原理，只看它具体吸收了哪些横切。
+
+## 5. 最小原理演示
+
+下面这段 TS 演示演透"字段驱动 + 能力自报 + 公共流程委托钩子"这条主干。每行都对应上面某个原理点：`PROTOCOL_MAP` 演字段驱动，`ExternalFD.supports/canDownload` 演能力自报，`pickForOneProtocol` 演外部下载器自荐接管，`getSuitableDownloader` 的 `+` 拆分演多协议合并，`FileDownloader.download` 演横切流程委托 `real_download` 钩子。
 
 ```ts
-if (url 后缀是 m3u8) 用 HLS 下载器
-else if (url 是 rtmp) 用 RTMP 下载器
-else if (要合并音视频) 用 ffmpeg
-else ...
-```
-
-那你就惨了。每一种协议的细节都会涌进你的核心流程，而且每多支持一种协议，你都得回来改这段 `if/else`。更糟的是，用户今天想用内置下载器、明天想换成 aria2c 加速，这个选择也不该是你操心的。
-
-使用者真正想说的只有一句："**给我这个视频文件**"。至于用哪种姿势把它拿下来——那是下载阶段自己的事，不该漏到上层。
-
-这一章要讲的就是 yt-dlp 怎么做到这件事的：**让数据自己带一个"我该被怎么下载"的标签，再用一张表把标签翻译成具体的下载器**。上层只负责把数据递过来，完全不碰下载细节。
-
-## 一个标签决定一切：协议字段驱动
-
-先打个比方。快递分拣中心里，每个包裹上都贴着一张运单标签——写明这件走空运、那件走陆运、还有一件得专人押送。分拣员根本不需要打开箱子判断内容，只看标签就把包裹丢到对应的传送带上。
-
-这里那张"运单标签"就是信息字典里的 **`protocol` 字段**。分派函数拿到一个描述目标视频的字典后，第一件事就是把这个标签读出来（字典里没填就按 URL 兜底推断），然后查一张"协议 → 下载器"的对照表，命中谁就用谁。
-
-> 跨章一句：这个信息字典是整个系统贯穿各阶段的"公共语言"，第 4 章已经讲透它是怎么在提取器→编排器→下载器→后处理器之间流动的。本章只盯着它的一个新侧面——字典里那个 `protocol` 字段，是怎么被下载阶段消费、驱动策略选择的。
-
-整个分派的心智模型，六步走完：
-
-1. 编排器拿到目标视频的字典，喊一句"给我合适的下载器"。
-2. 先**算出协议字段**：优先读字典里已填好的 `protocol`，没填就按 URL 前缀/扩展名兜底（rtmp 前缀、m3u8 扩展名、f4m 扩展名，最后退回 URL 的 scheme）。
-3. 字段里可能带 `+`（表示这个目标由好几种协议拼成，比如分离的音视频），按 `+` 拆开，**逐个**查表。
-4. 每一段协议：如果用户配了外部下载器，先问它"你装了吗、这个活你能接吗"——能就让它接管；否则落到表里的默认原生下载器。
-5. 合并各段选出的下载器：要是全都落到了那个"既能下又能合并"的多面手 ffmpeg 且条件满足，就交给它一次性边下边合；只选出一种就直接用；否则返回"没有单一下载器能整体搞定"，交还上层另想办法。
-6. 选定下载器后，编排器把进度钩子挂上去，调它的公共 `download()`——基类先跑完"已存在就跳过/续传/限速"这些通用流程，最后才委托给子类那个"真正把字节写下来"的钩子。
-
-接下来自底向上拆：先看"下载器"这个最小零件长什么样，再看标签怎么来、怎么翻译、怎么拼接。
-
-## 最小零件：一个下载器对象长什么样
-
-不管协议多花哨，所有下载器对外都得是同一个样子——都有一个 `download(filename, info_dict)` 方法。这样编排器调用时根本不用管底下是哪个类。
-
-这个统一的样子由基类 `FileDownloader` 定。它干两件事：
-
-**第一件，把所有协议都要做、但跟协议无关的杂活全揽下来。** 限速（下太快就主动睡一会儿把均速压下来）、断点续传、临时 `.part` 文件（先下到 `xxx.part`，下完再原子改名回真名，保证半成品不覆盖好文件）、文件访问出错重试（文件被占用之类的瞬时错误，重试几次而不是直接失败）、进度钩子（把同一个进度字典依次喂给所有挂上来的钩子，编排器据此更新进度条）——这些横切关注点全在基类里。
-
-**第二件，给子类只留一个钩子。** 基类的 `download()` 把上面那些杂活跑完之后，最后才调用 `real_download(filename, info_dict)`——这个方法在基类里直接抛 `NotImplementedError`，子类必须自己实现。换句话说，子类只管一件事："真正把字节写下来"，其余的基类都帮你做完了。
-
-```ts
+// 下载器基类：横切流程 + 委托子类钩子
 abstract class FileDownloader {
-  params: Record<string, unknown>
-  download(filename: string, info: Info): boolean {
-    // 横切：已存在且允许续传 → 跳过
-    if (this.params.continuedl && exists(filename)) return true
-    // 横切：站点规定此刻才能下 → 先睡
-    if (info.available_at) this.sleepUntil(info.available_at)
-    // 横切都跑完 → 委托给子类的"真正下载"
-    return this.real_download(filename, info)
+  constructor(public params: any) {}
+  download(filename: string, info: any): boolean {
+    if (exists(filename) && !this.params.overwrite) return true   // 已存在跳过
+    this.maybeSleep()                                              // sleep 限速等横切
+    const tmp = filename + '.part'                                 // 临时 .part 文件
+    try { return this.real_download(tmp, info) }                   // 委托子类真正写盘
+    finally { tryRename(tmp, filename) }                           // 原子重命名收尾
   }
-  abstract real_download(filename: string, info: Info): boolean
-}
-```
-
-> 跨章一句："基类吸收所有横切样板、子类只填一个钩子"这个分工，第 4 章在提取器基类上已经讲透（一个 `_real_extract` 钩子 + 一整套抓取样板）。这里是同一个思想，换到下载器上的具体落地——它多出来的代价，放到本章末尾的关键权衡里细说。
-
-## 标签从哪来：`determine_protocol`
-
-协议字段优先信提取器填好的——提取器解析站点时已经知道这是 HLS 还是 RTMP，直接写进 `info_dict['protocol']`，下载阶段照单全收。
-
-问题是有些老字典没填这个字段。那就按 URL 兜底推断：URL 以 `rtmp` 开头就当 RTMP；扩展名是 `m3u8` 就当 HLS（但直播和非直播要区分，下面单独说）；扩展名是 `f4m` 就当 F4M；都匹配不上，就退回 URL 的 scheme（http/https/ftp……）。
-
-这里有个很能说明问题的细节：**同一个 `.m3u8` 文件，直播和点播会落到两个不同的下载器上。** `determine_protocol` 看到 `m3u8` 扩展名时，会看 `is_live`：直播返回 `m3u8`，点播返回 `m3u8_native`。而这两个字段在分派表里指向的下载器完全不同——点播走原生 HLS 下载器，直播交给 ffmpeg。说人话就是：决定用哪个下载器的不是 URL 长什么样，而是数据里那个标签说什么。
-
-## 一张表翻译标签：分派表与原生下载器
-
-有了标签，就靠一张 `PROTOCOL_MAP` 把它翻译成下载器类：
-
-```
-rtmp          → RtmpFD
-m3u8_native   → HlsFD        （点播 HLS，原生逐片下载）
-m3u8          → FFmpegFD     （直播 HLS，交给 ffmpeg）
-f4m           → F4mFD
-http_dash_segments → DashSegmentsFD
-... 各种直播协议 → 各自专用 FD
-查不到        → 退回 HttpFD   （兜底的通用 HTTP 下载器）
-```
-
-查表这一步极其直白：拿到协议字符串，去表里取对应的类，没有就给默认的 `HttpFD`。新增一种协议？在表里加一行、写一个新的 `XxxFD` 类，编排器一行都不用改。
-
-不过现实没这么干净——直播要换下载器、用户偏好原生还是外部、时间区间裁剪必须用 ffmpeg……这些"协议字段表达不了"的特例，最后全堆进了查表函数里，长成一片裸的 `if`。这正是本章最核心的权衡，先记住，后面专门展开。
-
-## 外部下载器：子进程也来抢活
-
-到目前为止说的都是"进程内下载"——下载逻辑就在 yt-dlp 自己的进程里跑。但用户常常想用 aria2c 多线程加速，或者直接让 ffmpeg 拉流。这些是**外部可执行程序**，运行方式完全不同：组命令行、起子进程、等退出码。
-
-有趣的是，yt-dlp 没有为它们另起一套体系。外部下载器（aria2c/ffmpeg/curl/wget/…）和原生下载器**共用同一套抽象**——同样继承自基类那一脉，同样对外暴露 `download()`。所以对编排器来说，"调子进程拉文件"和"进程内下载"没有任何区别，`--downloader aria2c` 一个开关就能整体换引擎。
-
-那外部下载器怎么"被选中"？靠它自己毛遂自荐。每个外部下载器类都声明两样东西：一个 `SUPPORTED_PROTOCOLS`（我能下哪些协议），一个 `SUPPORTED_FEATURES`（我支持哪些特性，比如能不能输出到 stdout、能不能一次处理多个格式）。分派时，先看用户配没配外部下载器，配了就调它的 `can_download` 自检——**`available`（我可执行文件装了吗）且 `supports`（这个活在我的能力清单里吗）**，两项都过就由它接管。
-
-`supports` 这个自检问了四件事：要不要输出到 stdout（不是所有工具都支持）、协议里有没有 `+`（多协议只有 ffmpeg 能整）、有没有碰上 HLS 的 AES 加密分片（外部工具搞不定加密）、目标协议是不是全在我的清单里。
-
-> 跨章一句：这套"下载器自报能力、分派方逐个问、首选不行就降级"的机制，和第 1 章传输层那套"handler 自报能力 + Director 按偏好择优"是同构的，那里已经展开过，这里不重复。本章只看它落在下载器上的这四项自检。
-
-至于"怎么知道世界上有哪些外部下载器"——靠一个约定：**类名以 `FD` 结尾，就自动被收进一张发现表**。模块加载完，扫一遍全局命名空间，把所有 `XxxFD` 按类名登记好。新增一个外部下载器？写个 `XxxFD` 类，自动就被收编了，不用改任何注册表。
-
-> 跨章一句：这个"后缀即类型、约定胜配置"的发现机制，和第 2 章插件注册（IE/PP/RH 后缀）是同一个思想，那里讲透了为什么约定胜过显式注册表，这里不重讲。
-
-## 多协议拼接：拆开逐个查，能合则合
-
-有些目标不是单一协议能搞定的。最典型的是分离的音视频：视频流是一条 m3u8、音频流是另一条 http。这种情况下，`protocol` 字段长这样：`https+m3u8_native`，中间一个 `+` 把两段协议拼起来。
-
-分派函数看到 `+`，就把它拆开，**逐段**查表/问外部，各自选出下载器，然后再做合并决策：
-
-- 要是**各段全都落到了 ffmpeg**，而且条件满足（能合并、不是不允许直接合并），就交给 ffmpeg **一次性边下边合**——两条流一起喂进去，出来一个合并好的文件。
-- 要是**只选出一个**下载器，直接用它。
-- 要是选出好几个、又不全是 ffmpeg——**返回 `None`**。注意，这不是报错。它的意思是"没有单一下载器能整体拿下这件事"，交还给编排器上层去走另一条路：分别下载两条流，再交给后处理阶段合并。
-
-这条 `None` 的退路很重要：它说明"边下边合并"并不是唯一选择，走不通时系统会平滑退化成"分别下、后处理合"。
-
-## 动手演一遍：一个迷你分派器
-
-下面这段 TS 把上面所有机制压在一起：字段驱动、`+` 拆分合并、外部下载器自荐、能力探测、基类公共流程委托钩子。真实的网络/子进程/限速/.part 工程细节都剥掉了，只留"查表 + 能力探测 + 公共流程委托子类"这条主干。
-
-```ts
-// demo.ts —— 迷你下载分派器：字段驱动 + 能力自荐
-// 跑法：bun run demo.ts   或   npx tsx demo.ts
-// 配 package.json: { "scripts": { "start": "tsx demo.ts" }, "devDependencies": { "tsx": "^4" } }
-
-type Info = {
-  url: string
-  protocol?: string
-  is_live?: boolean
-  to_stdout?: boolean
-  impersonate?: unknown
+  abstract real_download(filename: string, info: any): boolean
+  maybeSleep() {}
 }
 
-// 模拟"可执行文件装没装"——现实里靠 PATH 探测，这里直接给答案
-const INSTALLED = new Set(['aria2c', 'ffmpeg'])
-const installed = (exe: string) => INSTALLED.has(exe)
-const exists = (_f: string) => false   // 演示里假装目标文件都不在
+// 内置下载器
+class HttpFD extends FileDownloader { real_download() { return true } }
+class HlsFD  extends FileDownloader { real_download() { return true } }
+class RtmpFD extends FileDownloader { real_download() { return true } }
 
-// ① 下载器基类：吸收横切流程，只给子类留 real_download 一个钩子
-abstract class FileDownloader {
-  constructor(public params: Record<string, unknown> = {}) {}
-  protected hooks: Array<(s: Record<string, unknown>) => void> = []
-  addProgressHook(fn: (s: Record<string, unknown>) => void) { this.hooks.push(fn) }
-
-  download(filename: string, info: Info): boolean {
-    if (this.params.continuedl && exists(filename)) {       // 横切：已存在就跳过
-      console.log(`  [skip] ${filename} 已存在`); return true
-    }
-    const ok = this.real_download(filename, info)            // 真正干活，交给子类
-    this.hooks.forEach(h => h({ status: 'finished', filename }))
-    return ok
+// 外部下载器基类：能力自报 + can_download 自检
+abstract class ExternalFD extends FileDownloader {
+  static SUPPORTED_PROTOCOLS: string[] = []
+  static available(): boolean { return true }       // 探测可执行文件是否安装
+  static supports(info: any): boolean {
+    return info.protocol.split('+').every((p: string) =>
+      this.SUPPORTED_PROTOCOLS.includes(p))
   }
-  abstract real_download(filename: string, info: Info): boolean
+  static canDownload(info: any): boolean {
+    return this.available() && this.supports(info)
+  }
+  abstract _make_cmd(filename: string, info: any): string[]  // 把字典翻成命令行
 }
 
-// ② 协议字段怎么算：信提取器填好的，否则按 URL 兜底
-function determineProtocol(info: Info): string {
+class Aria2cFD extends ExternalFD {
+  static SUPPORTED_PROTOCOLS = ['http', 'https', 'ftp']
+  _make_cmd(filename: string, info: any) { return ['aria2c', '-o', filename, info.url] }
+}
+
+class FFmpegFD extends ExternalFD {
+  static SUPPORTED_PROTOCOLS = ['http', 'https', 'm3u8', 'rtmp']
+  static canMergeFormats(_info: any): boolean { return true }   // 多面手：能边下边合并
+  _make_cmd(filename: string, info: any) { return ['ffmpeg', '-i', info.url, filename] }
+}
+
+// 分派表（协议→下载器类）与外部下载器名表
+const PROTOCOL_MAP: Record<string, any> = {
+  http: HttpFD, https: HttpFD,
+  m3u8_native: HlsFD, m3u8: FFmpegFD,
+  rtmp: RtmpFD, f4m: FFmpegFD, http_dash_segments: FFmpegFD,
+}
+const EXTERNAL_BY_NAME: Record<string, typeof ExternalFD> = {
+  aria2c: Aria2cFD, ffmpeg: FFmpegFD,
+}
+
+// 协议字段来源：优先读字典已填好的，否则按 URL 兜底推断
+function determineProtocol(info: any): string {
   if (info.protocol) return info.protocol
   if (info.url.startsWith('rtmp')) return 'rtmp'
-  const ext = info.url.split('.').pop()!
-  if (ext === 'm3u8') return info.is_live ? 'm3u8' : 'm3u8_native'  // 直播/点播分家
-  if (ext === 'f4m') return 'f4m'
-  return info.url.split(':')[0]                                      // 退回 scheme
+  if (info.url.endsWith('.m3u8')) return info.is_live ? 'm3u8' : 'm3u8_native'
+  if (info.url.endsWith('.f4m')) return 'f4m'
+  return new URL(info.url).protocol.replace(':', '')
 }
 
-// ③ 几个原生下载器（进程内）
-class HttpFD extends FileDownloader {
-  real_download(_f: string, i: Info) { console.log(`  [http] 进程内拉取 ${i.url}`); return true }
-}
-class HlsFD extends FileDownloader {
-  real_download(_f: string, i: Info) { console.log(`  [hls] 进程内逐片解析 ${i.url}`); return true }
-}
-class RtmpFD extends FileDownloader {
-  real_download(_f: string, i: Info) { console.log(`  [rtmp] 进程内握手 ${i.url}`); return true }
-}
-
-// ④ 外部下载器基类：自己声明能力、自己探测在不在、自己翻命令行
-class ExternalFD extends FileDownloader {
-  static SUPPORTED_PROTOCOLS = ['http', 'https']
-  static MULTIPLE_FORMATS = false
-  static EXE = ''
-  static available() { return installed(this.EXE) }
-  static supports(info: Info) {
-    const proto = info.protocol!
-    return (!info.to_stdout)                                          // 不输出到 stdout？
-      && (!proto.includes('+') || this.MULTIPLE_FORMATS)              // 多协议只有 ffmpeg 能整？
-      && proto.split('+').every(p => this.SUPPORTED_PROTOCOLS.includes(p))  // 协议都在我清单里？
+// 单段协议选一个下载器
+function pickForOneProtocol(info: any, proto: string, params: any): any {
+  const extName = params.external_downloader?.[proto]
+  if (extName && extName !== 'native' && !info.impersonate) {
+    const ed = EXTERNAL_BY_NAME[extName]
+    if (ed && ed.canDownload({ ...info, protocol: proto })) return ed   // 自荐接管
   }
-  static canDownload(info: Info) { return this.available() && this.supports(info) }
-  real_download(f: string, i: Info): boolean {
-    const cmd = this.makeCmd(f, i)
-    console.log(`  [${(this.constructor as typeof ExternalFD).EXE}] 子进程: ${cmd.join(' ')}`)
-    return true
-  }
-  makeCmd(_f: string, _i: Info): string[] { return [] }
-}
-class Aria2cFD extends ExternalFD {
-  static EXE = 'aria2c'
-  static SUPPORTED_PROTOCOLS = ['http', 'https', 'ftp']
-  makeCmd(f: string, i: Info) { return ['aria2c', '-x16', '-o', f, i.url] }
-}
-class FFmpegFD extends ExternalFD {
-  static EXE = 'ffmpeg'
-  static SUPPORTED_PROTOCOLS = ['http', 'https', 'm3u8', 'm3u8_native', 'rtmp']
-  static MULTIPLE_FORMATS = true
-  static canMergeFormats = true
-  makeCmd(f: string, i: Info) { return ['ffmpeg', '-i', i.url, '-c', 'copy', f] }
+  return PROTOCOL_MAP[proto] ?? HttpFD                                   // 默认原生兜底
 }
 
-// ⑤ 外部下载器发现表（真实代码里靠"类名以 FD 结尾"自动扫出来）
-const EXTERNAL_BY_NAME: Record<string, typeof ExternalFD> = { aria2c: Aria2cFD, ffmpeg: FFmpegFD }
-
-// ⑥ 协议 → 原生下载器的分派表
-const PROTOCOL_MAP: Record<string, typeof FileDownloader> = {
-  rtmp: RtmpFD, m3u8_native: HlsFD, m3u8: FFmpegFD, f4m: FFmpegFD,
-  http: HttpFD, https: HttpFD,
-}
-
-// ⑦ 选合适的下载器：算字段 → 按 + 拆 → 逐个查表/问外部 → 合并决策
-function getSuitableDownloader(info: Info, params: Record<string, unknown> = {}) {
+// 分派入口：按 + 拆分多协议，逐个查表后合并决策
+function getSuitableDownloader(info: any, params: any): any {
   info.protocol = determineProtocol(info)
-  const protocols = info.protocol.split('+')
-  const picks = protocols.map(p => pickOne(info, p, params))
-  if (picks.every(c => c === FFmpegFD) && FFmpegFD.canMergeFormats) return FFmpegFD  // 全是 ffmpeg → 边下边合
-  if (picks.length === 1) return picks[0]
-  return null   // 多协议又没法合并 → 没有单一下载器能整体拿下
+  const chosen = info.protocol.split('+').map(p => pickForOneProtocol(info, p, params))
+  if (chosen.every(c => c === FFmpegFD) && FFmpegFD.canMergeFormats(info))
+    return FFmpegFD                                                      // 边下边合
+  return new Set(chosen).size === 1 ? chosen[0] : null                   // 否则交还上层
 }
-function pickOne(info: Info, proto: string, params: Record<string, unknown>) {
-  const ext = params.external_downloader as string | undefined
-  if (ext && ext !== 'native' && !info.impersonate) {           // impersonate 时禁用外部(它不改 TLS 指纹)
-    const ed = EXTERNAL_BY_NAME[ext]
-    if (ed?.canDownload({ ...info, protocol: proto })) return ed  // 自荐成功就接管
-  }
-  return PROTOCOL_MAP[proto] ?? HttpFD                            // 查不到退回通用 http
-}
-
-// ⑧ 跑几条轨迹
-function run(label: string, info: Info, params: Record<string, unknown> = {}) {
-  console.log(`\n=== ${label} ===`)
-  const proto = info.protocol ?? determineProtocol(info)
-  console.log(`字段 protocol = ${proto}`)
-  const Cls = getSuitableDownloader(info, params)
-  if (!Cls) { console.log('  → 没有单一下载器能搞定，交还上层分别下'); return }
-  console.log(`→ 选中 ${Cls.name}`)
-  new Cls(params).download('out.mp4', info)
-}
-
-run('普通 https 直链', { url: 'https://cdn.site/v.mp4' })
-run('点播 HLS（m3u8 非直播）', { url: 'https://cdn.site/master.m3u8', is_live: false })
-run('直播 HLS（同一个 m3u8，但 is_live）', { url: 'https://cdn.site/live.m3u8', is_live: true })
-run('双流让 ffmpeg 边下边合', { url: 'https://cdn/site/v', protocol: 'https+https' }, { external_downloader: 'ffmpeg' })
-run('用户指定 aria2c 拉 https', { url: 'https://cdn.site/v.mp4' }, { external_downloader: 'aria2c' })
 ```
 
-跑出来的轨迹，恰好把几种决策路径都点亮了：
+## 6. 执行轨迹
 
-```
-=== 普通 https 直链 ===
-字段 protocol = https
-→ 选中 HttpFD
-  [http] 进程内拉取 https://cdn.site/v.mp4
+**输入一**：`info = { url: 'https://cdn.example.com/master.m3u8', is_live: false }`，没显式 `protocol`，没配外部下载器。
 
-=== 点播 HLS（m3u8 非直播）===
-字段 protocol = m3u8_native
-→ 选中 HlsFD
-  [hls] 进程内逐片解析 https://cdn.site/master.m3u8
+1. `determineProtocol(info)` 检查到扩展名 `.m3u8` 且非直播 → 推断为 `m3u8_native`。
+2. `'m3u8_native'.split('+')` 得 `['m3u8_native']`，单段。
+3. `pickForOneProtocol` 读不到 `external_downloader`，落到 `PROTOCOL_MAP['m3u8_native']` → `HlsFD`。
+4. `chosen = [HlsFD]`，单一 → 直接返回 `HlsFD`。
+5. 编排器实例化 `new HlsFD(params)`，挂进度钩子，调 `fd.download(name, info)`。
+6. `FileDownloader.download` 走横切：无 `.part` 续传 → 不 sleep → 委托 `HlsFD.real_download` 真正切片下载 → 进度钩子逐片上报 → `tryRename` 收尾。
 
-=== 直播 HLS（同一个 m3u8，但 is_live）===
-字段 protocol = m3u8
-→ 选中 FFmpegFD
-  [ffmpeg] 子进程: ffmpeg -i https://cdn.site/live.m3u8 -c copy out.mp4
+**输入二（对照）**：同一字典但 url 换成普通 https 直链，且用户传了 `--downloader aria2c`。
 
-=== 双流让 ffmpeg 边下边合 ===
-字段 protocol = https+https
-→ 选中 FFmpegFD
-  [ffmpeg] 子进程: ffmpeg -i https://cdn/site/v -c copy out.mp4
+1. `determineProtocol` 退到 URL scheme → `https`。
+2. `pickForOneProtocol` 读到 `external_downloader.https = 'aria2c'`。
+3. `Aria2cFD.canDownload({ protocol: 'https', ... })`：`available()` 通过；`supports()` 检查 `'https'.split('+') = ['https']` 全在 `['http','https','ftp']` 内 → 通过。
+4. 自荐接管，返回 `Aria2cFD`。
+5. `Aria2cFD.real_download` 调 `_make_cmd` 把字典翻成 `['aria2c', '-o', name, url]`，跑子进程拉文件，收退出码、重命名、上报 finished。
 
-=== 用户指定 aria2c 拉 https ===
-字段 protocol = https
-→ 选中 Aria2cFD
-  [aria2c] 子进程: aria2c -x16 -o out.mp4 https://cdn.site/v.mp4
-```
+两条轨迹的差别只在第 3 步——分派方对内置和外置完全一视同仁，路由代码没有任何分支感知到"子进程 vs 进程内"。
 
-第二、第三条轨迹对照看最有意思：**同一个 `.m3u8`，就因为 `is_live` 不同，算出的协议字段不同，最终落到完全不同的下载器上**。这正是"字段驱动"的精髓——决定用什么下载器的，是数据里的标签，不是 URL 的长相。最后一条轨迹则演了外部下载器的自荐：用户配了 aria2c，它 `available`（装了）且 `supports`（https 在清单里）都通过，于是接管，把字典翻成了 `-x16 -o ...` 这套它自己的命令行。
+## 7. 教学简化说明
 
-## 关键权衡
+本章演示故意省略了：真实的网络 I/O 与子进程 `Popen`、限速算法的精确数学、`.part` 重命名在跨文件系统下的原子性细节、AES-128 分片解密、多行进度条的渲染、FFmpeg 命令行 `-map`/`-bsf:a`/`-protocol_whitelist` 等音视频工程细节、所有协议特例分支（section 裁剪、`hls_prefer_native`、直播强制 FFmpeg 等）。这些是工程化脚手架，原理主干只需要"查表 + 能力探测 + 公共流程委托钩子"。
 
-这一章机制密集，四条权衡逐个说清"为什么这么设计"。
+## 8. 小结
 
-**权衡 1（全章核心）：用数据里的协议字段驱动策略选择。**
-选择是把"用什么下载器"从编排器下沉到数据自身（一个协议字段），再用一张分派表把字段翻译成下载器类。换来的是编排器对下载细节彻底无感——它只调一句"给我合适的下载器"，新增一种协议时编排器一行都不用改，加一行表、写个新类即可。**代价是**：协议字段表达不了的现实特例，全部堆积进同一个分派函数，长成一片裸的 `if`：要按时间区间裁剪（`section_start/section_end`）且 ffmpeg 可下 → 强制 FFmpeg；`m3u8` 直播 → FFmpeg；`hls_prefer_native` 真/假 → 在原生 HlsFD 和 FFmpeg 之间切换；`http_dash_segments` 直播 → FFmpeg。这些分支没有任何对象模型，每多一种特例就长一截，可读性随协议增多持续劣化。说白了：字段驱动很优雅，但现实永远比一个标签复杂，多出来的复杂度总要有个出口，而这个出口退化成了条件分支海洋。**这是字段驱动换来的最痛的代价。**
+`protocol` 字段是一张路由标签，让编排器在千百种下载姿势面前只说一句"给我合适的下载器"。换来的零侵入是真的，付出的代价也是真的——字段表达不出的特例全挤进分派函数的条件分支海洋。
 
-**权衡 2：外部可执行下载器和原生下载器共用一套抽象。**
-选择是让 aria2c/ffmpeg/curl/wget 这些"调子进程拉文件"的工具，和"进程内下载"的原生下载器对外暴露同一个 `download()` 接口。换来的是编排器无差别对待这两类——`--downloader aria2c` 一个开关整体换引擎，调用代码一个字都不用改。**代价是**：每个外部工具都得有人把那个胖信息字典翻译成它认识的命令行参数——curl 用 `--header`、aria2c 用 `--header`、wget 用 `--header`，连限速旋钮都各是各的写法（curl 是 `--limit-rate`，wget 是 `--limit-rate`，aria2c 是 `--max-overall-download-limit`），每个工具一套适配（`_make_cmd`）。而且它们得自己负责探测"我装了吗"和"这个活我能接吗"，不然就会被错误启用或永远没机会上场。
-
-**权衡 3：把"我能下吗"做成下载器自报能力。**
-选择是不让分派方去替下载器判断合不合适，而是让每个下载器自己声明能耐（支持哪些协议、哪些特性），分派方逐个问，谁说能就用谁。换来的是多个后端可插拔、能优雅降级到下一个候选。（这套"能力探测 + 候选择优"和第 1 章传输层同构，那里已展开，不重复。）**代价是**：每个下载器都必须老实、完整地声明自己的能力边界——`supports` 那四项自检里漏掉一项，要么被错误启用（声明能下其实下不了，运行时才崩），要么永远没机会上场（明明能下却没声明）。能力清单和真实能力之间一旦出现缝隙，bug 就藏在那道缝里。
-
-**权衡 4：把所有横切关注点收进下载器基类。**
-选择是把限速、断点续传、临时 `.part` 文件、文件访问重试、进度钩子、多行进度条这些和协议无关、但对每个下载器都要做的事，全塞进 `FileDownloader` 基类（"基类吸收样板、子类填一个钩子"这个分工思想第 4 章已讲透，这里只看落地）。换来的是每个具体下载器子类只需实现"真正把字节写下来"这一个方法，几十行就够。**代价是**基类越长越胖、成一个什么都管的大家伙；更隐蔽的是——基类和子类之间靠一个巨大的 `params` 选项字典做隐式耦合，子类直接 `self.params.get('ratelimit')` 这样取参数，没有任何编译期契约，哪个参数谁用、什么时候用、取不到默认成什么，全靠人脑和注释。这个隐式字典是抽象基类换来的、独属于下载器这一侧的额外成本。
-
-## 小结
-
-这一章的核心就一句话：**让数据自带"我该被怎么下载"的协议标签，再用一张分派表把标签翻译成下载器**——编排器因此对下载细节彻底无感，新增协议零侵入。围绕这条主线，我们看到了一张 `PROTOCOL_MAP` 怎么把协议字段映射到下载器类、外部下载器怎么靠能力自荐和子进程适配混进同一套抽象、多协议的 `+` 怎么拆开逐个查再决定合并、以及基类怎么把所有横切杂活揽下来只给子类留一个 `real_download` 钩子。而这一切优雅的代价，是分派函数里那片消化不掉的特例条件分支。
-
-最后留一个扣子：前面提到外部下载器其实继承自一个叫 `FragmentFD` 的类，而不是直接继承 `FileDownloader`——也就是说它们天生带着一条"分片路径"。当目标是 HLS/DASH 这种一长串小切片时，下载不是一口气拉完，而是拆成一片一片、每片独立重试、还能断点续传。这条分片机制，正是下一章《分片化下载：把长流拆成可恢复的工作单元》要讲透的东西。
+下一章会揭开一个隐藏连接点：当协议落到 `m3u8_native` / `http_dash_segments` 时，下载实际走的是 `FragmentFD` 子类——把"长流"建模为"可迭代的分片序列"、用簿记文件支持断点续传的舞台，外部下载器复用的也是同一条分片路径。

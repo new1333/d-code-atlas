@@ -1,330 +1,257 @@
 # 路由位置与 URL 解析
 
-你在 `/users/1` 这个页面，手一抖又点了一次指向 `/users/1` 的链接。按直觉，什么也不该发生——你就在这儿。可路由器怎么知道「就在这儿」？
+> 本章属于 primitive 层。前置：URL 分段编码与查询串。
+> 学完你能：用一句话讲清「为什么路由器要把"同一个位置"定义成 matched record 引用相等 + params 结构 + 序列化后的 query/hash，而不是 URL 字符串相等」。
 
-最直白的办法是比 URL 字符串：`/users/1 === /users/1`，相等就跳过。但这层判定稍一放松，一堆麻烦就冒出来：同一个用户页可以写成 `/users/1`，也能走别名 `/u/1`；参数既能写成 `id=1` 也能写成 `id=01`；查询串 `?a=1&b=2` 和 `?b=2&a=1` 明明是同一份。靠比字符串，这些「其实是同一处」的情况一个都认不出来。
+## 1. 为什么需要它
 
-所以路由器每次导航前要先回答两个问题：
+上一章把 URL 的编码原理讲透——按段细分保留字符集、用类型区分 `?key` 与完全省略，并把「查询串怎么序列化 / 反序列化」做成了独立函数。本章接过接力棒：location 层不再自己编码，而是把 `parseQuery` / `stringifyQuery` 作为参数注入进来，自己只负责三段切分与路由级相等语义。
 
-- **(a) 目标位置是不是就是我现在待的地方？** 回答了才能短路——省掉守卫询问、组件拉取、滚动计算那一整套，只在确有同锚点时滚一下。
-- **(b) 这是不是应用启动以来的第一次导航？** 回答了，守卫里的 `from`（「我从哪来」）才有个合理的值，否则应用刚启动时根本没有「上一个路由」。
+具体场景：用户连点同一个链接、或代码里重复 `router.push('/users/1')`。如果没有「我要去的就是我现在的位置」这层判定，每次都会重走整套导航——守卫询问、组件拉取、滚动计算，既慢又会触发守卫里的副作用（发请求、埋点）。
 
-本章就讲清这两件事背后的那块代码：怎么把一个 URL 字符串拆成路由能用的结构，又怎么判定两个结构是不是「同一处」。
+更隐蔽的是同一个位置有许多种 URL 写法：别名 `/profile` 与 `/me`、重定向、`/a/1` 写成 `/a/01`、`?a=1&b=2` 与 `?b=2&a=1`、params 写成标量 `'1'` 或单元素数组 `['1']`——比 URL 字符串根本认不出「其实是同一处」。
 
----
+此外应用刚启动时还没有「上一个路由」，守卫里的 `from` 该是什么？又怎么识别「这是首次进入」？
 
-## 底层基本件 ①：手工把 URL 切成三段
+回答这两个问题就是 location 层的全部职责：把 URL 字符串拆成 path / query / hash 三段；给出「两个位置是否同一处」的语义；给首次导航一个固定身份。
 
-先看最底层的一块：拿到一个 URL 字符串，要产出 `{ path, query, hash, fullPath }` 四个字段。
+## 2. 核心思想
 
-浏览器其实白送了 `URL` 和 `URLSearchParams` 两个类干这事。为什么不直接用？因为导航是一条热路径——每次 `push` / `replace` 都要跑一遍解析。那两个通用类内部要做规范化、要分配一堆对象，对手头这个「只切三段」的小活来说太重了。
+把「同一个路由位置」定义成「匹配到同一条原始路由记录 + 参数 / 查询 / 锚点全等」，而非 URL 字符串相等；首次导航用一个固定单例对象当哨兵。
 
-自己用 `indexOf` 切，几行就够：
+## 3. 心智模型
+
+URL 字符串进到路由器时要走两步：先切分，再判定相等。
+
+### 3.1 URL 字符串 → 路由位置
+
+```
+1. 定位 # 的位置 hashPos
+2. 定位 ? 的位置 searchPos
+3. 若 ? 落在 # 之后 → 那个 ? 属于 hash 片段 → 把 searchPos 置 -1
+4. 按 ? / # 切三段：path / search / hash
+5. 把 search 段（去掉前导 ?）交给注入的 parseQuery —— 本层不碰编码
+6. 把路径里的 . / .. 用双指针解析成绝对路径
+7. fullPath = path + (query 非空时补 ?) + query 序列化 + hash
+```
+
+第 3 步是边界修正：URL 规范里 hash 后面的所有字符都是 hash 片段，包括看起来像查询串的 `?x=1`——`/foo#hash?x=1` 没有 query。浏览器内置的 `URL` 已经替你处理了这条规则，但手工 `indexOf` 没有。
+
+第 5 步是依赖倒置：本层不解析查询串，只把 `parseQuery` 函数当作参数吃进来。换个 parseQuery，切分逻辑不变——上一章的编码原理就以此方式被彻底倒置出去。
+
+### 3.2 两个路由位置 → 是否同一处
+
+```
+两端 matched 链等长
+→ 比末端 record 的引用（别名归一到原始 record）
+→ 比 params 结构（单值 ≡ 单元素数组）
+→ 比查询串序列化后的字符串
+→ 比锚段字符串
+```
+
+五关全过才算「同一处」。每一关都对应一类「URL 字符串不同但语义相同」的情形：末端 record 相等覆盖别名与重定向；params 结构相等覆盖 `'1'` 与 `['1']`；query 序列化串相等覆盖 `?a=1&b=2` 与 `?b=2&a=1`；hash 字符串相等直白，但要让上面所有相等都通过后才有意义。
+
+## 4. 关键权衡
+
+### 用手工 indexOf 切分换解析性能，代价是亲手处理 # 与 ? 的先后
+
+导航是热路径——每次 push / replace 都要跑一次 parseURL。浏览器内置的 `URL` / `URLSearchParams` 内部要做完整的 RFC 解析、规范化、URL 类实例化，开销在每次导航上叠加。手工 `indexOf('#')` 再 `indexOf('?')` 切三段，能拿到约 2～5 倍的速度提升。
+
+代价是必须亲手处理一个边界：当 `?` 出现在 `#` 之后，那个 `?` 属于 hash 片段、不是查询串。`/foo#hash?x=1` 的 query 应为空。手工代码靠一行 `searchPos = hashPos >= 0 && searchPos > hashPos ? -1 : searchPos` 修正这条边界——浏览器内置 `URL` 默认就这么做，而你用 `indexOf` 切分时这条规则不会自动生效。
+
+**本质矛盾**：性能 vs 正确性的全面性。手工快但只覆盖你自己想到的边界，内置覆盖全但慢。热路径上选前者，但要为每条规则亲手负责。
+
+### 用末端 matched record 引用相等判定"同一处"，换来别名与重定向的语义统一
+
+如果比 URL 字符串，别名 `/profile` 与 `/me` 永远不会被识别为同一处；比路径也不行，重定向会把 `/old` 变成 `/new` 但其实是同一个组件页；比路由名？别名有自己的 name。
+
+用「末端 matched record 的引用相等」就能让所有别名都归一到原始 record：`(a.aliasOf || a) === (b.aliasOf || b)`。原始 record 的 aliasOf 为 undefined，所有别名都指向同一原始 record，两端归一再比引用，所有别名形式自然等同。
+
+代价是必须保证 matched 链由匹配表按确定方式构建——祖先链稳定、末端 record 不变。这一前置条件本章不解决，是后面匹配表章的事。本章只要求两端 matched 链等长时才去比末端那条 record：等长 + 末端同源隐含祖先同源。
+
+**本质矛盾**：同一性应建立在语义层（路由记录）还是字面层（字符串）。路由器的全部合理性来自前者——这正是它能跨「同一处的无数 URL 写法」成立的关键。
+
+### 把查询串的相等委托给序列化后再比字符串
+
+比两个 query 对象的「结构相等」有两种实现：手写深比较 vs 序列化后比字符串。
+
+手写深比较要处理 `a.length === b.length && a.every(...)`、键顺序、单值与数组互转……相当于把第 1 章的查询语义复刻一遍。
+
+序列化后比字符串把所有这些交给 `stringifyQuery`：单值与单元素数组的等价、键值编码、键顺序问题，全在序列化函数里解决。`{a:'1'}` 与 `{a:['1']}` 在 stringifyQuery 看来都是 `a=1`；`{a:1,b:2}` 与 `{b:2,a:1}` 在「按 key 排序」的 stringifyQuery 看来都是 `a=1&b=2`。
+
+代价是每次比较都要跑一次 stringifyQuery。但这步发生在「重复导航短路」之前——一旦短路成功就省掉了整套守卫与组件开销，序列化这点开销远小于换来。
+
+**本质矛盾**：结构比较 vs 规范化串比较。当规范化规则已被序列化函数封装好时，复用它比复刻一套深比较更不容易出错。
+
+### 用固定单例对象标识首次导航
+
+应用刚启动、第一次导航时，没有「上一个路由」。守卫里的 `from` 该是什么？null？一个空对象 `{}`？
+
+用一个导出的固定对象字面量 `START_LOCATION_NORMALIZED`（path: `'/'`、name: undefined、matched: `[]`），所有地方比较的都是这同一个引用。守卫里一行 `from === START_LOCATION_NORMALIZED` 即可识别首次进入，且天然可跨 realm（不同 iframe / worker 也能识别同一引用）。
+
+代价是该对象必须作为全局唯一单例导出——任何模块拿到的都得是同一个引用，不能有「另一个等价的初始位置」。
+
+配合上面的五条件相等判定，`START_LOCATION` 的 matched 为 `[]`，永远不与任何真实位置相等（aLastIndex 永远是 -1），这正合「首次导航不应被短路」的语义。
+
+**本质矛盾**：识别"空"该用特殊值（哨兵）还是用空状态（如 null）。哨兵换来可携带语义（path / '/'、matched []、跨 realm），null 只代表"什么都没有"。
+
+## 5. 最小原理演示
+
+下面一段几十行的 TS 演透上面四个原理点：手工切分 + 边界修正 + 注入 parseQuery + 引用相等 + 序列化比 query + 单值≡数组 + 哨兵。
 
 ```ts
-const hashPos = location.indexOf('#')
-let searchPos = location.indexOf('?')
-// e.g. /foo#hash?query -> has no query
-searchPos = hashPos >= 0 && searchPos > hashPos ? -1 : searchPos
-```
-
-注意第二行那个看似多余的条件——它是这层的命门。看 `/foo#hash?x=1` 这个串：`?` 在 `#` **后面**。这时那个 `?x=1` 属于 hash 片段，根本不是查询串。如果不做这个边界判定，朴素切分会把 hash 里的 `?x=1` 误当成 query。
-
-> **权衡 1**：选了手工 `indexOf` 切分、不用浏览器内置的 `URL` / `URLSearchParams` → 换来约 2～5 倍的解析速度（导航是热路径，每次 push/replace 都跑）→ 代价是 `#` 与 `?` 谁先谁后的边界得自己亲手处理，`?` 在 `#` 之后时要把它视作没有查询段。这个代价不大，但漏掉就是 bug。
-
-切完三段，`fullPath` 由 `path + searchString + hash` 拼成。这里有个细节：`fullPath` 不能直接拿入参字符串顶上，因为入参可能是相对路径（`./bar`），得先解析成绝对路径再拼。
-
----
-
-## 底层基本件 ②：查询串的解析，是「外包」出去的
-
-这里要看一个和编码有关的新侧面。编码本身——哪段 URL 保留哪些字符、`null` / `undefined` 怎么区分 `?key`（无等号）和完全省略——是第 1 章的核心，这里不重复。本章只看它带来的一个设计后果：**location 这层干脆不碰编码。**
-
-`parseURL` 的签名长这样：`parseURL(parseQuery, location, currentLocation)`。注意 `parseQuery` 是**参数**——查询串怎么解析、怎么解码，整个交给了外面塞进来的函数。本层只管把字符串切成段落，至于每段怎么翻译，由外部决定。
-
-打个比方：这层像个只负责「断句」的编辑，至于每句用什么词典翻译，他不管，翻译员是甲方（调用方）派来的。换个翻译员，断句逻辑一行都不用改。
-
-这就是把编码责任整个倒置出去的写法。好处很实际：同一套切分逻辑，既能配「严格按 RFC 解码」的 `parseQuery`，也能配「对齐浏览器实际行为」的版本（第 1 章那套分段编码），切分代码完全不变。
-
----
-
-## 底层基本件 ③：相对路径 `./` `../` 的双指针
-
-如果入参是个相对路径，比如 `../bar`，就得拿「我现在在哪」当基准，把它折算成绝对路径。这一步用的是一个挺干净的双指针算法。
-
-想象 `from = /a/b/c`，要解析 `to = ../d`。先把两端按 `/` 切成段数组：`fromSegments = ['', 'a', 'b', 'c']`、`toSegments = ['..', 'd']`。然后两个指针同时走：
-
-- `position` 指针在 `fromSegments` 上**退格**，初值是末段下标（先把末段当成「文件名」丢掉）；
-- `toPosition` 指针在 `toSegments` 上**前进**，遇到 `.` 跳过、遇到 `..` 就让 `position` 退一格、遇到普通段就 `break`。
-
-```ts
-let position = fromSegments.length - 1
-let toPosition = 0
-for (; toPosition < toSegments.length; toPosition++) {
-  const seg = toSegments[toPosition]
-  if (seg === '.') continue
-  if (seg === '..') { if (position > 1) position-- }   // 不退到根之上
-  else break
-}
-return fromSegments.slice(0, position).join('/') + '/' + toSegments.slice(toPosition).join('/')
-```
-
-走一遍 `/a/b/c` + `../d`：`position` 从 3 出发，遇到 `..` 退到 2，遇到 `d` 这个普通段 break。最后 `slice(0, 2)` = `/a`，拼上 `/d`，得到 `/a/d`。（对，不是 `/a/b/d`——因为基准 `/a/b/c` 的末段 `c` 先被当文件名丢掉了，这跟 `new URL('../d', '/a/b/c')` 的行为一致。）
-
-那个 `position > 1` 的下限，是为了不让你退到根之上：`/a` + `../../d` 只会退到根，结果是 `/d`，不会变成乱码。
-
----
-
-## 组合机制：两个位置，「同一处」怎么判
-
-底层三块拼完了，现在看它们怎么组合出「同一位置」的判定——这是回答问题 (a)、决定要不要短路的关键。
-
-难点在于：同一个地方，URL 写法千变万化。所以判定不能比字符串，得比**路由语义**。具体怎么比？先看一段被 `&&` 串起来的判定，它一眼就能看出整个思路：
-
-```ts
-const aLastIndex = a.matched.length - 1
-const bLastIndex = b.matched.length - 1
-return (
-  aLastIndex > -1 &&                                              // 前置条件
-  aLastIndex === bLastIndex &&                                    // 关卡 ①
-  isSameRouteRecord(a.matched[aLastIndex], b.matched[bLastIndex]) && // 关卡 ②
-  isSameRouteLocationParams(a.params, b.params) &&                // 关卡 ③
-  stringifyQuery(a.query) === stringifyQuery(b.query) &&          // 关卡 ④
-  a.hash === b.hash                                               // 关卡 ⑤
-)
-```
-
-这里要先分清一个**前置条件**和**五道关卡**。`aLastIndex > -1`（a 自己得有 matched）是前置条件——没有 matched 的位置根本不参与「同一处」的比较。真正逐一比较的是后面五道关卡，全过才算同一处：
-
-```
-前置：a.matched 非空（aLastIndex > -1）？   否 ──▶ 判「不同位置」
-                  │ 是
-                  ▼
-关卡① 两端 matched 链等长？               否 ──▶ 不同位置
-                  │ 是
-                  ▼
-关卡② 末端 record 同源（别名都指回原始 record）？ 否 ──▶ 不同位置
-                  │ 是
-                  ▼
-关卡③ params 结构相等（单值 ≡ 单元素数组）？ 否 ──▶ 不同位置
-                  │ 是
-                  ▼
-关卡④ 查询串序列化后字符串相等？           否 ──▶ 不同位置
-                  │ 是
-                  ▼
-关卡⑤ hash 字符串相等？                   否 ──▶ 不同位置
-                  │ 是
-                  ▼
-              同一位置 ──▶ 短路导航（跳过守卫/组件/滚动，仅保留同锚点滚动）
-```
-
-逐条说一下为什么这么设计。
-
-**关卡 ① + ② 比的是「匹配到哪条路由」，不是「URL 长什么样」。** `matched` 是从根到叶的一条祖先链（这条链怎么由匹配表构建，是后面匹配表章的事，这里不展开）。比较时只看链的**末端那条 record**——前提是关卡 ① 已经保证了两端等长。等长 + 末端同源，祖先自然同源，所以不必逐条比祖先。至于「同源」怎么判：
-
-```ts
-return (a.aliasOf || a) === (b.aliasOf || b)   // 别名都还原到原始 record 再比引用
-```
-
-原始 record 的 `aliasOf` 是 `undefined`，所有别名的 `aliasOf` 都指向同一条原始 record。两端各走一步 `aliasOf || a`，就都还原到原始 record，再比引用相等。这样一来，`/users/1` 和它的别名 `/u/1`，只要末端 record 同源，就被认成同一处。
-
-> **权衡 2**：判定「同一处」用末端 matched record 的**引用相等**，而不是比路径或名字字符串 → 换来别名、重定向、各种 URL 写法都能被正确认成「同一处」→ 代价是 matched 链必须由匹配表按确定方式（祖先链）构建，且要先把「两端等长」这个前提判过，才去比末端那一条。
-
-**关卡 ③ 比的是 params 的结构，而且容忍「单值 ≡ 单元素数组」。** 路由参数 `:id=1` 在内部既可以存成标量 `'1'`，也可以存成单元素数组 `['1']`，这俩语义上是一回事。所以比较时不是简单 `===`：
-
-```ts
-function isEquivalentArray(a, b) {
-  return Array.isArray(b)
-    ? a.length === b.length && a.every((v, i) => v === b[i])
-    : a.length === 1 && a[0] === b                       // [x] ≡ x
-}
-```
-
-**关卡 ④ 比的是查询串，但做法很巧：不手写 query 对象的深比较，而是各自序列化成字符串再比。** 这一招直接复用了第 1 章那套序列化语义——序列化时本就把 `{a:'1'}` 和 `{a:['1']}` 视作等价，所以「单值 ≡ 单元素数组」的等价在这里天然成立，`?a=1&b=2` 和 `?b=2&a=1` 序列化后（键排序）也自然相同。
-
-> **权衡 3**：查询串的相等**委托给「序列化后再比字符串」**，不手写 query 对象的深比较 → 换来 `{a:'1'}` 与 `{a:['1']}` 这种「单值 ≡ 单元素数组」自然等价（白捡了第 1 章的序列化语义），也省得维护一套深比较 → 代价是每次比较都要跑一次序列化。但这点开销可以忽略——它只跑在「判定要不要短路」这一处，不在每帧都跑的热路径上。
-
-这五道关卡全过，路由器就认定「我要去的地方就是我待的地方」，产出一次 `NAVIGATION_DUPLICATED`（重复导航），跳过整套 navigate 流程，只保留「滚动到同锚点」这一点副作用。
-
----
-
-## 首次导航：一个固定对象当哨兵
-
-最后看问题 (b)：应用刚启动，还没有「上一个路由」，守卫里的 `from` 该是什么？又怎么识别「这是第一次导航」？
-
-答案是一个叫 `START_LOCATION` 的固定对象，全局只导出一份。有意思的是，它**不是**一个光秃秃的标记值，而是一个**完整的路由对象**——`path: '/'`、`params: {}`、`matched: []`、`query: {}`、`hash: ''`、`fullPath: '/'`、`meta: {}`，该有的字段都有。
-
-为什么得是个完整对象？因为它一身二任：
-
-- **首先**，它是 `currentRoute` / `pendingLocation` 的初值。应用一启动，路由器就处在这个合法的路由位置上，而不是 `null`——下游所有读 `currentRoute` 的代码都不用判空。
-- **其次**，它顺手当首次导航的哨兵：守卫里一行 `from === START_LOCATION`（引用相等）就认出「这是开场第一幕」。
-
-正因为首要职责是「当 currentRoute 的初值」，它才必须承载那些路由字段；一个光秃秃的 `Symbol` 承载不了 `path` / `params` / `matched` 这些，所以这里没有用 Symbol。
-
-可以把它想成一枚盖了章的固定信物：全局就这一枚，谁拿出来对照的都是同一枚，一比对就知道是不是「开场第一幕」。
-
-还有个精妙的连带效果：`START_LOCATION` 的 `matched` 是空数组 `[]`，所以回头看上面那个前置条件 `aLastIndex > -1`——它根本不满足。意思是 `START_LOCATION` 永远不会等于任何真实位置，**首次导航绝不会被误判成「重复」而短路**。这正是我们想要的语义。
-
-> **权衡 4**：选一个**全局唯一的完整路由对象**当哨兵，而不是随便挑个标记值 → 换来它一身二任：既作 `currentRoute` / `pendingLocation` 的初值（应用一启动就处在合法路由上、无需判空），又让守卫一行 `from === START_LOCATION` 靠引用相等就认出首次导航 → 代价是它必须作为全局单例导出，任何地方的比较都得拿到**同一个引用**才有效。
-
----
-
-## 把原理跑给你看
-
-下面这份演示从零实现，两幕：第一幕演「拆解」（边界修正 + 查询解析外包 + 相对路径双指针），第二幕演「语义相等」（别名同源 + 单值≡数组 + 序列化比 query）。每行都对应上面某个原理点。
-
-`package.json`（用 `npx tsx demo.ts` 或 `bun run demo.ts` 跑）：
-
-```json
-{
-  "name": "route-location-url-demo",
-  "private": true,
-  "scripts": { "demo": "tsx demo.ts" },
-  "devDependencies": { "tsx": "^4.0.0" }
-}
-```
-
-`demo.ts`：
-
-```ts
-// ===================== 第一幕：把 URL 拆成 path / query / hash =====================
-
-// 一个会出错的朴素切分：认定 ? 之后全是查询串、# 之后全是 hash，互不干扰
-function naiveSplit(location: string) {
-  const q = location.indexOf('?')
-  const h = location.indexOf('#')
-  const path = location.slice(0, q >= 0 ? q : h >= 0 ? h : location.length)
-  return {
-    path,
-    searchString: q >= 0 ? location.slice(q) : '',   // 从 ? 一路切到底
-    hash: h >= 0 ? location.slice(h) : '',
-  }
+type RouteRecord = { name: string; aliasOf?: RouteRecord }
+type RouteLocation = {
+  path: string
+  query: Record<string, string | string[]>
+  hash: string
+  params: Record<string, string | string[]>
+  matched: RouteRecord[]
 }
 
-// 正确切分：parseQuery 是「注入」进来的——本层只切分段落，不碰编码
-function parseURL(parseQuery: (s: string) => Record<string, any>, location: string) {
+// 第一幕：手工切分。parseQuery 作为参数注入——本层不碰编码细节
+function parseURL(
+  parseQuery: (s: string) => Record<string, string | string[]>,
+  location: string
+): { path: string; query: Record<string, string | string[]>; hash: string } {
   const hashPos = location.indexOf('#')
   let searchPos = location.indexOf('?')
-  if (hashPos >= 0 && searchPos > hashPos) searchPos = -1   // ? 在 # 之后 → 属于 hash
-  let path = '', searchString = '', hash = ''
-  let query: Record<string, any> = {}
+  // 边界修正：? 落在 # 之后，那个 ? 属于 hash、不是 query
+  if (hashPos >= 0 && searchPos > hashPos) searchPos = -1
+
+  let path = ''
+  let query: Record<string, string | string[]> = {}
+  let hash = ''
+
   if (searchPos >= 0) {
     path = location.slice(0, searchPos)
-    searchString = location.slice(searchPos, hashPos > 0 ? hashPos : location.length)
-    query = parseQuery(searchString.slice(1))              // 注入：编码语义全在外部
+    const searchEnd = hashPos > 0 ? hashPos : location.length
+    query = parseQuery(location.slice(searchPos + 1, searchEnd))
   } else if (hashPos >= 0) {
     path = location.slice(0, hashPos)
   } else {
     path = location
   }
   if (hashPos >= 0) hash = location.slice(hashPos)
-  return { path, query, hash, fullPath: path + searchString + hash }
+  return { path, query, hash }
 }
 
-// 两个可替换的查询解析函数：切分逻辑不变，只换塞进来的「翻译员」
-const parseQueryPairs = (s: string) => Object.fromEntries(new URLSearchParams(s))
-const parseQueryRaw = (s: string) => ({ _raw: s })
-
-// 相对路径 ./ ../ 的双指针
-function resolveRelativePath(to: string, from: string) {
-  const fromSegments = from.split('/')
-  const toSegments = to.split('/')
-  let position = fromSegments.length - 1, toPosition = 0
-  for (; toPosition < toSegments.length; toPosition++) {
-    const seg = toSegments[toPosition]
-    if (seg === '.') continue
-    if (seg === '..') { if (position > 1) position-- }
-    else break
-  }
-  return fromSegments.slice(0, position).join('/') + '/' + toSegments.slice(toPosition).join('/')
+// 第二幕：路由级相等。matched 末端引用 + 序列化比 query + 单值≡数组
+function isSameRouteRecord(a: RouteRecord, b: RouteRecord): boolean {
+  return (a.aliasOf || a) === (b.aliasOf || b) // 别名归一到原始 record
 }
 
-// ===================== 第二幕：「同一位置」的语义相等判定 =====================
+function isEquivalentArray(a: readonly string[], b: string | string[]): boolean {
+  return Array.isArray(b)
+    ? a.length === b.length && a.every((v, i) => v === b[i])
+    : a.length === 1 && a[0] === b // ['1'] ≡ '1'
+}
 
-const R = { path: '/users/:id' } as any              // 用普通对象充当 record（不依赖 Vue / 匹配表）
-const R_alias = { aliasOf: R } as any                // 别名，指回原始 record
+function isSameParams(
+  a: Record<string, string | string[]>,
+  b: Record<string, string | string[]>
+): boolean {
+  const aKeys = Object.keys(a)
+  const bKeys = Object.keys(b)
+  if (aKeys.length !== bKeys.length) return false
+  return aKeys.every(k => {
+    const av = a[k], bv = b[k]
+    return Array.isArray(av)
+      ? isEquivalentArray(av, bv)
+      : Array.isArray(bv)
+      ? isEquivalentArray(bv, av)
+      : av === bv
+  })
+}
 
-function isSameRouteRecord(a: any, b: any) {
-  return (a.aliasOf || a) === (b.aliasOf || b)       // 两端都还原到原始 record 再比引用
-}
-function sameParamValue(a: any, b: any) {
-  if (Array.isArray(a) && Array.isArray(b))
-    return a.length === b.length && a.every((v, i) => v === b[i])
-  if (Array.isArray(a)) return a.length === 1 && a[0] == b   // [x] ≡ x
-  if (Array.isArray(b)) return b.length === 1 && b[0] == a   // x ≡ [x]
-  return a == b
-}
-function isSameParams(a: Record<string, any>, b: Record<string, any>) {
-  const ak = Object.keys(a), bk = Object.keys(b)
-  if (ak.length !== bk.length) return false
-  return ak.every((k) => k in b && sameParamValue(a[k], b[k]))
-}
-function stringifyQuery(q: Record<string, any>) {    // 极简序列化，只为「比字符串」服务
-  return Object.keys(q).sort().map((k) => `${k}=${q[k]}`).join('&')
-}
-function isSameRouteLocation(a: any, b: any) {
-  const aLast = a.matched.length - 1, bLast = b.matched.length - 1
+function isSameRouteLocation(
+  stringifyQuery: (q: Record<string, string | string[]>) => string,
+  a: RouteLocation,
+  b: RouteLocation
+): boolean {
+  const aLast = a.matched.length - 1
+  const bLast = b.matched.length - 1
   return (
-    aLast > -1 &&                                            // 前置：a 必须有 matched
-    aLast === bLast &&                                       // 关卡① 等长
-    isSameRouteRecord(a.matched[aLast], b.matched[bLast]) && // 关卡② 末端 record 同源
-    isSameParams(a.params, b.params) &&                      // 关卡③ params
-    stringifyQuery(a.query) === stringifyQuery(b.query) &&   // 关卡④ 查询串
-    a.hash === b.hash                                        // 关卡⑤ hash
+    aLast > -1 &&
+    aLast === bLast &&
+    isSameRouteRecord(a.matched[aLast], b.matched[bLast]) &&
+    isSameParams(a.params, b.params) &&
+    stringifyQuery(a.query) === stringifyQuery(b.query) &&
+    a.hash === b.hash
   )
 }
 
-// 首次导航哨兵：一个完整的固定单例对象
-const START_LOCATION = { path: '/', params: {}, matched: [], query: {}, hash: '', fullPath: '/', meta: {} }
-const isFirstNavigation = (from: any) => from === START_LOCATION
-
-// ===================== 跑起来看 =====================
-console.log('--- 切分边界：? 在 # 之后 ---')
-const tricky = '/foo#hash?x=1'
-console.log('朴素切分误判 query:', naiveSplit(tricky).searchString)          // '?x=1' —— 错
-console.log('正确切分:        ', parseURL(parseQueryPairs, tricky))          // query 为空
-
-console.log('\n--- 切分不变，只换注入的解析函数 ---')
-console.log(parseURL(parseQueryPairs, '/a?b=2&c=3').query)                   // { b:'2', c:'3' }
-console.log(parseURL(parseQueryRaw,   '/a?b=2&c=3').query)                   // { _raw:'b=2&c=3' }
-
-console.log('\n--- 相对路径双指针 ---')
-console.log('/a/b/c + ./d     =>', resolveRelativePath('./d', '/a/b/c'))     // /a/b/d
-console.log('/a/b/c + ../d    =>', resolveRelativePath('../d', '/a/b/c'))    // /a/d
-console.log('/a    + ../../d  =>', resolveRelativePath('../../d', '/a'))     // /d（不退到根之上）
-
-console.log('\n--- URL 不同、路由语义相同 ---')
-const from = { matched: [R], params: { id: '1' }, query: { a: '1', b: '2' }, hash: '' }
-const target = {
-  matched: [R_alias],         // 走了别名 → URL 可能写成 /u/1
-  params: { id: ['1'] },      // 单元素数组 ≡ 标量
-  query: { b: '2', a: '1' },  // 顺序不同
-  hash: '',
+// 哨兵：全局唯一单例标识首次导航
+const START_LOCATION: RouteLocation = {
+  path: '/', query: {}, hash: '', params: {}, matched: [],
 }
-console.log('朴素比字符串:  ', '/users/1' === '/u/1')                        // false
-console.log('语义相等判定:  ', isSameRouteLocation(from, target))            // true  → 触发短路
 
-console.log('\n--- 首次导航不会被误短路 ---')
-const firstTarget = { matched: [R], params: { id: '1' }, query: {}, hash: '' }
-console.log('START_LOCATION 与任意位置:', isSameRouteLocation(START_LOCATION, firstTarget)) // false
-console.log('靠引用相等识别首次:      ', isFirstNavigation(START_LOCATION))                 // true
+// —— 验证：边界修正 ——
+// 朴素 indexOf('?') 会把 ?x=1 当 query；边界判定认出它在 # 之后
+const r1 = parseURL(() => ({ wouldBe: 'wrong' }), '/foo#hash?x=1')
+console.log(r1.path, r1.hash) // /foo  #hash?x=1   ← query 仍为 {}
+
+// —— 验证：parseQuery 是注入参数，换个解析函数、切分逻辑不变 ——
+const r2 = parseURL(
+  s => Object.fromEntries(new URLSearchParams(s)),
+  '/foo?a=1&b=2#h'
+)
+console.log(r2.query) // { a: '1', b: '2' }
+
+// —— 验证：URL 字符串不同、路由语义相同 ——
+const Home: RouteRecord = { name: 'home' }
+const HomeAlias: RouteRecord = { name: 'home-alias', aliasOf: Home }
+const stableStringify = (q: Record<string, string | string[]>) =>
+  Object.keys(q).sort().map(k => `${k}=${q[k]}`).join('&')
+
+const from: RouteLocation = {
+  path: '/users', params: { id: '1' },
+  query: { a: '1', b: '2' }, hash: '', matched: [Home],
+}
+const target: RouteLocation = {
+  path: '/u', params: { id: ['1'] },          // 单元素数组
+  query: { b: '2', a: '1' },                  // 顺序不同
+  hash: '', matched: [HomeAlias],             // 别名 record
+}
+console.log(isSameRouteLocation(stableStringify, from, target)) // true
+// 朴素字符串比较 '/users?a=1&b=2' === '/u?b=2&a=1' 会判 false
+
+// —— 验证：哨兵不与任何真实位置相等 ——
+console.log(isSameRouteLocation(stableStringify, from, START_LOCATION as any))
+// false —— aLast=0、bLast=-1 不等长 → 首次导航不被短路
 ```
 
-执行轨迹正是开篇设想的那一幕：`target` 的 URL 字符串和 `from` 不同（朴素比较 `false`），但语义相等判定返回 `true`，于是这次「重复」导航被短路掉；而 `START_LOCATION` 因为 `matched` 为空，过不了前置条件，首次导航照常进行。
+## 6. 执行轨迹
 
----
+**拆解轨迹**——输入 `/foo#hash?x=1`：
 
-## 回顾：四条权衡一览
+1. `hashPos = location.indexOf('#')` → 4
+2. `searchPos = location.indexOf('?')` → 9
+3. `searchPos > hashPos`（9 > 4）→ 命中边界修正，searchPos 置 -1
+4. 进入 hash 分支：path = `/foo`、query 保持 `{}`、hash = `#hash?x=1`
+5. fullPath 拼回 = `/foo` + `` + `#hash?x=1` = `/foo#hash?x=1`
 
-| # | 选择 | 换来 | 代价 |
-|---|------|------|------|
-| 1 | 手工 `indexOf` 切分，不用 `URL` / `URLSearchParams` | 2～5 倍解析速度（热路径） | 自己处理 `#` / `?` 谁先谁后的边界 |
-| 2 | 「同一处」用末端 matched record 的引用相等判定 | 别名、重定向、各种 URL 写法都认成同一处 | matched 链须由匹配表确定构建，且先判两端等长 |
-| 3 | 查询串相等委托给「序列化后比字符串」 | 单值≡单元素数组自然等价、免写深比较 | 每次比较跑一次序列化（开销可忽略） |
-| 4 | 用全局唯一的完整路由对象当首次导航哨兵 | 一身二任：currentRoute 初值 + 一行 `from === START_LOCATION` | 必须全局单例导出，比较须同一引用 |
+朴素 `indexOf('?')` 会拿到 9、从 9 切到末尾当成 query 解析 `x=1`——错把 hash 里的查询串当真查询。一行边界判定挡住这类错误。
 
-四条合起来，回答了开篇那两个问题：(a) 比「路由语义」而非字符串，才能短路重复导航；(b) 一个固定单例对象，既撑起初值又当哨兵，才让首次导航有个合理的 `from`。
+**相等短路轨迹**——`from`（在 `/users`，末端 record R、params `{id:'1'}`、query `{a:'1',b:'2'}`）vs `target`（在 `/u`，R 的别名 RA、params `{id:['1']}`、query `{b:'2',a:'1'}`）：
 
----
+1. 两端 matched 都长 1 → 等长过关
+2. 末端 record 比对：`(RA.aliasOf || RA) === (R.aliasOf || R)` → `R === R`（别名归一）→ 过关
+3. params 比对：`'1'` vs `['1']` → isEquivalentArray → `a.length === 1 && a[0] === '1'`（单值≡数组）→ 过关
+4. query 比对：序列化两端 → `a=1&b=2` === `a=1&b=2`（按 key 排序）→ 过关
+5. hash 比对：`''` === `''` → 过关
+6. 五关全过 → `isSameRouteLocation` 返回 true → 触发 `NAVIGATION_DUPLICATED`，跳过整套导航、仅触发滚动到同锚点的副作用
 
-本章判定「同一处」靠的是末端 record 的引用相等——但这条 record 是怎么从你写的路径模式（`:param`、`*` 通配、自定义正则）编译出来的？多条模式撞车时，又凭什么判定谁优先？这正是下一章「路径模式编译与优先级评分」要拆开讲的。
+URL 字符串 `/users?a=1&b=2` vs `/u?b=2&a=1`——朴素字符串比较会判「不同」，重新跑一遍导航。
+
+**首次识别轨迹**——应用启动后第一次 push：守卫收到 `from === START_LOCATION_NORMALIZED` → true → 进入「首次导航」分支，不做重复短路。
+
+## 7. 教学简化说明
+
+本章演示故意省略了：完整 `RouteRecord` / matched 祖先链是怎么由匹配表构建的（属后续匹配表章）；真正的分段编码与 null/undefined 语义（第 1 章已讲，本章 parseQuery 是注入占位）；`stripBase` 的 base 剥离（属 history 章衔接）；相对路径 `./` `../` 的双指针解析（心智模型已点，不在演示里铺开）；devtools 诊断码与类型泛型。
+
+## 8. 小结
+
+URL 字符串是不可信的同一性证据——同一处可以有无数种写法。location 层把它降到「路由记录引用 + 参数结构 + 序列化后的查询与锚点」这一层语义上，再以一个全局单例对象给首次导航一个固定身份。手工切分换来的速度，是这套语义判定能在每次导航热路径上跑得起的代价。
+
+下一章接过 path 段——把 `/users/:id` 这样的模式编译成正则与 parse/stringify 双向函数，并从模式本身派生具体性评分消解多路由歧义。

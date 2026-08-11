@@ -1,251 +1,174 @@
----
-title: "统一配置体系与版本感知默认值"
----
-
 # 统一配置体系与版本感知默认值
 
-## 一个让人头疼的场景
+> 本章属于 system 层。前置：「一次编写、六套构建器适配」。
+> 学完你能：用一句话讲清为什么 vue-macros 的默认配置不是常量、而是「Vue 版本号的函数」——以及它换来了什么、付出了什么。
 
-想象你在维护三个 Vue 项目：一个是三年前的老项目，还跑在 Vue 3.2；一个是去年的，Vue 3.3；还有刚搭起来的新项目，Vue 3.4。你三个项目都想用 vue-macros 这个库，因为它有三十多个语法糖宏能让代码更舒服。
+## 1. 为什么需要它
 
-但你很快发现一个问题：有些宏是「为旧 Vue 补齐的语法糖」——比如 `shortEmits`，Vue 3.3 之前原生不支持简洁写法，所以宏来补；3.3 之后原生支持了，宏再来一遍就是多余转换，搞不好还和原生行为打架。还有一些像 `shortBind`，是 3.4 才原生吸收的，那在 3.4 项目里就该关掉。
+上一章末尾留了个钩子：`short-bind`、`short-vmodel` 这些单点宏在 plugin 层调 `detectVueVersion()` 是为了**变换逻辑**本身的版本差异（旧版允许 `:foo`、新版只认 `::foo`），至于「这个宏在新旧 Vue 下默认开还是关」的另一层版本感知，归配置层管。本章就接着这另一层讲。
 
-如果每个宏都写死一个固定开关，必然在某一侧出错：旧版该补的不补，新版该收的没收。
+把视角拉到整个 vue-macros：三十多个特性里，相当一部分的命运和 Vue 版本绑死——`shortEmits`、`defineSlots` 这类语法糖在 3.3 之后被 Vue 原生吸收；`short-bind` 在 3.4 之后原生支持；另一些是给旧版补齐能力的垫片。想象一个用户在两个项目里都用 vue-macros：项目 A 跑 Vue 3.2、项目 B 跑 Vue 3.4。如果每个特性都写死一个固定默认（比如「`shortEmits` 默认开」），那它要么在项目 B 里做无用转换、甚至跟原生能力打架，要么就得用户自己关掉。反过来默认都关，项目 A 就少了一块补齐能力。
 
-你真正想要的是这样一句话：**「我几乎不用配，库自己看我的 Vue 版本，决定哪些宏该上、哪些宏可以撤。」**
+**问题不在于「该开还是该关」，而在于「该开还是该关」这件事本身就取决于一个外部状态——当前项目装的 Vue 版本。** 这一层要解决的，就是把这个外部状态接到配置体系里，让用户几乎不用动配置，库自己按 Vue 版本决定哪些宏该上。
 
-这一章讲的就是 vue-macros 怎么做到这件事。核心一句话：**默认值不是常量，是「检测到的 Vue 版本号」的函数。**
+## 2. 核心思想
 
-## 一张「版本门槛表」就是全部玄机
+默认值不是常量，而是「检测到的 Vue 版本号」的函数。同一份配置在 Vue 3.2 和 Vue 3.4 项目里跑出来长出不同的形状——前者把 `shortEmits` 算成开、后者把它算成关，用户完全不用感知。
 
-打个比方：这就像一道带自动门禁的入口，每个人（特性）胸前都挂着一块牌子，上面写「仅限身高 1.2 米以下进入」。门口有个测身高的人（版本探测），测完逐个对照，过线的放行、不过线的拦下。整张「谁挂什么牌子」的表，就是配置的源头。
+## 3. 心智模型
 
-vue-macros 把三十多个特性收进了一张表，每个特性配一个**默认门槛**。门槛只有两种写法：
+先把整条解析路径画清楚：从磁盘一路读到最终配置，一共七步，每一步都在把「版本号」和「用户意图」往最终开关里拼。
 
-- 一个布尔值（`true` / `false`）：写死开或关。
-- 一个版本号（如 `3.3`）：意思是「检测到的 Vue 版本 **小于** 这个数才默认开」。
+1. **读磁盘配置**：按约定文件名（`vue-macros.config.*`）和 `package.json` 里的字段，把用户写在磁盘上的配置读进来。
+2. **探版本**：用 `local-pkg` 按 `root` 路径解析已安装的 `vue` 包，读它的 `version` 字段。
+3. **合并**：把磁盘配置和「调用时传入的选项」浅合并——后者逐字段覆盖前者。
+4. **补全局默认**：三个全局量（`root` 缺省 `cwd`、`version` 缺省探到的版本、`isProduction` 缺省 `NODE_ENV === 'production'`）补齐。
+5. **逐特性算门槛默认**：每个特性在调用处都有一个门槛值（布尔或数字）。门槛是布尔就直接当默认值；门槛是数字就按 `version < 门槛` 算出默认开或关。
+6. **用户优先**：用户显式给过的，就用用户的；否则用第 5 步算出的默认。
+7. **`false` 即关闭**：最终值是 `false` 的特性原样返回 `false`；否则把全局量合并进去，得到带上下文的完整配置对象。
 
-注意第二种——这是整章的精髓。被新版 Vue 原生吸收的语法糖（`shortEmits`、`defineSlots`、`shortBind` 等）门槛就是「该版本号」，于是在新版下自动关、旧版下自动开。**同一个默认值，在不同版本下算出不同行为。**
+整张表汇总后交给前置章讲过的那条 `resolvePlugin → bundler 入口` 装配管道——某特性是 `false`，对应的宏实例就不会被创建、从管道里消失。
 
-## 自底向上：从原始件到最终配置
+## 4. 关键权衡
 
-讲清楚这张表怎么运转，得从最底层的那几块往上搭。
+### 把版本号当默认门槛，而不是写死布尔
 
-### 第一块：三个「全局量」
+每个特性的「默认开关」在源码里不是一个布尔，而是一个版本数字（或一个布尔）。规则是「检测到的版本 < 该数字才默认开」。比如 `shortEmits` 的门槛是 `3.3`——Vue 3.3 之后原生支持，于是 3.2 项目里默认开、3.4 项目里默认关。
 
-合并配置前，先有三个公共量要确定：
+- **换来**：同一份配置在新旧 Vue 下行为自适应——新版里被吸收的语法糖自动停止做无用转换，旧版里自动补齐。用户零配置即可用。
+- **代价**：用户必须理解每个特性有自己的版本门槛；升级 Vue 时某个宏可能「静默关闭」，依赖它的代码不会报错、只是相应转换不再发生——这是一体两面的副作用。
+- **化解的本质矛盾**：「默认值随环境漂移」与「用户不想手动改配置」在打架——把版本号塞进默认值定义里，让漂移本身被默认值吸收掉，而不是逼用户去手改。
 
-- **根目录 `root`**：项目装在哪。后面所有「读磁盘配置」「读 vue 包版本」都得知道去哪个目录读。
-- **Vue 版本号 `version`**：用 `local-pkg` 沿 `root` 解析已安装的 `vue` 包，读它的 `version` 字段，`parseFloat` 取出来。Vue 2.x 还会取整（`Math.trunc`）。探测不到时给个回退默认（如 3.5）并 warn 一声。
-- **生产环境标记 `isProduction`**：直接看 `process.env.NODE_ENV === 'production'`。
+### 三层合并，全局上下文一次性下发
 
-这三个量是「全局上下文」——**每个特性最终都需要它们**，所以探测一次、统一注入，比每个特性各自探测强得多。这是后面权衡 2 要展开的点。
+整套合并是「磁盘配置 ← 调用时传入选项」的浅覆盖，然后把 `root`/`version`/`isProduction` 三个全局量单独提到一张 `globalOptions` 里，给每个特性的最终配置都注入一份。
 
-### 第二块：两层用户配置合并
+- **换来**：探测成本只付一次（探版本是一次磁盘 I/O），各特性不必各自重复探测；配置来源也只剩两层（文件、调用），单一可控。
+- **代价**：合并语义是隐式的——传入选项永远覆盖文件，且是浅合并。用户对「文件 vs 调用谁赢」没有显式信号，新手写一份又改一份时容易困惑。
+- **化解的本质矛盾**：「特性级独立性」与「全局上下文一致性」在打架——各特性只关心自己的子选项，全局量统一注入，不重复也不漂移。
 
-用户可以两处写配置：
+### 用字面量 `false` 当关闭哨兵
 
-- **磁盘配置文件**：约定文件名 `vue-macros.config.{mts,cts,ts,mjs,cjs,js,json}`，或 `package.json` 里的 `vueMacros` 字段。这是「项目级的偏好」。
-- **调用时传入的选项**：在 vite 配置里 `VueMacros({ ... })` 这样传。这是「这次装配的覆盖」。
+下游看到的解析结果，对每个特性要么是 `false`（关闭），要么是一个完整的选项对象（开启，至少含全局量）。`true`、空对象 `{}` 在「开启」语义上等价（都展开成「只含全局量」），只有 `false` 是唯一的关闭信号。
 
-合并规则非常简单：**后者逐字段覆盖前者，浅合并**。说人话就是：你在调用时传了的字段就赢，没传的字段 fallback 到磁盘文件。
+- **换来**：下游管道只需要一个二元判定——`=== false` 就跳过、否则就用。类型也把「关闭」显式纳入，没有「`undefined` 表示关闭」这种模糊态。
+- **代价**：「关闭(`false`)」与「开启但无额外参数(`true`/空对象)」必须用不同字面量区分，新手配置时容易混——尤其想「关掉某个特性」时下意识写 `null` 或 `undefined` 都没用，必须显式写 `false`。
+- **化解的本质矛盾**：「API 形状简单（二元判定）」与「类型完整覆盖关闭态」在打架——把关闭做成字面量而不是缺省，下游消费时的判定降到一次比较。
 
-### 第三块：每个特性的「最终配置」
+### 配置解析做成异步动作
 
-合出来的那份对象，每个特性名下还有一个值——可能是用户没动它（缺省）、可能是用户显式给的（`true` / `false` / 一个带参数的对象）。对每个特性，按下面这个流程算出它最终的配置：
+整个解析入口用 `quansync` 包成「可同步可异步」的双模函数：内部真正去读磁盘配置文件是 async，但对外暴露的签名看上去能同步调用。
 
-1. 取出该特性的**默认门槛**（布尔或版本号）。
-2. 算默认值：门槛是布尔就直接用；门槛是数字就 `version < 门槛`。
-3. 用户显式给过就用用户的，否则用默认（`用户值 ?? 默认`）。
-4. 算出来是 `false` 就原样返回 `false`（关闭）；否则把三个全局量合并进去，得到该特性的最终配置。
+- **换来**：上层装配管道可以先 `await resolveOptions(userOptions)` 拿到完整配置，再决定实例化哪些宏——「先解析、再装配」的时序清晰：配置不全就没法判断哪些宏该上。
+- **代价**：配置解析成了带 I/O 的异步步骤，必须在装配管道启动前完成——这是一个不可违反的时序约束。如果有人误把解析放到「已经实例化宏之后」，就会拿到不完整的配置。
+- **化解的本质矛盾**：「需要读磁盘（异步 I/O）」与「下游消费想要简单同步签名」在打架——用双模包装把两边都安抚下来，但要付一次时序约束的代价。
 
-整张表跑一遍，得到一份「每个特性要么是 `false`、要么是带全局上下文的配置」的结果表。这就是喂给下游装配管道的东西——管道里看到 `false` 就跳过该宏，看到对象就实例化它。
+## 5. 最小原理演示
 
-## 心智模型：七步流水线
-
-把上面拼成一张全景图：
-
-```
-磁盘配置文件 ──┐
-               ├─→ 合并（磁盘 ← 调用覆盖）─┐
-调用传入选项 ──┘                            │
-                                            ├─→ 逐特性解析
-三个全局量（root/version/isProduction）─────┘
-                                            │
-                                            ↓
-              ┌─────────────────────────────────────┐
-              │ 对每个特性：                          │
-              │   默认门槛 → 算默认（version<门槛？） │
-              │   用户值 ?? 默认                       │
-              │   false 则关闭 / 否则合并全局量        │
-              └─────────────────────────────────────┘
-                                            │
-                                            ↓
-              每特性: false | 带全局上下文的配置
-                                            │
-                                            ↓
-                  喂给下游装配管道（前置章已展开）
-```
-
-展开成七步：
-
-1. 读磁盘配置文件（约定文件名 + `package.json#vueMacros`）。
-2. 探测 Vue 版本（`local-pkg` 读 `vue` 包版本）。
-3. 合并：磁盘配置 ← 调用选项覆盖。
-4. 补三个全局量的默认值。
-5. 逐特性查门槛：布尔用布尔；数字按 `version < 数字` 算默认。
-6. 用户显式给过就用用户的；否则用第 5 步算出的默认。
-7. 结果 `false` 就原样返回；否则合并全局量得到最终配置。
-
-最后这张表交给装配管道，前置章已讲过它怎么把每个特性分发到对应 bundler 入口，本章不重复。
-
-## 最小演示：版本感知开关表
-
-下面这段几十行的脚本，演透了两条原理：**默认值 = 版本的函数**，以及 **`false` 哨兵 + 全局量合并**。完全从零实现，不依赖任何具体构建器，能用 `bun run` 或 `tsx` 直接跑。
+下面这段几十行的脚本只演透两件事：**版本号如何左右默认开关**，以及 **`false` 哨兵 + 全局量合并**。它故意不读磁盘、不双模包装、不接任何构建器。
 
 ```ts
-// version-aware-config.ts
-// 一张极简的「特性 → 默认门槛」表
-// 门槛只有两种：布尔（写死开/关）、数字（version < 数字 才默认开）
+// 一张小特性表：每个特性配一个门槛
+// 门槛是布尔 → 直接当默认值
+// 门槛是数字 → version < 门槛 才默认开
 type Threshold = boolean | number
 
 const featureTable = {
-  // 默认开的特性
-  defineModels: true,
-  betterDefine: true,
-  // 「被新版 Vue 原生吸收」的语法糖：旧版补、新版关
-  shortEmits: 3.3, // Vue 3.3 起原生支持
-  defineSlots: 3.3,
-  shortBind: 3.4, // Vue 3.4 起原生支持
-  // 默认关的特性（实验性，需显式启用）
-  defineStylex: false,
-} as const
+  defineModels:  true,   // 固定默认开（所有版本都需要）
+  shortEmits:    3.3,    // 3.3 之后被 Vue 原生吸收，旧版才需要补
+  shortBind:     3.4,    // 3.4 之后原生支持
+  exportExpose:  false,  // 默认关，需显式启用
+} satisfies Record<string, Threshold>
 
-type FeatureName = keyof typeof featureTable
+// 全局上下文：探测一次、所有特性共享
+type GlobalCtx = { root: string; version: number; isProduction: boolean }
 
-// 全局上下文：探测一次、各特性共享
-type GlobalCtx = {
-  root: string
-  version: number
-  isProduction: boolean
-}
-
-// 单特性解析：算默认 → 用户值优先 → false 或合并全局量
-function resolveFeature<K extends FeatureName>(
+// 单特性解析：算门槛默认 → 用户优先 → false 即关闭 → 合并全局量
+function resolveFeature<K extends keyof typeof featureTable>(
   name: K,
-  global: GlobalCtx,
-  userValue: boolean | object | undefined,
-): false | (GlobalCtx & object) {
-  // 第一步：算「版本感知的默认值」
-  const threshold: Threshold = featureTable[name]
+  ctx: GlobalCtx,
+  userValue?: boolean | Record<string, unknown>,
+): false | (GlobalCtx & Record<string, unknown>) {
+  const threshold = featureTable[name]
+  // 默认值是版本的函数：版本数字与当前版本号比较得出开或关
   const defaultEnabled =
-    typeof threshold === 'boolean' ? threshold : global.version < threshold
-
-  // 第二步：用户值优先
-  const resolved = userValue ?? defaultEnabled
-
-  // 第三步：false 是唯一的关闭哨兵
-  if (!resolved) return false
-
-  // 否则把全局量合并进去
-  // 用户给 true 表示「开但无额外参数」、给对象表示「开且带参数」
-  return {
-    ...global,
-    ...(resolved === true ? {} : resolved),
-  }
+    typeof threshold === 'boolean' ? threshold : ctx.version < threshold
+  const value = userValue ?? defaultEnabled
+  // false 是唯一的关闭哨兵
+  if (value === false) return false
+  // 开启：把全局量合并进去（true / 空对象 / 子选项 都走这条）
+  const subOptions = value === true ? {} : value
+  return { ...ctx, ...subOptions }
 }
 
-// 跑一遍：同一份用户配置、两个 Vue 版本，看差异
-function run(userOpts: Record<string, any>, version: number) {
-  const global: GlobalCtx = {
-    root: '/fake/project',
-    version,
-    isProduction: false,
+// 入口：对每个特性调一次 resolveFeature
+function resolveOptions(
+  ctx: GlobalCtx,
+  userOptions: Partial<Record<keyof typeof featureTable, boolean | object>> = {},
+) {
+  const result = {} as Record<string, false | (GlobalCtx & Record<string, unknown>)>
+  for (const name of Object.keys(featureTable) as (keyof typeof featureTable)[]) {
+    result[name] = resolveFeature(name, ctx, userOptions[name])
   }
-  console.log(`\n=== Vue ${version} ===`)
-  for (const name of Object.keys(featureTable) as FeatureName[]) {
-    const result = resolveFeature(name, global, userOpts[name])
-    console.log(
-      `  ${name.padEnd(14)} ->`,
-      result === false
-        ? '关闭（管道跳过）'
-        : '开启，配置 = ' + JSON.stringify(result),
-    )
-  }
+  return result
 }
-
-// 同一份空用户配置，分别在 Vue 3.2 和 3.4 下跑
-const emptyUserConfig: Record<string, any> = {}
-run(emptyUserConfig, 3.2)
-run(emptyUserConfig, 3.4)
 ```
 
-跑出来的轨迹长这样：
+跑两次，对比同一份用户配置在两版本下的形状差异：
 
-```
-=== Vue 3.2 ===
-  defineModels   -> 开启，配置 = {"root":"/fake/project","version":3.2,"isProduction":false}
-  betterDefine   -> 开启，配置 = {"root":"/fake/project","version":3.2,"isProduction":false}
-  shortEmits     -> 开启，配置 = {"root":"/fake/project","version":3.2,"isProduction":false}
-  defineSlots    -> 开启，配置 = {"root":"/fake/project","version":3.2,"isProduction":false}
-  shortBind      -> 开启，配置 = {"root":"/fake/project","version":3.2,"isProduction":false}
-  defineStylex   -> 关闭（管道跳过）
+```ts
+const emptyUserConfig = {}  // 用户什么都不传
 
-=== Vue 3.4 ===
-  defineModels   -> 开启，配置 = {"root":"/fake/project","version":3.4,"isProduction":false}
-  betterDefine   -> 开启，配置 = {"root":"/fake/project","version":3.4,"isProduction":false}
-  shortEmits     -> 关闭（管道跳过）
-  defineSlots    -> 关闭（管道跳过）
-  shortBind      -> 关闭（管道跳过）
-  defineStylex   -> 关闭（管道跳过）
+const onVue32 = resolveOptions(
+  { root: '/proj-a', version: 3.2, isProduction: false },
+  emptyUserConfig,
+)
+const onVue34 = resolveOptions(
+  { root: '/proj-b', version: 3.4, isProduction: false },
+  emptyUserConfig,
+)
+console.log(onVue32.shortEmits)  // { root: '/proj-a', version: 3.2, ... } —— 3.2 < 3.3，默认开
+console.log(onVue34.shortEmits)  // false —— 3.4 ≥ 3.3，默认关
 ```
 
-**同一份空配置，仅仅版本号不同**——3.2 下短绑定语法糖全开（旧版需要补）、3.4 下它们全关（新版原生有了，再补就是多余）。这就是「默认值 = 版本的函数」最直白的体现。
+## 6. 执行轨迹
 
-> 演示故意省略了真实的磁盘文件加载、双模异步包装的转译细节、三十多个特性的专属字段、HMR 等工程细节。这些不参与「演透原理」，留着只增加噪音。
+把 `shortEmits` 这一个特性在两个项目里各跑一遍，看每一步状态：
 
-## 关键权衡
+**项目 A：Vue 3.2、空用户配置**
 
-这一章的原理看似简单，背后却有四条值得说的设计取舍。前三条讲透机制本身，最后一条牵出对下游时序的影响。
+| 步骤 | 状态 |
+|---|---|
+| 1. 读磁盘 | 用户没写文件，得到 `{}` |
+| 2. 探版本 | 读到 `vue@3.2.5`，解析为 `3.2` |
+| 3. 合并 | `{}` ← `{}` 浅覆盖 → `{}` |
+| 4. 补全局 | `globalOptions = { root: '/proj-a', version: 3.2, isProduction: false }` |
+| 5. 算门槛默认 | 门槛 `3.3`，`3.2 < 3.3` → `defaultEnabled = true` |
+| 6. 用户优先 | 用户没给 `shortEmits`，用默认 `true` |
+| 7. `false` 即关闭？ | 不是 `false` → 返回 `{ ...globalOptions, ...({}) }` |
 
-### 权衡 1（核心）：版本号当默认门槛
+**最终输出**：`{ root: '/proj-a', version: 3.2, isProduction: false }`——装配管道看到不是 `false`，就把 `shortEmits` 实例化、塞进管道。
 
-**做了什么**：把每个特性的默认开关从「写死的布尔」改成「一个版本数字」，规则是「检测到的版本 < 该数字才默认开」。
+**项目 B：Vue 3.4、空用户配置**
 
-**换来什么**：同一份配置在新旧 Vue 下行为自适应——被新版原生吸收的语法糖在新版下自动关闭、在旧版下自动补齐。用户从 3.2 升级到 3.4 时，无需改一行配置，原本补齐的语法糖自动撤掉，不会和新原生能力打架。**同一份 `vue-macros.config.ts` 在不同版本项目里复制粘贴就能用**，这是它最大的用户体验红利。
+| 步骤 | 状态 |
+|---|---|
+| 1. 读磁盘 | `{}` |
+| 2. 探版本 | 读到 `vue@3.4.0`，解析为 `3.4` |
+| 3. 合并 | `{}` |
+| 4. 补全局 | `globalOptions = { root: '/proj-b', version: 3.4, isProduction: false }` |
+| 5. 算门槛默认 | 门槛 `3.3`，`3.4 < 3.3` 为 `false` → `defaultEnabled = false` |
+| 6. 用户优先 | 用户没给，用默认 `false` |
+| 7. `false` 即关闭？ | 是 → 返回 `false` |
 
-**代价**：用户必须理解每个特性都有自己的版本门槛——这本身就是一份隐藏的知识。**更棘手的是「静默关闭」**：升级 Vue 时某个宏可能突然关掉，依赖它的代码不会报错，只是悄悄退回原生写法。比如你的 demo 里用 `shortEmits` 的简洁写法演示某件事，从 3.2 升到 3.3 后宏没了，写法在新版 Vue 下若恰好踩到原生不支持的边界，可能要等用户运行时才察觉。这是「版本即默认来源」的一体两面——你接受自动适配的便利，就要承担自动适配的盲区。
+**最终输出**：`false`——装配管道跳过 `shortEmits`、不实例化它。同一份用户配置，两个版本，两套行为：3.2 项目拿到补齐能力、3.4 项目不重复造轮子。
 
-### 权衡 2：三层合并 + 全局上下文一次性下发
+## 7. 教学简化说明
 
-**做了什么**：把「磁盘配置文件」「用户调用时传入的选项」按前者被后者覆盖地合并（浅合并、逐字段覆盖）；再把三个全局量（`root`、`version`、`isProduction`）注入到每一个特性的最终配置里。
+上面的演示故意省略了：磁盘配置的多源匹配（`unconfig` 怎么按优先级找文件）、`quansync` 双模异步包装的转译机制、三十多个特性各自的专属字段（属各宏自己的章）、HMR 与具体构建器的接线。这些都不影响理解「版本即默认来源」这条主线。
 
-**换来什么**：「全局上下文探测一次、各特性无需各自重复探测」——三十多个特性谁也不用自己去翻 `package.json`、自己判 NODE_ENV。配置来源也单一可控：磁盘是项目默认、调用是工程覆盖、语义清晰。同时这让特性的子选项类型保持干净——只装该特性自己关心的东西，三个全局量不污染类型签名。
+## 8. 小结
 
-**代价**：合并语义是**隐式的**——传入选项永远覆盖文件，且都是浅合并。用户对「文件 vs 调用谁赢」没有显式信号，嵌套对象（如某特性的子选项）会被整体替换而非深合并。比如磁盘里写了 `defineModels: { include: ['**/*.vue'] }`、调用里写了 `VueMacros({ defineModels: { isProduction: true } })`，合出来的 `defineModels` 只有 `isProduction`、`include` 没了——这通常不是用户预期。新手踩到这个坑很难第一反应过来是浅合并惹的祸。
+升 Vue 不改配置，库自己就把被原生吸收的语法糖关掉、把旧版缺的能力补上——这就是版本感知默认值换来的事。代价是每个特性有自己的版本门槛，升 Vue 时某个宏可能无声关闭。
 
-### 权衡 3：用 `false` 当「关闭」哨兵
-
-**做了什么**：用字面量 `false` 表示某特性彻底关闭，其余情况（无论 `true` 还是对象）都合并出一份带文件过滤条件（include/exclude）的配置。
-
-**换来什么**：下游管道只需要一个二元判定——`=== false` 就跳过、否则就用。类型上把「关闭」也明明白白纳入（解析结果是 `false | 完整选项`），没有「`undefined` 表示关闭吗？」这种含糊空间。装配管道的代码因此极其清爽：`if (options.shortEmits) plugin.use(setupPlugin(options.shortEmits))`，不用判 undefined、不用判 null、不用判空对象。
-
-**代价**：「关闭(`false`)」与「开启但无额外参数(`true` / 空对象)」必须用不同字面量区分，新手配置时容易混。比如有人想关一个特性，可能下意识写 `defineStylex: {}`，结果是开启、只是没传参数——和「关」背道而驰。这种「布尔 vs 空对象语义不对称」的小坑，是把关闭纳入类型的不可避免副产品。换句话说，**类型上的整洁是用配置语义上的微妙换来的**。
-
-### 权衡 4：配置解析做成异步
-
-**做了什么**：因为要读磁盘上的配置文件，把整个解析入口用「可同步可异步」的双模包装（对外伪装成同步签名、内部实际是 `async`），让上层可以 `await resolveOptions(userOptions)`。
-
-**换来什么**：「先解析、再装配」的清晰时序——主聚合插件先 `await` 完配置拿到完整的开关表，再决定实例化哪些宏、跳过哪些。装配管道启动前，所有「关闭的宏」已经在配置阶段从表里消失了，下游不需要二次判定。换句话说，**配置定型这件事有一个明确的、不可绕过的时间点**，过了这个点整张表就只读、谁拿到的都是同一份。
-
-**代价**：配置解析成了带 I/O 的异步步骤，**必须在装配管道启动前完成**，增加了一个不可违反的时序约束。这意味着想在运行时动态改配置（比如某个钩子里翻转开关）是不可能的——它锁死在「启动前一次定型」的语义里。双模异步包装的转译机制本身（quansync 的宏）属第三方库内部，本章只见用法、不展开其内部。
-
-> 这一章的机制相对集中，这四条已把核心讲透——没有再凑数冗余的取舍。
-
-## 这一章和下一章的接口
-
-本章产出是一张「每个特性 → `false` 或 带全局上下文的配置」的表。**紧邻下一章「主聚合插件与转换管道顺序编排」**就要消费这张表：它在一个 async IIFE 里 `await` 完配置，再把每个特性的结果按精心设计的顺序喂给装配管道，串成一条完整的转换流水线。
-
-换句话说，本章解决「**开关怎么算出来**」，下一章解决「**开了的宏按什么顺序跑**」——顺序之所以关键，是因为 `betterDefine` 必须在 `defineProps` 之后才能看到已重写的 props，结构扩展必须先于一切否则后续宏拿不到 script setup。这些下一章详谈。
-
-至于「分发到六套 bundler 入口」的机制本身——前置章已展开，这里不重复。
+这份最终配置喂给装配管道时，每个特性是 `false` 就被丢掉、是一个对象就被实例化——下一章「主聚合插件与转换管道顺序编排」就接着讲：剩下的这些宏实例按什么顺序串成一条管道。

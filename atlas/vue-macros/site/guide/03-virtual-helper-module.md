@@ -1,233 +1,200 @@
----
-title: "编译期注入虚拟 helper 模块"
----
-
 # 编译期注入虚拟 helper 模块
 
-## 一个绕不开的矛盾：帮手代码到底该住哪
+> 本章属于 primitive 层。前置：「一次编写、六套构建器适配的 unplugin 模式」。
+> 学完你能：用一句话讲清「宏如何往用户源码里塞一段自己实现的运行时帮手，而又不让那段代码以文件形式真实存在于用户项目里」，以及这么做换取了什么、付出了什么。
 
-假设你写了一个 Vue 宏，它在编译期偷偷往用户的 `setup` 顶部塞了一行调用——比如一个叫 `useVModel` 的函数，作用是把某个 prop 和它对应的 `update:xxx` 事件粘成一个能直接读写的变量。这行代码要能跑，前提是 `useVModel` 这个函数在运行时真实存在。
+## 1. 为什么需要它
 
-可这个函数该住哪？你怎么想都觉得别扭：
+上一章把宏的实现拆成了两半：一个纯函数 `transformXxx(code, id)` 做源码改写，外面套 `createUnplugin` 自动长出六套构建器入口。但这套外壳默认只用了 `transform` 这一面——给现有代码改文字、挪 AST 节点。很多宏其实还想干一件更激进的事：**给用户源码塞一段运行时支持代码**。
 
-- **住进用户的项目里？** 那就得让用户在源码树里凭空多出一个文件，版本还要跟着宏一起升级，污染人家的代码。
-- **内联到每一处调用点？** 同一个帮手被用十次就复制十份实现，产物膨胀，还完全没法复用。
+比如 `defineModels`：它把每个字段编译成一个可写 ref，这个 ref 在运行时要靠一段「把 props 和对应的 `update:` 事件粘起来」的函数才能真正工作。这段函数不是用户写的，也不该让用户去手动安装，它必须由宏自己带。
 
-vue-macros 的解法很巧妙：**根本不让这个函数住在磁盘上**。它在编译期只往源码里插一句 `import`，而这个 `import` 指向的路径是**编出来的**——磁盘上压根没这个文件。真正的实现集中住在宏自己的包里，等到构建器来加载这个"假路径"时，由插件当场把实现代码交出来。
+那这段帮手代码到底该住哪？两条路都不好走：
 
-这个插件外壳怎么搭、怎么靠 `createUnplugin` 一次写完六套构建器入口，第 2 章已经讲透了，这里不重复。本章只盯它新露出来的这一面：**当宏插进去的 `import` 指向一个不存在的路径时，插件怎么把这个虚构模块"认领"下来、并把它变成一段真正能跑的代码。**
+- **住进用户项目**：要拷一份文件过去，污染源码树；宏升级了帮手的实现，用户的拷贝跟不上；版本同步成了噩梦。
+- **完全内联到每一处调用点**：每用一次宏，就把整段帮手源码复制一遍贴进 setup 顶部。产物会膨胀，多组件之间也无法共享同一份实现。
 
-> 一句话核心思想：**编译期只插一句指向虚构路径的 `import`，运行时由插件自己冒充这个模块、把实现代码当场交出来。**
+两条路都把「注入点」与「实现」耦合死了。本章要解决的矛盾就是：宏想往源码里塞运行时代码，但那段代码既不能住进用户的磁盘、又不能就地膨胀。
 
-打个比方：这个虚构路径就像一个地图上不存在的门牌号，普通人（构建器默认的文件查找）投递会失败，但邮局内部（插件）知道这封信该转交给谁。说人话就是——**注入点和实现被彻底拆开了**，编译期只负责贴一张"假地址标签"，运行时再由插件按这张标签把真东西递过去。
+幸运的是 `createUnplugin` 外壳还暴露了 `resolveId`、`load` 这些模块解析钩子——这正是给运行时帮手「凭空」找地方住的关键。
 
-## 自底向上：先看三块基本件
+## 2. 核心思想
 
-### 基本件一：一块所有插件都认得的"公共前缀"
+**编译期只往源码插一行指向虚构路径的 import，运行时由插件冒充这个虚构模块、当场把实现代码交出来。**
 
-要拦截一个虚构模块，插件首先得能一眼认出"这是我家的"。vue-macros 给所有虚拟模块统一加了一段全局前缀 `/vue-macros`，下面再挂各特性的命名空间，比如 `/vue-macros/define-models`，再往下派生具体的帮手路径：
+关键在于「虚构」二字——这条 import 路径在磁盘上根本不存在，但它被插件用三件套拦住了：解析时认领、加载时交货、必要时声明「我能加载」。从此「注入点」就只是一行字符串，真正的实现集中在宏自己的包里，两边只在加载的瞬间相遇。
 
-```
-/vue-macros                              ← 全局共享前缀，谁都能 startsWith 认领
-  └─ /define-models                      ← define-models 的命名空间
-       ├─ /use-vmodel                    ← 帮手一：粘合 prop 与事件
-       └─ /emit-helper                   ← 帮手二：赋值即触发事件
-```
+## 3. 心智模型
 
-这种"前缀分层"的好处是：任何插件只需一句 `id.startsWith('/vue-macros')` 就能判断这个 id 归不归自己管。它像一块**谁都能看到的公共留言板**——大家约好用同一个抬头发帖，认领时按抬头过滤即可。
+一段虚拟 helper 模块的完整生命周期是这样走的：
 
-### 基本件二：帮手文件就是被加载的内容（自我引用）
+1. **编译期注入**：宏在改写用户源码时，在 setup 顶部插一行 `import 本地名 from "<虚构路径>"`，同时把原来对宏的调用改写成对这个本地名的调用。
+2. **路径前缀分层**：所有 vue-macros 虚拟模块共享 `/vue-macros` 这个统一前缀，每个特性在自己的命名空间下挂具体帮手，比如 `/vue-macros/define-models/use-v-model`。任何插件用 `startsWith` 一眼就能认出哪些 id 归自己管。
+3. **构建器尝试解析**：构建器拿到一行新 import，逐个问已注册的插件「你能认领这个路径吗？」。
+4. **插件认领**：本插件看到前缀匹配，返回 id 本身。这一步把虚构路径**固化为模块标识**，相当于告诉构建器「别去磁盘找文件，这就是个真模块」。
+5. **构建器要求加载**：构建器随后要从这个标识拿到模块代码。某些构建器在加载前还要再问一次「这个 id 你确实能加载吗？」，于是 `loadInclude` 这个过滤器再用同样的前缀答「能」。
+6. **插件交出实现**：`load` 钩子按精确 id 匹配，把预先以字符串形式备好的源码作为模块内容返回。
+7. **进入正常打包**：帮手代码此后就和其他用户代码一样被打进产物、一起运行。
 
-这是整个机制里最漂亮的一笔。插件声明虚构 id 的同时，用 `?raw` 把同目录下那个真正的运行时实现文件**以字符串形式**导入进来：
+其中最值得点出的是第 6 步的一个巧思：插件交出的字符串不是手写硬编码的，而是用 `?raw` 把同目录下那份运行时实现文件**以字符串形式导进来**。于是「帮手的实现」与「load 要交出的内容」是同一份文本，改一处两边同步生效。
+
+## 4. 关键权衡
+
+### 用虚构路径当 import 目标，换注入点与实现彻底解耦
+
+宏的注入器在改写源码时，把 import 的 `from` 写成 `/vue-macros/define-models/use-v-model` 这样的前缀路径——磁盘上**根本没有这个文件**。换来的是：帮手代码集中住在自己的包里，用户源码树一尘不染；多个特性可以共用同一个虚构模块机制（结构扩展、命名模板都通过它注入）；宏升级时帮手实现也跟着自动更新，没有版本同步问题。
+
+代价是：必须实现一整套**模块解析拦截**才能让那行 import 不报错——认领解析、声明可加载、加载三步缺一不可，而且这套拦截要在 vite/rollup/webpack/esbuild/rspack/rolldown 六套构建器下都成立。不同构建器对「插件能拦截到哪一步」的约定有差异，某些构建器需要额外的 `loadInclude` 过滤器才知道哪些 id 该进 load，跨构建器的虚拟 id 还要按 `framework` 后缀分流。
+
+化解的本质矛盾：**「注入点」想尽可能轻（一行字符串），「实现」想尽可能厚（带响应式逻辑的函数）**。把两者用虚构路径切开，让轻的轻到只是一行 import，厚的厚到可以是一个完整模块。
+
+### 帮手源文件即被加载内容，换实现永不漂移
+
+声明虚构 id 的同时，用 `?raw` 把同目录下那份运行时实现文件以字符串形式导入：
 
 ```ts
-// 帮手的真实实现，就住在这个文件里
-export { default as useVmodelHelperCode } from './use-vModel?raw'
+// 等价于 import useVmodelHelperCode from './use-vModel?raw'
+import { readFileSync } from 'node:fs'
+const useVmodelHelperCode = readFileSync('./use-vModel.ts', 'utf-8')
 ```
 
-`?raw` 是个约定：它让构建器不要去执行、解析这个文件，而是**把它的源代码文本原样当成一个字符串**返回。于是同一段文本身兼两职：
+`load` 钩子直接返回这段字符串。换来的是：**实现与被加载内容是同一份文本**——开发者改 `use-vModel.ts` 的实现，下一次构建交出去的就是新版，永远不会出现「声明里说的」与「加载时给的」对不上的漂移。
 
-- 它是**帮手的源码**（开发者改的就是它）；
-- 它也是 **`load` 钩子要交出的模块内容**。
+代价是依赖一个**约定**：构建器必须支持「以原始字符串形式导入文件」这种 `?raw` 用法。这是个被 vite/rollup 广泛支持但并非标准的约定，遇到不支持的构建器就得退化为「构建期把文件读成字符串」。此外，帮手源文件里不能含**仅编译期有效、运行期会塌掉的语法**——它现在要作为运行时模块原封不动地交出去，编译期擦除掉的类型注解或宏调用都不能残留。
 
-改一处实现，被加载的内容立刻同步——两者永不漂移，因为它们压根就是同一份文本。换句话说，插件是**拿自己的源文件当成了要交付的商品**，自己引用自己。
+化解的本质矛盾：**「声明虚构模块」是一次事，「交付内容」是另一次事**。用 `?raw` 自引用把这两件事焊死成同一份文本，从机制层面消灭了不一致的可能。
 
-### 基本件三：注入器——给帮手取个不撞名的本地名，且只插一次
+### 统一前缀 + WeakMap 去重，换帮手只注入一次且绝不撞名
 
-宏往用户源码里插 `import` 时不能太随意。要是用户代码里恰好也有个叫 `useVModel` 的变量，就撞车了。所以有一个公共的注入函数 `importHelperFn`，它做两件事：
+注入器给所有本地名都加一段 `__MACROS_` 前缀（比如 `__MACROS_useVModel`），并用一个以 magic-string 实例为键的 WeakMap，按「来源文件 @ 导入名 @ 前缀 @ 本地名」做去重。换来的是：同一个帮手在一处源码里被引用十次也只插一行 import；前缀保证了它绝不会和用户自己写的变量撞名。
 
-1. **统一加内部前缀** `__MACROS_`：插进去的本地名一定是 `__MACROS_useVModel` 这种，绝不可能和用户代码重名。
-2. **按"来源+名字+前缀+本地名"去重**：它用一个以 magic-string 实例为键的缓存记下"这处源码里已经插过这个帮手了"，于是**同一个帮手在一处源码里被引用十次，也只插一条 `import`**。
+代价是：用户在最终产物里看到的变量名是被改写过的、对人类不友好；调试时 stack trace 里会冒出 `__MACROS_xxx` 这种名字，需要靠 sourcemap 才能对回源码。前缀的选择也是单向门——一旦发布就不能改，否则用户已有的代码可能与新前缀不期而遇地撞名。
 
-注入时还区分默认导入和命名导入两种形态，但思路都一样：拿一个安全的本地名，把 `import` 插到 `setup` 顶部。
+化解的本质矛盾：**「全局唯一性」与「不打扰用户命名空间」**。前缀把名字空间隔离，去重把同次构建的多次引用合并，组合起来既保证正确又控制了产物体积。
 
-## 组合件：模块解析拦截三件套
+## 5. 最小原理演示
 
-光有前缀和实现还不够。要让一句 `import "/vue-macros/define-models/use-vmodel"` 不报错地拿到代码，插件必须在 unplugin 实例里同时实现三个钩子。这三个钩子是一条流水线上的三道关：
+下面这段脚本手写一条「转换 → 认领 → 加载 → 字符串拼装 → 求值」的最小流水线，**不依赖真实 vite/rollup**，演透「import 一个不存在的路径却没报错、反而拿到了实现」这件事。
 
-```
-构建器拿到 import "/vue-macros/.../use-vmodel"
-        │
-        ▼
-  ① resolveId   ── 认领：前缀对得上？把虚构路径钉死成模块标识，挡住磁盘查找
-        │
-        ▼
-  ② loadInclude  ── 报名：告诉构建器"这个 id 我能加载"（部分构建器必需）
-        │
-        ▼
-  ③ load         ── 交货：按精确 id 匹配，返回对应的 ?raw 源码字符串
-        │
-        ▼
-  帮手代码进入正常打包流程，和用户代码一起进产物
-```
+```ts
+// 全局前缀：所有虚拟模块共享，认领靠 startsWith 一眼判断
+const HELPER_PREFIX = '/vue-macros/helper'
 
-**① `resolveId`：认领，把虚构路径钉死成模块标识。**
+// 帮手实现：以字符串形式预先备好，对应实际仓库里用 ?raw 读同目录文件
+const helperSource = `
+export default function greet(name) {
+  return 'hello ' + name
+}
+`
 
-构建器每遇到一个 `import`，都会挨个问插件"这个路径归你管吗"。本插件的回答很干脆：只要 id 以 `/vue-macros` 开头，就返回 id 本身——这一步的真正作用是**把一个虚构路径固化成一个确定的模块标识，从而阻止构建器再去磁盘上找文件**。如果不认领（返回空），构建器就会老老实实去文件系统里找 `/vue-macros/...`，结果当然是找不到，直接抛"模块解析失败"。
-
-**② `loadInclude`：先报上名，说"我能加载"。**
-
-有些构建器（典型如 webpack 系）不会无脑把每个 id 都送进 `load`，而是先问一句"哪些 id 你打算加载"。`loadInclude` 就是用来回答这个问题的过滤器——同样以前缀做判断。没有它，在某些构建器下你的 `load` 根本不会被调用，虚构模块就成了断头路。
-
-**③ `load`：按精确 id 交出源码。**
-
-到了这一步，构建器已经认定"这个模块归你加载，请给代码"。插件按精确的 id 匹配：是 `use-vmodel` 就交出 `useVmodelHelperCode`，是 `emit-helper` 就交出 `emitHelperCode`。交出来的，正是基本件二里那段 `?raw` 字符串。
-
-三件套缺一不可：少了 `resolveId`，构建器去磁盘扑空；少了 `loadInclude`，部分构建器压根不进 `load`；少了 `load`，认领了也没东西可交。**三者合起来，才在多构建器下都站得住。**
-
-## 一次完整的心智轨迹
-
-把上面几块串起来，从用户写下一句宏，到帮手跑起来，是这样一条路：
-
-```
-A. 用户在 setup 里写了 defineModel('title')
-        │  宏在转换阶段：
-        ▼
-B. setup 顶部被插入 import useVModel from "/vue-macros/define-models/use-vmodel"
-   原来的宏调用被改写成 useVModel('title')
-        │  构建器尝试解析这行新 import：
-        ▼
-C. resolveId 认领 → 把虚构路径钉成模块标识，不去磁盘找
-        │  构建器要加载这个标识：
-        ▼
-D. loadInclude 放行 → load 按精确 id 交出 ?raw 源码字符串
-        │  帮手代码进入正常打包：
-        ▼
-E. 帮手与用户代码一起被打进产物 → 运行时 useVModel('title') 真实生效
-```
-
-注意：**编译期插的只是一张"假地址标签"，运行时才由插件把真东西递过去。** 这条拆分，就是本章全部设计的落点。
-
-## 最小原理演示
-
-下面这段脚本不依赖任何真实构建器，手写了一条"转换 → 认领 → 加载 → 拼装 → 求值"的最小流水线。你存成 `virtual-helper-demo.js`，用 `node virtual-helper-demo.js` 就能跑。重点不是它多完备，而是让你**亲眼看见**：import 一个磁盘上不存在的路径，没有报错，反而拿到了实现。
-
-```js
-// virtual-helper-demo.js —— node virtual-helper-demo.js
-
-// ===== ① 虚构路径的分层前缀 =====
-const VIRTUAL_PREFIX = '/vue-macros'                       // 全局共享前缀
-const helperPrefix   = `${VIRTUAL_PREFIX}/define-models`   // define-models 命名空间
-const vmodelId       = `${helperPrefix}/use-vmodel`        // 具体帮手 id
-
-// ===== ② 帮手实现：load 时要交出的"模块内容" =====
-// 真仓库里这串文本来自 use-vModel.ts 的源码（用 ?raw 以字符串导入）；
-// 这里手写一份等价骨架：把 props[k] 的读、update:k 事件的发，粘成一个可写引用。
-const useVModelCode = `
-export default function useVModel(key) {
-  return {
-    get value() { return state.props[key] },
-    set value(v) { state.emit('update:' + key, v) },
-  };
-}`
-
-// ===== ③ 插件：模块解析拦截三件套 =====
-const plugin = {
-  // (a) 认领：前缀对得上就把虚构路径钉成模块标识，挡住磁盘查找
-  resolveId(id)   { return id.startsWith(VIRTUAL_PREFIX) ? id : null },
-  // (b) 报名：告诉构建器"这个 id 我能加载"
-  loadInclude(id) { return id.startsWith(VIRTUAL_PREFIX) },
-  // (c) 交货：按精确 id 匹配，返回源码字符串
-  load(id)        { return id === vmodelId ? useVModelCode : null },
+// 转换阶段：在用户源码顶部插一行 import，并把宏调用改写为对导入名的调用
+function transform(code: string): { code: string; helperLocal: string } {
+  const helperLocal = '__MACROS_greet'   // 加内部前缀避免与用户变量撞名
+  const importLine = `import ${helperLocal} from "${HELPER_PREFIX}/greet"\n`
+  const rewritten = code.replace(/\bgreet\(/g, `${helperLocal}(`)
+  return { code: importLine + rewritten, helperLocal }
 }
 
-// ===== ④ 宏在转换用户源码时做的事 =====
-// 转换前：用户写了句声明双向绑定的调用
-//   const title = defineModel('title')
-// 转换后：顶部多了指向虚构路径的 import，调用被改写成对帮手的调用
-const entryAfterTransform = `
-import useVModel from "${vmodelId}";
-const title = useVModel('title');`
+interface Plugin {
+  resolveId(id: string): string | null
+  load(id: string): string | null
+}
 
-// ===== ⑤ 模拟构建流水线：resolveId → load → 拼装 → 求值 =====
-function buildAndRun() {
-  // 5.1 把入口里的 import 拆出来：拿到的 fromId 是个磁盘上不存在的虚构路径
-  const m = entryAfterTransform.match(/import\s+(\w+)\s+from\s+"([^"]+)";?/)
-  const [, localName, fromId] = m
+// 模拟一个最小构建器：走完「解析 → 加载 → 拼装」三步
+function miniBundler(userCode: string, plugin: Plugin): string {
+  const { code: transformed } = transform(userCode)
+  const importRe = /import\s+(\w+)\s+from\s+"([^"]+)"/g
+  let finalCode = transformed
 
-  // 5.2 构建器问插件认不认领；认领了就不会去磁盘扑空
-  const resolved = plugin.resolveId(fromId)
-  if (resolved == null) throw new Error(`找不到模块 ${fromId}`)
+  for (const match of transformed.matchAll(importRe)) {
+    const [line, local, specifier] = match
 
-  // 5.3 构建器要加载；插件按精确 id 交出源码字符串
-  const code = plugin.load(resolved)
+    // 解析钩子：插件认领路径并返回模块标识，从而阻止磁盘查找
+    const resolved = plugin.resolveId(specifier)
+    if (resolved == null) throw new Error('module not found: ' + specifier)
 
-  // 5.4 拼装：把"默认导出"改成具名绑定，替换掉用户代码里的 import 行
-  const bundle =
-    code.replace(/export default/, `const ${localName} =`) +
-    '\n' +
-    entryAfterTransform.replace(m[0], '')
+    // 加载钩子：插件按 id 交出预先备好的源码字符串
+    const loaded = plugin.load(resolved)
+    if (loaded == null) throw new Error('module empty: ' + resolved)
 
-  // 5.5 求值：注入一个假的 Vue 运行时（props + emit），看帮手是否生效
-  const state = {
-    props: { title: 'hello' },
-    emitted: [],
-    emit(name, val) { this.emitted.push([name, val]) },
+    // 拼装：把 import 行替换为 inline 实现，将 export default 改写为 const 赋值
+    const inlined = loaded.replace('export default ', `const ${local} = `)
+    finalCode = finalCode.replace(line, inlined)
   }
-  const run = new Function('state', bundle + `
-    const before = title.value;        // 读：应拿到 props.title
-    title.value = 'changed';           // 写：应触发 update:title 事件
-    return { before, emitted: state.emitted };
-  `)
-  return run(state)
+  return finalCode
 }
 
-console.log(buildAndRun())
-// { before: 'hello', emitted: [ [ 'update:title', 'changed' ] ] }
+const plugin: Plugin = {
+  // 认领：前缀匹配即视为本插件管的真实模块标识
+  resolveId(id) {
+    return id.startsWith(HELPER_PREFIX) ? id : null
+  },
+  // 加载：按 id 交出预先备好的源码字符串
+  load(id) {
+    return id.startsWith(HELPER_PREFIX) ? helperSource : null
+  },
+}
+
+// 用户源码：调用 greet('Vue')
+const userCode = `const r = greet('Vue')\nconsole.log(r)`
+
+// 跑流水线
+const bundled = miniBundler(userCode, plugin)
+console.log(bundled)
+// 输出（拼装后）：
+//   const __MACROS_greet = function greet(name) {
+//     return 'hello ' + name
+//   }
+//   const r = __MACROS_greet('Vue')
+//   console.log(r)
+
+// 求值，验证虚构模块确实命中了实现
+new Function(bundled)()   // 打印：hello Vue
 ```
 
-执行轨迹一目了然：
+跑完可以看到：用户写的是 `greet('Vue')`，磁盘上根本不存在 `/vue-macros/helper/greet` 这个文件，但经过三步拦截后，调用真的命中了帮手函数。这就是「用虚拟模块桥接编译期与运行时」的全部魔法——注入点与实现解耦，靠虚构路径在加载瞬间接通。
 
+## 6. 执行轨迹
+
+拿一句具体的宏调用走一遍——
+
+**输入**（用户源码片段，简化示意）：
+
+```ts
+// 用户在 <script setup> 里写：
+const visible = defineModels<{ visible: boolean }>().visible
 ```
-入口 import 的 fromId  = /vue-macros/define-models/use-vmodel   （磁盘上没有）
-resolveId(fromId)      → 该 id 本身                          （认领，挡住磁盘查找）
-load(resolved)         → useVModelCode 那段字符串             （交出实现）
-拼装后 bundle          → 帮手定义 + 用户代码，import 行已被替换
-求值结果               → 读到 'hello'；写之后发出 ['update:title','changed']
+
+**编译期转换**（宏的 transform 阶段，往源码注入 import 并改写调用）：
+
+```ts
+import __MACROS_useVModel from '/vue-macros/define-models/use-v-model'
+
+const visible = __MACROS_useVModel(['visible', 'visible', 'onUpdate:visible'])
 ```
 
-`fromId` 这个路径在任何文件系统里都查无此物，但流水线一路走下来没报错，最后还真的把 prop 的读、事件的发粘在了一起。**这就是"用虚拟模块桥接编译期与运行时"被演到肉眼可见的样子。**（至于帮手内部到底怎么用响应式库把读写粘起来的，那是第 5 章 `defineModels` 的主题，本章只管"这段实现怎么被装载进产物"。）
+注意 import 的路径在磁盘上不存在——这是后面的拦截能成立的关键。
 
-## 关键权衡
+**构建器解析阶段**：构建器拿到这行 import，依次询问每个插件。`resolveId('/vue-macros/define-models/use-v-model')` 在本插件里命中前缀，返回 id 本身。虚构路径被固化为模块标识，构建器不再尝试去 `node_modules` 或磁盘找文件。
 
-这套设计之所以这么搭，每一步都是在拿一样东西换另一样东西。下面三条是核心。
+**构建器加载阶段**：构建器要拿这个标识的代码。本插件的 `load` 命中前缀，返回通过 `?raw` 预先读好的 `use-vModel.ts` 源码字符串——一段大约二十行的运行时实现，里面用响应式库把 props 和 emit 粘成可写 ref。
 
-**权衡一：用"磁盘上不存在的虚构路径"当 import 目标。**
+**进入打包**：这段帮手代码从此就和用户写的其他代码一样，被构建器当成正常模块处理。参与 tree-shaking、被打进同一个 chunk、最终在浏览器里一起运行。运行时 `__MACROS_useVModel(...)` 调用命中的就是这段被注入的实现。
 
-宏选择让注入的 `import` 指向一个编出来的路径，而不是某个真实文件。**换来的是**：帮手代码集中住在宏自己的包里、统一维护，既不污染用户的源码树，又能被多个特性复用——结构扩展、命名模板等都会用到同一套虚拟模块机制。**代价是**：你必须亲手实现一整套模块解析拦截（认领解析 → 声明可加载 → 交出代码三步），而且这套拦截还要照顾不同构建器的脾气：有些构建器认 `resolveId` 就够，有些非得你再给一个 `loadInclude` 过滤器才肯把 id 送进 `load`。换句话说，你用一个"假地址"省下了源码树污染和复用难题，买来的工程债是要写一份能在六套构建器下都成立的三段式拦截。
+至于这段实现**内部**怎么把 props 和事件粘成可写 ref，那是 `defineModels` 的内核，本章只关心它如何被装载进产物。
 
-**权衡二：把"帮手的源文件"直接当成"被加载的模块内容"自我引用。**
+## 7. 教学简化说明
 
-插件没有另外维护一份"要交出的代码"，而是用 `?raw` 把帮手的源文件以字符串导入，让它**同时是源码、也是 `load` 的返回值**。**换来的是**：实现与被加载内容永不漂移——你改了 `use-vModel.ts`，下一次 `load` 交出的就是新内容，不需要记得同步第二个地方。**代价是**：它依赖构建器对"`?raw` 这种以原始字符串导入文件"约定的支持，而且帮手文件里**不能出现那种只在编译期有意义、运行时会塌掉的语法**——因为这段文本是要原样进产物、被真实执行的，任何"编译期魔术"都会在运行时炸掉。这逼着帮手文件必须是干净、自洽、能直接跑的运行时代码。
+本章演示故意省略了：
 
-**权衡三：给注入的标识符统一加内部前缀，并按"来源+名字"缓存去重。**
+- 多构建器适配的细节（vite/rollup/webpack/rspack 在 `resolveId/load/loadInclude` 上的约定差异），上一章已经讲过这套外壳，本章只取拦截语义本身。
+- `?raw` 这一约定在不同构建器下的退化实现路径。
+- 帮手 `useVModel` 内部如何用响应式库粘合 props 与 emit 的具体语义（属第 5 章）。
+- 「赋值即触发事件」模式下赋值表达式如何被 walkAST 改写、并复用同一套虚拟模块机制注入另一个帮手 `emit-helper`（属第 5 章）。
+- `__MACROS_` 前缀 + WeakMap 去重的工程实现、与 sourcemap 对齐的细节。
 
-注入器没有直接用帮手的原名插进用户源码，而是统一加 `__MACROS_` 前缀，并用缓存保证同一帮手在一处源码里只插一条 `import`。**换来的是**：同一帮手被多处引用时产物里只有一条 `import`、绝不与用户代码撞名（哪怕用户也定义了个 `useVModel`）。**代价是**：用户在最终产物里看到的变量名是被改写过的 `__MACROS_useVModel`，对人类不可读——调试时看到这种名字得知道它是宏注入的、对应哪个帮手。这是拿"产物的可读性"换"正确性与体积"。
+## 8. 小结
 
-> 一个贯穿三者的共同取舍：**把"注入点"和"实现"彻底拆开。** 编译期只留一张指向假地址的标签，真正的实现集中维护、运行时交付。这条拆分换来的是复用与不污染，代价是必须搭一套解析拦截、且帮手文件必须老老实实是可运行代码。
+虚拟 helper 模块的关键不在「虚拟」二字本身，而在它把整件事拆成了**三个独立的关注点**：前缀分层管认领、`?raw` 自引用管实现与交付同步、前缀加去重管命名安全。三者合起来，宏才有了「凭空注入运行时支持」的能力，而又不让那段代码以文件形式真实存在于用户项目里。
 
-## 小结
-
-宏想在编译期给用户源码塞一段运行时帮手，又不想污染源码树、不想让产物膨胀，解法就是**虚拟模块**：插一句指向虚构路径的 `import`，再由插件用 `resolveId` / `loadInclude` / `load` 三件套把这个虚构模块认领下来、当场交出实现。编译期贴标签，运行时递真东西——这就是 vue-macros 桥接编译期与运行时的那块基石。
-
-顺带一提，下一章我们会看到 vue-macros 里**另一类完全相反**的宏：props/emit 宏的编译期重写。它们走的不是"往产物里塞运行时实现"这条路，而是纯粹在编译期把更顺手的写法（比如 `$defineProps`、`ShortEmits`）改写成 Vue 原生的 `defineProps` / `defineEmits`，**运行时一尘不染**。对照着看，你会更清楚"注入运行时"和"只做编译期改写"这两种宏的分界线画在哪。
+但有一类宏根本不需要这种运行时支持——它们只是在编译期把用户写的某种语法糖改写成 Vue 原生宏的等价形态。下一章「props/emit 宏的编译期重写与类型转换」讲的就是这类纯编译期重写器。

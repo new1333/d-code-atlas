@@ -1,218 +1,237 @@
----
-title: "在 JSX 里镜像 Vue 模板指令"
----
-
 # 在 JSX 里镜像 Vue 模板指令
 
-## 写 JSX 的人，为什么想要模板指令
+> 本章属于 composite 层。前置：SFC 解析与增量 AST 编辑。
+> 学完你能：用一句话讲清「为什么 jsx-directive 选编译期翻译 + 分桶 + 兄弟分组，而不是运行时解释器或即遇即改」。
 
-在 TSX 里写一段「带条件渲染的列表」，你得这么写：
+## 1. 为什么需要它
 
-```tsx
-const App = () => (
-  <div>
-    {show ? <span>有</span> : <span>无</span>}
-    {list.map((item, i) => <li key={i}>{item}</li>)}
-  </div>
-)
-```
+上一章把 SFC 的结构约束打开了：整文件即 setup、独立 setup 块、内联子组件都能落到 `.vue` 里。但 Vue 用户里还有另一拨人——他们压根不写 `.vue`，直接在 `.jsx/.tsx` 里写组件，靠 `@vue/babel-plugin-jsx` 把 JSX 编译成渲染函数。这拨人手里没有 template，自然也就没有 `v-if`、`v-for`、`v-model` 这些指令。
 
-而在 template 里干同样的事，只要 `<span v-if="show">` 和 `<li v-for="...">`。一个团队里既写 template 又写 JSX，脑子里就得同时装两套写法——条件用三元还是 v-if、循环用 map 还是 v-for、双向绑定手搓 prop 加事件还是 v-model。久了你会发现，两套写法干的其实是同一件事，只是长得不一样。
+于是同一家团队出现两种心智：template 这边写 `<span v-if="show">A</span>`，JSX 那边只能写 `{show ? <span>A</span> : null}`；template 这边写 `<li v-for="item in list">`，JSX 那边只能写 `list.map(item => <li />)`。两套写法的语义本就等价，写法却割裂，成员要在两套语法之间反复切换。
 
-这一章讲的机制，干的就是「让它们长一样」：你在 JSX 元素上直接写 `v-if={show}`、`v-for={(item, i) in list}`、`v-model$...` 这些「伪指令属性」，编译器在背后把它们翻译成上面那种标准 JSX 表达式。你写的是指令，运行时跑的是三元、列表渲染回调、对象展开——两边对齐到同一套语义。
+`jsx-directive` 这个宏要解决的，就是把 Vue 模板指令的能力延伸到 JSX 里：让你在 JSX 元素上直接写 `v-if={show}`、`v-for={...}`，编译期自动翻译成等价的标准 JSX 表达式。两套写法对齐到同一套指令语义。
 
-## 核心思想：当个翻译机，不造新机器
+## 2. 核心思想
 
-说人话就是：**这个机制不发明任何新的运行时能力**，只在编译期做一件事——把 JSX 上那些「长得像指令」的属性，翻译成 JSX 本来就认识的表达式。
+不发明任何新的运行时；只在编译期把 JSX 元素上的「伪指令属性」翻译成等价的标准 JSX 表达式。
 
-打个比方，它像个同声传译：你用自己顺手的指令语法说话，传译当场把你说的话翻成 JSX 这个「母语」能听懂的标准句子。等程序真正跑起来，运行时压根不知道有「指令」这回事——它看到的只有三元、列表渲染回调、对象展开这些它早就会的东西。
+`v-if={x}` 不是新语法、新 helper，它就是一个普通的 JSX 属性，编译器看到这个属性名时把它翻译成 `{(x) ? <节点> : null}`。翻译完的产物永远是合法 JSX，`babel-plugin-jsx` 直接接着编译就行。
 
-这件事有个硬证据：这个机制用到的所有帮手函数——renderList、withKeys、withMemo、withModifiers——全部是从 vue 里直接 re-export 出来的，一个都没新造。也就是说，它翻译出来的产物，用的零件和 template 编译出来的完全一样。
+## 3. 心智模型
 
-## 地基：复用第 1 章那套偏移编辑
+输入先按文件类型分流。`.vue` 用 `parseSFC` 拿到 `script` 和 `scriptSetup` 两段（懒解析 + 增量编辑机制前置章已讲透），`.jsx/.tsx` 直接整段 babel 解析。两种输入最终都产出一个或多个 `[AST, 偏移]` 对。对每个 program 复用同一个 `MagicStringAST` 编辑器，先把偏移基准切到该 program 的起始偏移，再做基于偏移的改写——这套偏移机制前置章已交代，本章不重演。
 
-整章的底层操作还是第 1 章建立的两件套——用 parseSFC（或对 .jsx/.tsx 直接整段解析）拿到 AST，再用 MagicStringAST 做基于偏移的增量改写。那套「懒解析 + 按偏移改写」的原理第 1 章已经讲透，这里不重复。本章只看它的一个新侧面：**改写的对象从「SFC 里的宏调用」换成了「JSX 元素上的指令属性」**。同一个编辑器实例，把偏移基准切到当前 program，就能在 JSX 的 AST 上动刀。
-
-## 主干：扫一遍、分拣、回放
-
-想象一个快递分拣中心：包裹在传送带上过了一遍，工人不急着当场拆每一个，而是先按种类扔进不同的格子——顺丰的一格、京东的一格、退件的一格。等传送带过完了，再一格一格处理。
-
-这个机制干的一模一样。它对整段 AST 只遍历一次，遇到一个 JSX 元素就扫它的属性，看见 `v-if` 扔进「v-if 格」、看见 `v-for` 扔进「v-for 格」，以此类推。遍历结束，再按一个写死的顺序，一格一格地把收集到的指令改写掉。
-
-为什么不「遇到一个改一个」？因为有些指令光看自己改不了。最典型的就是 v-if：一条 `v-if / v-else-if / v-else` 链，你得先知道后面还跟着几个 else，才能决定结尾是「续接下一支」还是「收尾」。如果即遇即改，改第一个 v-if 的时候你根本不知道后面有没有 else。所以必须先把同类兄弟都收齐，回放时一起看。
-
-收集时一共开 7 个格子，按数据形态分两种：
-- v-if 用一个「以父节点为键」的 Map——同一父节点下的兄弟指令自然成一组；
-- v-for、v-memo、v-html、v-on、带修饰符的事件，各自一个数组；
-- v-slot 用一个嵌套 Map（结构最复杂，本章不展开）。
-
-回放顺序是写死的：先插槽，再 v-if，再 v-for，再 v-memo、v-html、v-on……这个顺序不是随便排的，下面会讲为什么。
-
-## v-if：靠「下一个兄弟」还原出嵌套三元
-
-v-if 要变成嵌套三元，难点不在条件本身，而在「怎么知道这一支后面还有没有别的支」。答案就是上面那个「以父节点为键」的 Map：同一父节点下的 v-if 兄弟被收进了同一个数组，顺序就是源码里的顺序。所以回放时，你只要看「数组里我的下一个邻居，是不是以 v-else 开头」就能判断。
-
-具体改法分三种角色：
-- `v-if` 或 `v-else-if`：在元素开头插 `{ (条件) ? `，开启一支三元；
-- 同一个元素结尾：看下一个兄弟是不是 else 开头——是，就续接 ` :`（把话筒交给下一支）；不是，就收尾 ` : null}`（这条链到我结了）；
-- `v-else`：它不需要开头加什么（靠前一支的 ` :` 把它接进来），只在结尾补一个 `}`，把最外层的 `{` 闭合掉。
-
-走一遍 `<span v-if={x}>是</span><span v-else>否</span>`：
-- 第一个 span 开头变成 `{(x) ? `，结尾看下一个是 v-else → 接 ` :`；
-- 第二个 span 结尾补 `}`；
-- 两个元素的指令属性都被删掉。
-
-最终：`{(x) ? <span>是</span> : <span>否</span>}`。
-
-一条多支的 v-if 链，就这样靠「下一个兄弟姓什么」被推断成一串嵌套三元。这里还有个小机关叫 hasScope：如果当前元素正好处在另一个 JSX 元素或片段的子节点位置，可以直接用 `{ }` 包；但如果它处在「函数 return」「数组元素」这种位置，`{ }` 会被当成别的东西，这时就得用 `<>{ ... }</>` 这种 Fragment 形式兜一下。这部分是工程细节，下面的演示先省略。
-
-## v-for：借 JS 已经会的东西来表达语法
-
-v-for 想表达的是 `(item, index) in list`。这看着像 template 专属语法，但你想想——JS 里本来就有一个 `in` 操作符（`'x' in obj` 那个）。于是这个机制干脆让 babel 把 `(item, i) in list` 当成一个**普通的二元表达式**来解析：操作符就是 `in`，右边是列表，左边是 `(item, i)` 这个逗号序列。
-
-不用自己写任何解析器。babel 直接吐给你一棵合法的 AST：
-- 操作符：`in`
-- 左边：逗号序列表达式 `(item, i)` → 拆出 item 和 index（如果还有第三个，就是 objectIndex）
-- 右边：list
-
-拿到这些之后，把元素改写成一次列表渲染调用：
+本章的主干是：单次遍历、分桶收集、顺序回放。
 
 ```
-{renderList(list, (item, i) => <li>{item}</li>)}
+walkAst(program)
+  → 看每个 JSX 元素的每个属性名
+  → 按指令类型分桶：
+       v-if / v-else-if / v-else   → Map<父节点, 子元素[]>
+       v-for                        → 倒序数组（外层先排到队首）
+       v-model                      → 不入桶，当场改写
+       v-slot / v-memo / v-html / v-on → 各进各的桶
+  → 遍历结束后按固定顺序回放：
+       v-slot → v-if → v-for → v-memo → v-html → v-on
+  → 每类回放把指令属性翻译成等价 JSX 表达式，并删掉原属性
 ```
 
-这里的 renderList 就是从 vue 来的那个，和 template 里 `v-for` 编译出来的产物是同一个函数。换句话说，v-for 在 JSX 里的最终形态，和 template 里的 v-for 跑的是同一段代码。
+产物是改写后的代码 + sourcemap。
 
-收集 v-for 时还有个倒序的小动作（unshift）：遍历是深度优先的，遇到嵌套的 v-for，内层会先被访问。用 unshift 把节点插到队头，外层就排到了前面，回放时外层先包裹、内层落在它的回调里，嵌套顺序才对。
+v-if 之所以要收进一张「按父节点分组」的 Map，是因为同一个 v-if 链 `v-if / v-else-if / v-else` 必然是一串兄弟元素，遍历到第一个 `v-if` 时你不知道后面还会不会有 `v-else-if`，必须把同父的所有 v-if 系列兄弟收齐了，才能拼出正确的嵌套三元。v-model 走相反的路：它只依赖自身属性、不需要兄弟上下文，于是遍历时当场改写、不入桶——这是按「是否需要兄弟上下文」做的策略分流。这两件事下一节展开。
 
-## 同一个节点上指令凑一块
+## 4. 关键权衡
 
-真实代码里，你常常在一个元素上同时写 v-for 和 v-if。这两条指令一个变列表渲染、一个变三元，凑在一个节点上，括号怎么配平是个坑。
+### 编译期翻译换零新运行时
 
-办法是在收集阶段就多记一笔：碰到一个 v-for 节点，顺手看看它身上还挂没挂 v-if。回放 v-for 的时候，如果发现它带着 v-if，结尾就**少闭一个 `}`**——把这个缺口留给外层的 v-if 三元去包。这样 v-if 的 `{... ? ... : ...}` 就能把整个 `renderList(...)` 兜在它的「真」分支里。这是靠「收集时多记一笔、回放时少写一笔」来协调两条指令的嵌套关系。回放顺序之所以 v-if 排在 v-for 前面，也是为了让外层三元的括号先开好，v-for 再嵌进去。
+「让 JSX 用上 Vue 的指令语义」最直观的实现是写一个运行时——一个能在浏览器里解释 v-if/v-for 的 helper，类似一个迷你的模板引擎。jsx-directive 没走这条路，它选的是编译期翻译：把每条伪指令属性直接翻译成等价的标准 JSX 表达式，产物里没有任何「只有 jsx-directive 才看得懂」的新语法。
 
-## v-model：唯一一个当场就改的指令
+换来的结果是零新运行时。helper 模块整个文件只有一行：
 
-到目前为止，所有指令都是「先收集、后回放」。但 v-model 是个例外——它在遍历阶段、碰到的那一刻就直接改掉了，根本不进任何格子。
-
-为什么它能这么特殊？因为 v-model 完全不需要兄弟节点的信息，它只看自己这一个属性。它的语义是固定的：一个 prop + 一个对应的 `onUpdate:xxx` 事件（再加可选的修饰符）。所以收集它纯属浪费，直接就地展开成一段对象展开就行：
-
-```
-{...{[参数]: 值, ["onUpdate:"+参数]: $event => 值 = $event, [参数+"Modifiers"]: {...}}}
+```ts
+export { renderList, withKeys, withMemo, withModifiers } from 'vue'
 ```
 
-把这段对象直接 spread 到原来的属性位置，双向绑定就齐了。这是 v-model 在 JSX 里的等价表达：没有 .sync、没有指令钩子，就是一个读、一个写回调、展开成 props。
+全是 vue 本身已有的函数，jsx-directive 只是把它们 re-export。最终产出的代码永远是合法 JSX，能消化 JSX 的工具链就能消化 jsx-directive 的产物。
 
-这个例外其实暴露了整个机制的一个设计原则：**按「需不需要兄弟上下文」分流**。v-if、v-for 必须入桶（要靠兄弟信息拼控制流），v-model 不需要，就走最短路径当场改。代价是主循环里出现了两套改写时机，新人读代码时得意识到这个分叉。
+代价是：编译器只能做「等价语义翻译」。当指令的语义天然和 JSX 表达力冲突时，翻译就跑不通，必须靠 hack 兜底。最典型的例子是 v-for 包裹 `<template>`：babel-plugin-jsx 会把 Fragment 当成普通自定义组件、把它的 children 当成插槽 prop，于是 jsx-directive 只能用一个内部标识 `_Fragment9` 替换标签名来骗过 babel-plugin-jsx。这种兼容代码散落在实现里，没有运行时方案「一个 helper 搞定一切」的清爽。
 
-## 关键权衡
+这条权衡化解的本质矛盾是**「语义可翻译性 vs 语法兼容性」**。把语法糖翻译到宿主语言都会撞上它：能翻译的部分清爽干净、零运行时；翻译不动的部分要么放弃、要么写 hack。
 
-这一章机制不少，挑四条最值得记住的展开。
+### 单次遍历、分桶、按顺序回放
 
-**一、选「编译期翻译成标准 JSX」而非「造一个运行时指令解释器」。**
-最根本的一步棋。如果走运行时解释器，你就得在程序跑起来的时候去读每个元素上的指令属性、动态决定渲染——又重又慢，还得跟 Vue 自己的渲染抢控制权。选了编译期翻译，换来的是**零新运行时**：所有帮手都来自 vue，产物就是合法 JSX（babel-plugin-jsx 能直接接着编译），template 和 JSX 在产物层面真正对齐了。代价是，这个机制只能做「等价语义翻译」——它永远变不出 JSX 表达力之外的东西。遇到和 JSX 本身冲突的特性（比如 Fragment 在 vue-jsx 里会被误当成组件、children 被当成插槽），就只能上针对 babel-plugin-jsx 的 hack 兜底，没法干净地表达。
+一个朴素的实现是「即遇即改」：遍历到 `v-if` 节点时立刻动手翻译。jsx-directive 没这么做，它选了「先把所有指令节点收集进桶，遍历结束后再统一回放」。
 
-**二、选「单次遍历 + 分桶收集 + 顺序回放」而非「即遇即改」。**
-换来的是能**跨兄弟节点还原控制流**。v-if 链能不能正确拼成嵌套三元、v-for 和同节点 v-if 能不能正确嵌套，全靠这一步——先把同类兄弟收齐，回放时一起看。代价是，每种指令都得维护一套中间结构（按父节点分组的 Map、倒序数组、嵌套 Map），主流程比「看见就改」绕不少，而且回放顺序是写死的、不能随便调。
+换来的是**跨兄弟节点还原控制流**的能力。一个 v-if 链 `v-if / v-else-if / v-else` 由多个并列的兄弟元素组成，看到第一个 `v-if` 时你完全不知道后面还会不会有 `v-else-if`、`v-else`，更不知道它们的条件。只有把同一父节点下的所有 v-if 系列兄弟都收齐了，才能拼出正确的嵌套三元。同样，v-for 节点同时挂 v-if 时，回放也必须先知道这件事，才能决定列表渲染外面要不要再套一层三元、少闭一个 `}`。
 
-**三、v-if 选「按父节点分组，靠下一个兄弟的属性名决定续接还是收尾」。**
-换来的是，从一串原本平铺的 `v-if / v-else-if / v-else` 兄弟元素，干净地推断出一条嵌套三元链，不需要用户额外标记。代价是**产物强依赖节点顺序**——结尾该写 ` :`（续接）还是 ` : null}`（收尾），完全由「下一个兄弟姓什么」决定。源码里兄弟顺序乱了，三元就拼错。
+代价是主流程比即遇即改绕得多。要为每类指令维护中间结构：v-if 用一张按父节点分组的 Map，v-for 用倒序数组，v-slot 用嵌套 Map……回放顺序也必须精心安排（v-slot → v-if → v-for → v-memo → v-html → v-on），顺序错了就会改写到上一类已改写过的代码段。新人读代码时需要先在脑子里把这套调度建立起来，才能跟上数据流。
 
-**四、v-for 选「借用 JS 已有的 `in` 操作符 + 逗号序列」来承载 `(item, index) in list` 语法。**
-换来的是**零自造解析器**：babel 直接把这段当成合法的二元表达式吐出来，左操作数是逗号序列、操作符是 in、右操作数是列表，白捡一棵 AST。代价是，v-for 的写法被锁死在这一种表达式形态——左操作数必须是逗号序列（或单项）、必须用 in、列表必须在右边，想换个写法做不到。
+这条权衡背后是**「单节点局部信息 vs 跨节点控制流信息」**的拉扯。只要存在「需要兄弟节点配合才能正确翻译」的指令，即遇即改就跑不通；要解开这个结，就得先收集、后回放。
 
-## 原理演示：手写一个最小 v-if + v-for 翻译器
+### 按父节点分组、查「下一个兄弟」还原 v-if 链
 
-把上面几条权衡（分桶、靠兄弟分组还原三元链、借 in 操作符白捡 AST）落到一个能跑的脚本里。这里只硬编码 v-if 和 v-for 两种，省掉前缀配置、Fragment 包裹、template 特判这些工程细节，专注演「遍历分桶 + 回放」这条数据流。用 @babel/parser 解析，改写用最朴素的「记录偏移操作、从后往前套用」，不需要真正的增量编辑器。
+上一条已经说了 v-if 必须入桶，但具体怎么分组也很关键。jsx-directive 选的是按父节点（兄弟容器）分组：把同一个父节点的所有 v-if/v-else-if/v-else 子元素收到一起，回放时对每个 v-if 节点查「它的下一个兄弟的属性名是不是以 `v-else` 开头」——是的话这个分支就是续接（结尾插 ` :`），不是的话就是收尾（结尾插 ` : null}`）。
 
-```js
-// mini-jsx-directive.js —— 只演 v-if + v-for，依赖 @babel/parser
+这样能从一串兄弟元素直接拼出一条嵌套三元。三个兄弟 `<A v-if>`、`<B v-else-if>`、`<C v-else>` 翻译完就是 `cond1 ? <A/> : cond2 ? <B/> : <C/>`，三段续接 + 最终收尾全靠「下一个兄弟是不是 else」这一个判断决定。`v-else` 分支特殊一些：它不需要在节点开头插三元（靠前驱兄弟的 ` :` 续接），只在节点结尾按需补一个 `}` 闭合最外层 `{`。
+
+代价是产物**强依赖节点顺序**。如果用户在 JSX 里把 `v-else-if` 写在 `v-else` 后面，或者中间隔了一个非指令元素，编译器拼出来的三元就是错的——它没有任何容错，只看属性名顺序。Vue 模板编译器在 `v-else` 找不到配对的 `v-if` 时还能给告警，jsx-directive 这套翻译是哑的，错了就错了，运行时拿到的是一条语义错乱的三元表达式。
+
+这条权衡化解的根本张力是**「链式语法需要前驱后继的拓扑信息 vs AST 遍历只给你单节点」**。「把链式语法映射到单点属性」的设计都得选一条路：要么靠兄弟位置（本章）、要么靠显式 id 配对（如 `v-if="x"` + `v-else-if="x"`，靠名字串起来）。前者写法自然、容错差；后者容错好、写法累赘。
+
+### 借用 JS 已有的 `in` 操作符承载 v-for 语法
+
+v-for 的写法是 `(item, index) in list`。这串字符在 JSX 属性值里没有任何合法的 JS 语法可以直接承载，除非你自己写一个解析器。jsx-directive 选了一条特别巧的路：让 babel 把这串字符当成 JS 来解析。
+
+它确实是合法的 JS。`(item, index) in list` 在 babel 眼里是一个 `BinaryExpression`（operator=`in`）：左操作数 `(item, index)` 是 `SequenceExpression`（逗号序列表达式），右操作数 `list` 是列表。整套 v-for 的「语法解析」就这样被外包给了 babel——babel 给出完整、合法的 AST，jsx-directive 只要识别这个固定形态：左操作数是 SequenceExpression 就拆出 item/index/objectIndex 三个回调参数，是单个标识符就只取 item；右操作数当列表。
+
+```ts
+if (attribute.value.expression.type === 'BinaryExpression') {
+  if (attribute.value.expression.left.type === 'SequenceExpression') {
+    const expressions = attribute.value.expression.left.expressions
+    item = expressions[0] || ''
+    index = expressions[1] || ''
+    objectIndex = expressions[2] || ''
+  } else {
+    item = attribute.value.expression.left
+  }
+  list = attribute.value.expression.right
+}
+```
+
+换来零自造解析器。不需要 tokenizer、不需要算优先级、不需要处理括号嵌套——babel 把这些都做完了，jsx-directive 拿到的是一棵已经结构化的 AST。
+
+代价是 v-for 的写法被锁死在该表达式形态：左操作数必须能解析成「单个标识符」或「逗号序列」，中间必须是 `in`、右操作数必须是表达式。变体（用 `of` 关键字、左操作数用解构 `({ id, name }) in list`）都要另写转换逻辑。这一选择把 v-for 的语法自由度换成了实现成本的下限。
+
+想借用已有解析器的外壳来承载新语法的设计都受**「语法外观 vs 解析器复用」**这对矛盾制约：能借到的语法形态有限，写法被锁死；要解开封印就得自己造解析器，工程成本翻几倍。
+
+## 5. 最小原理演示
+
+下面这份极简翻译器只演 `v-if` 与 `v-for`，刻意省略了 v-slot/v-memo/v-on/v-html、`hasScope` 的 Fragment 包裹判定、真正的 `MagicStringAST` 增量编辑（用字符串拼接代替）、`.vue` 双 program 与偏移切换。它只演透两件事：分桶 + 兄弟分组。
+
+```ts
 import { parse } from '@babel/parser'
 
-const code = `<div><span v-if={x}>是</span><span v-else>否</span><li v-for={(item, i) in list}>{item}</li></div>`
+const V_IF = 'v-if', V_ELSE_IF = 'v-else-if', V_ELSE = 'v-else', V_FOR = 'v-for'
 
-// ① 解析。{(item, i) in list} 会被 babel 当成合法的二元表达式（operator = 'in'）
-const ast = parse(code, { plugins: ['jsx'], sourceType: 'module' })
-
-// ② 单次遍历 + 分桶。v-if 按父节点分组，v-for 倒序进数组
-const vIfMap = new Map()       // 父节点 -> 该父节点下的 v-if 兄弟列表
-const vForNodes = []           // 倒序收集，回放时正序
-
-function isNode(x) { return x && typeof x === 'object' && 'type' in x }
-function walk(node, parent) {
-  if (node.type === 'JSXElement') collect(node, parent)
-  for (const key of Object.keys(node)) {
-    if (['type', 'start', 'end', 'loc'].includes(key)) continue
-    const v = node[key]
-    if (Array.isArray(v)) v.forEach(c => isNode(c) && walk(c, node))
-    else if (isNode(v)) walk(v, node)
-  }
+function isDirective(name: string) {
+  return name === V_IF || name === V_ELSE_IF || name === V_ELSE || name === V_FOR
 }
-function collect(node, parent) {
-  let vIfAttr, vForAttr
-  for (const a of node.openingElement.attributes) {
-    if (a.type !== 'JSXAttribute') continue
-    const name = a.name.name
-    if (name === 'v-if' || name === 'v-else-if' || name === 'v-else') vIfAttr = a
-    else if (name === 'v-for') vForAttr = a
-  }
-  if (vIfAttr) {
-    if (!vIfMap.has(parent)) vIfMap.set(parent, [])
-    vIfMap.get(parent).push({ node, attr: vIfAttr })   // 同一父节点 → 同一组兄弟
-  }
-  if (vForAttr) vForNodes.unshift({ node, attr: vForAttr })  // unshift 倒序
-}
-walk(ast.program, null)
 
-// ③ 回放：把每个指令翻译成等价 JSX，记成 [start, end, 替换串]
-const ops = []
-for (const nodes of vIfMap.values()) {
-  nodes.forEach(({ node, attr }, i) => {
-    const name = attr.name.name
-    const cond = attr.value && attr.value.expression
-    if (name === 'v-if' || name === 'v-else-if') {
-      const c = cond ? code.slice(cond.start, cond.end) : ''
-      ops.push([node.start, node.start, `{(${c}) ? `])             // 开头开启三元
-      const next = nodes[i + 1]
-      const elseNext = next && String(next.attr.name.name).startsWith('v-else')
-      ops.push([node.end, node.end, elseNext ? ' :' : ' : null}']) // 续接 or 收尾
-    } else if (name === 'v-else') {
-      ops.push([node.end, node.end, '}'])                          // 仅闭合外层 {
+function translate(code: string): string {
+  const ast = parse(code, { plugins: ['jsx'] })
+  // v-if 按父节点分组：同一父下的兄弟元素要落到同一组，才能拼嵌套三元
+  const vIfMap = new Map<any, any[]>()
+  // v-for 倒序收集：深度优先遍历里后访问的外层 v-for 要排到队首，回放时才能先包裹
+  const vForNodes: any[] = []
+  // 改写记录：[起始偏移, 结束偏移, 替换文本]
+  const edits: [number, number, string][] = []
+
+  function walk(node: any, parent: any | null) {
+    if (node.type === 'JSXElement') {
+      const attrs = node.openingElement.attributes || []
+      const directive = attrs.find((a: any) =>
+        a.type === 'JSXAttribute' && isDirective(a.name.name))
+      if (directive) {
+        if (directive.name.name === V_FOR) {
+          vForNodes.unshift({ jsx: node, attr: directive })
+        } else {
+          // v-if 系列入桶，按父节点收拢兄弟
+          if (!vIfMap.has(parent)) vIfMap.set(parent, [])
+          vIfMap.get(parent)!.push({ jsx: node, attr: directive })
+        }
+      }
     }
-    ops.push([attr.start - 1, attr.end, ''])                      // 删指令属性（含前导空格）
-  })
+    for (const k of Object.keys(node)) {
+      const child = node[k]
+      if (Array.isArray(child)) child.forEach(c => c?.type && walk(c, node))
+      else if (child?.type) walk(child, node)
+    }
+  }
+  walk(ast.program, null)
+
+  // v-if 回放：靠「下一个兄弟是否 else」决定续接（ :）还是收尾（ : null}）
+  for (const [, siblings] of vIfMap) {
+    siblings.forEach((entry: any, i: number) => {
+      const { jsx, attr } = entry
+      const name: string = attr.name.name
+      const cond = attr.value?.expression
+      const condText = cond ? code.slice(cond.start, cond.end) : 'true'
+
+      if (name === V_IF || name === V_ELSE_IF) {
+        edits.push([jsx.start, jsx.start, `{(${condText}) ? `])
+        const next = siblings[i + 1]
+        const continued = next && String(next.attr.name.name).startsWith('v-else')
+        edits.push([jsx.end, jsx.end, continued ? ` : ` : ` : null}`])
+      } else if (name === V_ELSE) {
+        // v-else 不开头插，结尾补一个 } 闭合最外层 {
+        edits.push([jsx.end, jsx.end, `}`])
+      }
+      edits.push([attr.start, attr.end, ''])
+    })
+  }
+
+  // v-for 回放：把 in 二元表达式的左右操作数拆开，包成 renderList(list, (item, index) => <节点>)
+  for (const { jsx, attr } of vForNodes) {
+    const expr = attr.value.expression  // BinaryExpression: 左 in 右
+    let item = '', index = ''
+    if (expr.left.type === 'SequenceExpression') {
+      // (item, index) 被解析成逗号序列，按位置拆出参数
+      item = code.slice(expr.left.expressions[0].start, expr.left.expressions[0].end)
+      if (expr.left.expressions[1]) {
+        index = code.slice(expr.left.expressions[1].start, expr.left.expressions[1].end)
+      }
+    } else {
+      item = code.slice(expr.left.start, expr.left.end)
+    }
+    const list = code.slice(expr.right.start, expr.right.end)
+    const params = index ? `${item}, ${index}` : item
+    edits.push([jsx.start, jsx.start, `{renderList(${list}, (${params}) => `])
+    edits.push([jsx.end, jsx.end, `)}`])
+    edits.push([attr.start, attr.end, ''])
+  }
+
+  // 应用所有改写：按起始偏移排序后顺序拼接
+  edits.sort((a, b) => a[0] - b[0] || b[1] - a[1])
+  let out = '', cursor = 0
+  for (const [s, e, repl] of edits) {
+    out += code.slice(cursor, s) + repl
+    cursor = e
+  }
+  return out + code.slice(cursor)
 }
-for (const { node, attr } of vForNodes) {
-  const e = attr.value.expression            // BinaryExpression { operator: 'in' }
-  let item, idx, list
-  if (e.left.type === 'SequenceExpression') { item = e.left.expressions[0]; idx = e.left.expressions[1] }
-  else { item = e.left }
-  list = e.right
-  const itemSrc = code.slice(item.start, item.end)
-  const idxSrc = idx ? `, ${code.slice(idx.start, idx.end)}` : ''
-  const listSrc = code.slice(list.start, list.end)
-  ops.push([node.start, node.start, `{renderList(${listSrc}, (${itemSrc}${idxSrc}) => `])
-  ops.push([node.end, node.end, ')}'])
-  ops.push([attr.start - 1, attr.end, ''])
-}
-
-// ④ 从后往前套用，避免前面的改写让后面的偏移失效
-ops.sort((a, b) => b[0] - a[0])
-let out = code
-for (const [s, e, r] of ops) out = out.slice(0, s) + r + out.slice(e)
-console.log(out)
 ```
 
-跑出来的结果：
+整个翻译器约 70 行，本章所有原理都在里面：分桶（v-if 进 Map、v-for 进倒序数组）、兄弟分组还原（查 `siblings[i+1]`）、借用 `in` 操作符（直接读 `BinaryExpression.left/right`）。
 
-```
-<div>{(x) ? <span>是</span> : <span>否</span>}{renderList(list, (item, i) => <li>{item}</li>)}</div>
-```
+## 6. 执行轨迹
 
-`v-if={x}` / `v-else` 变成了嵌套三元，`v-for={(item, i) in list}` 变成了 renderList 调用——和 template 里对应的产物是同一副样子。这一段演示演的就是前面几条权衡：单次遍历分桶、靠下一个兄弟还原三元链、借 in 操作符白捡 AST。
+把 `<div><span v-if={x}>A</span><span v-else>B</span></div>` 喂给上面的 `translate`：
 
-## 小结
+**第一步 walkAst 遍历**：
+- 进入 `<div>` 这个 JSXElement，没挂指令，直接继续
+- 进入第一个 `<span>`（`v-if`），命中分支：父节点 `<div>` 不在 `vIfMap` 里 → 新建空数组 → push 进去，`vIfMap` 变成 `Map { <div>: [<span v-if>] }`
+- 进入第二个 `<span>`（`v-else`），命中分支：父节点 `<div>` 已在 `vIfMap` 里 → push，`vIfMap` 变成 `Map { <div>: [<span v-if>, <span v-else>] }`
+- `vForNodes` 仍然为空
 
-这一章的核心，是在「不造新运行时」的前提下，让 JSX 拿到和 template 一致的指令语义。手段是编译期翻译：扫一遍 AST，按指令种类分桶收集，再按固定顺序回放，把每个伪指令属性翻成等价的标准 JSX 表达式。v-if 靠兄弟分组还原嵌套三元，v-for 借 JS 的 in 操作符零解析器地拿到参数，v-model 因为只看自己、当场展开成 prop 加事件。读者要带走的最重要一点：**这些指令在 JSX 里跑起来的样子，和 template 里编译出来的一模一样——翻译机不改变语义，只是换了一种写法**。
+**第二步 v-if 回放**：对 `vIfMap` 里唯一一组 `siblings = [<span v-if>, <span v-else>]`：
+- `i=0`，name=`v-if`：开头插 `{(x) ? `；查 `siblings[1]` 存在且属性名以 `v-else` 开头 → 续接，结尾插 ` : `；删 `v-if` 属性
+- `i=1`，name=`v-else`：跳过开头插值；结尾插 `}`；删 `v-else` 属性
 
-下一章会看另一个方向的「换一种写法」：当你不想用 `<template>` 来定义渲染输出时，怎么用 JSX、h() 或具名模板来充当渲染来源。
+**第三步应用改写**（按偏移排序后拼接）：
+- 第一个 `<span>` 开头位置插入 `{(x) ? `
+- 第一个 `<span>` 上 `v-if={x}` 被删（替换成空串）
+- 第一个 `<span>` 结尾位置插入 ` : `
+- 第二个 `<span>` 上 `v-else` 被删
+- 第二个 `<span>` 结尾位置插入 `}`
+
+**输出**：`<div>{(x) ? <span>A</span> : <span>B</span>}</div>`——正好是手写三元的样子。整条翻译链路里没有新引入的运行时 helper，也没有 v-else 标记对象；产物就是一段合法 JSX。
+
+## 7. 教学简化说明
+
+本章演示刻意省略了这些：v-slot / v-memo / v-on / v-html 四个指令的内部实现（机制同构：收集到桶、按某顺序回放、把属性翻译成表达式）；`hasScope` 判定（节点位于 JSX 子节点位置可以直接用 `{ }`、位于数组/函数体返回位置要用 Fragment 包住，演示里一律假设可以直接用 `{ }`）；真正的 `MagicStringAST` 增量编辑器与 sourcemap（演示用最朴素的字符串拼接代替）；`.vue` 双 program 与 `setupOffset` 偏移切换（前置章已讲透）；`<template>` 标签特判与 `_Fragment9` 兼容 hack；前缀可配置（演示硬编码 `v-`）。
+
+## 8. 小结
+
+JSX 拿到了和 template 等价的指令语义，靠的是三件套：编译期翻译（零新运行时）、按指令类型分桶（让兄弟能配合）、按固定顺序回放（让多类指令的改写不打架）。其中 v-if 的兄弟分组 + 「查下一个是不是 else」、v-for 借用 JS `in` 操作符这两个具体设计，是整套机制能成立的关键支点。
+
+既然 JSX 现在和 template 等价了，下一章「模板与渲染函数的重定向」就接着问：能不能干脆不写 template，直接用 JSX 或 `h()` 在 setup 里定义渲染函数？那就是 `define-render` / `export-render` / `named-template` 这一族宏要做的事。

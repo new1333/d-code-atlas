@@ -1,214 +1,269 @@
+---
+title: 文件路由：约定与前缀树
+---
+
 # 文件路由：约定与前缀树
 
-想象你接手一个后台系统，左边菜单两百多个页面，路由还分三四层嵌套。你打开 `routes.ts`，迎面一个巨大的数组——每加一个页面，都得：在数组里塞一条记录、想清楚它挂在哪个父路由下、同步它的 `name`/`meta`/`alias`、再祈祷别和别的路由撞名。加一个页面改三处，删一个页面还得回来翻配置。
+> 本章属于 system 层。前置：路由匹配表：从配置到 matched 链。
+> 学完你能：用一句话讲清"文件路由如何用前缀树承载父子拓扑、用按来源分桶的属性表让多来源共存而非互斥"。
 
-文件路由就是来终结这件事的：在 `pages/` 下新建一个 `.vue` 文件，它就自动变成一条路由；文件夹怎么嵌套，路由就怎么嵌套，配置一个字都不用写。这一步体验非常好。
+## 1. 为什么需要它
 
-但很快你会撞墙。产品说："这条 `users/[id]`，默认 path 我想改一下，叫 `users/:userId`"、"给它挂个别名 `/u/:id`"、"它的 `meta.auth` 要设成 `true`"。这些都不是文件名能表达的东西——如果方案只认文件名，你现在的唯一出路就是把整套文件路由 eject 掉，退回手写配置。
+上一章把"类型安全路由"推到了编译期——靠模块增强把路由名表注入 TS,让 `router.push({ name: '...' })` 在写代码时就能查得到。但这份被推导的"路由名清单"本身从哪来？如果还是手写一份 `routes` 配置数组、再手抄一遍到类型层,迟早会漏——配置漏写一条,类型推导再准也救不回来。
 
-这一章讲的就是：怎么做到"简单场景零配置、复杂场景逐条精细控制、中间不用 eject"。靠的不是一套更聪明的文件名约定，而是两件更底层的东西——一棵**前缀树**，和一张**按来源分桶、按固定座次深合并**的属性表。
+让路由配置自己从文件系统里长出来,就是这一章要解决的问题。
 
-> 先对齐一个边界：这一章的终点是产出一份 `routes` 数组（每条含 `path`/`name`/`meta`/`alias`/`components`）。这份数组之后怎么被编译成可匹配的 matcher 表、别名怎么展开成额外的匹配项，是前置章「路由匹配表」已经讲透的，这里不重复。本章只盯一件事：**怎么从文件系统的拓扑，加上多个来源的元数据，生成那份配置数组**。
+想象一个管理后台:百来个页面、三四层嵌套是常态。每加一个页面,要在 `routes` 数组里找到正确的父节点、嵌进去、起一个 `name`、配上 `meta`、可能还要补个 `alias`——加一个页面同时动三四样东西。文件路由把这件事反转过来:在 `pages/` 下新建一个 `.vue` 文件,路由就有了。零配置的便利,在这里是质的提升。
 
-## 底层第一件：前缀树，让文件夹结构直接就是路由树
+但纯约定(只认文件名)很快会撞墙:这条路由想改个 `path`、加个别名、给个 `meta`、条件性删掉——文件名表达不了。传统做法是直接 eject 整套方案、自己写配置。这就把"零配置"和"可定制"放在了对立面:要么吃下约定的天花板,要么把约定整个扔掉。
 
-你建一个 `pages/users/[id].vue`，它在路由上理应是 `users` 的孩子。这个父子关系从哪来？答案朴素得有点反常识：**文件夹就告诉你了**。每段路径就是树的一层，每多一个 `/` 就往下沉一层，文件本身挂在叶子节点上。
+这一章讲的机制是为了化解这对矛盾:既不让用户为每条路由手写配置,又不让约定成为天花板。从"丢个文件进来就生效"到"我要精细控制这一条路由"之间,应该有一条不必 eject 的平滑梯度。
 
-说人话就是：你根本不用在路由配置里声明 `users` 是谁的父亲——树的形状本身就把这层关系装下来了。
+> 关于范围:前置章「路由匹配表:从配置到 matched 链」讲的是**下游**——它把一份 `routes` 配置数组递归编译成 matcher 树、处理别名展开、按 score 排序。本章是它的**上游**:把**文件系统**编译成那份 `routes` 数组,再喂给匹配表。两个"树"不在同一层面:本章的前缀树是构建期的中间产物,匹配表里的 matcher 树是运行期匹配用的。
 
-建树的过程就是按 `/` 把路径切成段、逐段下沉，直到最后一段把组件挂上去：
+## 2. 核心思想
 
-```
-路径 users/[id] 的切分与下沉：
-root
- └─ users          （第一段，建/进入 users 节点）
-     └─ [id]       （第二段，建/进入 [id] 节点 → 叶子，挂组件 pages/users/[id].vue）
-```
+把路由的"父子拓扑"和"属性归属"拆成正交两层——结构交给前缀树（文件名即声明）,属性交给按来源分桶的深合并表（约定只是起点,不是天花板）。
 
-这里有两个"看着像普通文件、其实有特殊语义"的约定，值得拎出来，因为它们都是靠树的结构免费实现的，不是额外开洞：
+## 3. 心智模型
 
-- **`index` 映射父路径本身**：`users/index.vue` 不是 `users/index` 这条路由，而是 `users` 这条路由本身（`index` 段折叠成空段）。所以"一个文件夹的主页"和"这个文件夹的布局"是同一个节点。
-- **`_parent` 挂在当前节点、且不单独参与匹配**：`users/_parent.vue` 不会新建一个 `users/_parent` 子节点，而是把组件挂到 `users` 这个节点上，并顺手给它打上 `name: false`——意思是"我只是个布局壳子，别让用户能直接导航到我"。这样 `users/_parent.vue` 和 `users/index.vue` 才不会撞成两条路由。
+整套机制可以拆成两块来看。
 
-为什么非得用树，不能用一个大数组？这正是本章的第一条权衡（见文末）。这里先记住结论：**树把"嵌套、parent 链、参数沿父链自然累积、`(group)` 文件夹自动折叠路径"这些事一次性都送给你了**，代价是增删改时要按 `/` 递归、遍历要走 DFS。
+**结构层——前缀树承载拓扑**
 
-## 文件名段，怎么变成路由形态
+每个文件被剥掉页面根前缀、去掉扩展名后得到一个"路由路径",比如 `pages/users/[id].vue` 的路由路径是 `users/[id]`。这个路径按 `/` 切段,每段一个节点,逐段下沉,叶子挂组件文件。
 
-光有树还不够。节点叫 `[id]`，它在 URL 上到底匹配什么？显然不是字面的 `[id]`，而是动态参数 `:id`。这一步是文件名约定在起作用：方括号 `[param]` 变成 `:param`、`(group)` 文件夹不贡献路径只用来分组、`[[param]]` 是可选参数、`[...param]` 是通配。
+像查字典一样:根节点是 `pages/`,下面挂着 `users` 这一段;`users` 下又挂着 `index` 和 `[id]` 两个段;`index` 和 `[id]` 是叶子,分别挂着 `users/index.vue` 和 `users/[id].vue` 两个组件文件。`pages/users/index.vue` 这条路由的父子链 `users → index` 由树结构自动表达出来了。
 
-实现上，这是一个**字符级状态机**，把文件名段逐一吃进去、吐出"这段的路径形态 + 参数 + 子段"。这一套文法统一表达了动态/可选/带类型/通配/转义，文件名本身就是声明。不过状态机的边界很细（可选参数前的斜杠要挪进非捕获组之类），那是另一章的料，本章演示里只用到最常见的 `[id]` 和 `index`，够你看懂机制。
+每个节点还维护一张 `filePath → node` 的反查表,给 watcher 用:文件改了,要 O(1) 找到对应节点去改它的属性。
 
-## 底层第二件：一个节点的"多来源意见表"
+**属性层——按来源分桶的覆盖表**
 
-到目前为止一切都很顺：一个文件决定一条路由。但真正棘手的问题来了——**一条路由的 `path`、`name`、`meta`、`alias`，可能从四个不同的地方冒出来**：
+每个节点除了挂组件,内部还有一张 `_overrides: Map<来源标识, 覆盖块>`。来源标识大致有三种:
 
-1. 文件名约定（`[id]` → 路径形态 `:id`，`_parent` → `name: false`）；
-2. 文件里写的 `<route>` 路由块（一段声明式配置）；
-3. 文件里调的 `definePage()` 编译宏（专门设 `meta`/`path` 等）；
-4. 构建期的 `extendRoute` 扩展钩子（用户写的 JS，能干任何事）。
+- **约定**（`CONVENTION`）:从文件名约定推出来的部分,比如 `[id]` 段形态是 `:id`、`_parent` 设 `name:false` 不单独匹配。
+- **文件来源**（以 `filePath` 为 key）:从文件内容抽出来的,包括 `<route>` 路由块和 `definePage` 编译宏的字段。
+- **钩子来源**（`EDITS`）:用户写的 `extendRoute` 钩子修改的字段,通过可编辑节点写入。
 
-如果用"后者覆盖前者"的扁平写法，这四者就会互相打架：钩子设了 `alias`，就把文件里 `<route>` 块设的 `alias` 抹掉了。这显然不对——别名明明可以两个都要。
+各来源各占一桶,互不覆盖地并存。约定桶永远最先、钩子桶永远最后、各文件来源按字典序排中间。读取时按这个顺序 `reduce` 逐层深合并,所以"约定是起点,钩子永远是最终逃生舱"。
 
-所以每个节点内部不是存"一份配置"，而是存一张**按来源分桶的意见表**：`Map<来源标识, 覆盖块>`。每个来源各占一桶，谁也不覆盖谁地并存。
+**合并语义按字段分策略**——这是另一个关键设计:合并不是简单的"后者覆盖前者",每种字段有自己的合并语义:
 
-打个比方：这就像一场评审会。**文件名约定是"默认意见"**，座次最低，没人表态时它说了算；**文件里 `<route>` 块和 `definePage()` 是"文件本人的意见"**，各占一栏；**用户扩展钩子是"终审主席"**，座次最高，永远最后拍板。关键在于——**写入时分桶互不干扰，读取时才按既定座次把各栏意见揉成一份**。
+- `alias` 数组拼接（多来源都能贡献别名）
+- `meta` 深合并（嵌套对象不丢字段）
+- `params` 按 path/query 分组合并
+- 其它字段（`name`、`path` 等）后者胜,但 `falsy` 不覆盖（`b[key] ?? a[key]`）
 
-## 读时深合并：按座次揉成一份
+这套心智可以一句话讲清:**结构来自树,属性来自合并;合并不是覆盖,是按字段约定好的合流**。
 
-既然是"揉成一份"，就得有揉的规矩。两件事：先排座次，再按字段定合并策略。
+## 4. 关键权衡
 
-**排座次**：约定标识永远最前（地基）、用户钩子标识永远最后（逃生舱）、其余各文件来源之间按文件名字典序。然后从低到高逐层合并——所以最后合并的钩子，对任何字段都拥有最终发言权。
+### 用前缀树而非扁平数组承载拓扑
 
-**合并策略按字段分别定义**（不是一刀切的"后者盖前者"）：
+第一个选择是用什么数据结构表达路由集合。
 
-| 字段 | 合并策略 | 为什么这么定 |
-| --- | --- | --- |
-| `alias` | 数组拼接（两份都要） | 别名天然可以有多个，谁也别覆盖谁 |
-| `meta` | 深合并（逐字段往下揉） | `meta` 是一堆散字段，各来源各设几个很正常 |
-| `path`/`name` 等标量 | 后者胜，但 falsy 不覆盖（`b[key] ?? a[key]`） | 标量只能取一个值，但谁没设就不该去清空别人 |
+最直观的做法是一份扁平的 `routes` 数组,和手写配置一模一样,只是从文件生成。但路由本质上是**树性的**:父子关系、嵌套视图、参数沿父链累积、group 文件夹折叠路径,所有这些都依赖于"谁是谁的子"。扁平数组下,每次插入都得扫一遍数组找父节点,改的时候还得额外维护一张 parent 指针表。
 
-这套策略是整章的"心脏"——它让四个来源能同时往同一条路由贡献不同字段，互不抹掉。换句话说，**"约定给路径、文件给 meta、钩子给别名"这三件事可以同时成立在同一条路由上**。
+用前缀树（每个节点持有 `children: Map<string, TreeNode>`,按 `/` 递归切分逐段下沉）换来的是:**嵌套关系、parent 链、参数累积、group 折叠全部免费成立**。新增一条 `users/[id]/edit` 不需要"找到 users 节点再嵌进去",沿 `users → [id] → edit` 自然下沉就到了。
 
-## 四来源接入 + 完整流水线
+代价是增删要按 `/` 递归切分、删空节点要向上回溯清理（不能留空目录污染树）、遍历要走 DFS 而非直接 `for`。但这些都是局部、可预测的构建期开销——运行期路由器拿到的还是一份干净的 `routes` 数组。
 
-把上面两件东西拼起来，从磁盘上的文件到运行中的路由器，完整流水线是这样的：
+**本质矛盾**:路由的"声明形式"（文件路径字符串）是线性的,但路由的"含义"（嵌套、参数继承）是树性的。前缀树这个选择,就是承认后者——把声明形式编译成与含义同构的数据结构,后续所有"按父子关系做事"的逻辑都不再需要额外拼接。
 
-```
-扫描 pages/（glob 列文件）
-  → 每个文件算出 routePath（剥掉页面根前缀、去扩展名、加可选 path 前缀）
-  → routeTree.insert(routePath, filePath)        按 / 递归建树，叶子挂组件
-  → 读文件内容，抽出 <route> 块 / definePage()     作为一栏，挂到对应节点的意见表
-  → 读每个节点：四来源排序 + 按字段深合并 → 这条路由的最终属性
-  → 遍历树，对每条路由调 extendRoute 钩子        钩子写的字段进"逃生舱"桶，优先级最高
-  → 把整棵树序列化成 routes 数组
-  → 经虚拟模块 vue-router/auto-routes 热替换进运行中的路由器
-```
+### 按来源分桶,让多来源共存而非互斥
 
-注意"约定优先 + 多层逃逸舱"这条主线：简单场景，文件名约定就够，啥都不用写；要加 `meta`，写个 `<route>` 块或 `definePage()`；要程序化改路由，上 `extendRoute` 钩子。每一层都让你多一分控制力，但没有任何一层逼你 eject。而所有这些钩子的修改，最终都走的是**同一个合并通道**——钩子的 setter 把字段写进那张意见表的"逃生舱"桶，和文件来源平起平坐地参与深合并。这就是为什么钩子能"兜底"却不会绕开规则。
+第二个选择是属性怎么存。最简单的做法是"写时合并"——每个来源改完直接覆盖到节点的单一字段表里。简单、读起来也快。
 
-最后产物那份 `routes` 数组，正是前置章「路由匹配表」的输入——它接着去编译 matcher、按 score 排序、做匹配。本章到此交棒。
+但这个做法隐含的语义是"先来后到 / 后来居上"。一旦选了它,就回答不了一个要命的问题:**如果文件名约定、`<route>` 块、`definePage` 宏、扩展钩子都给同一条路由贡献了不同字段,谁覆盖谁、谁的字段被抹掉了？**
 
-## 最小演示：从零写一遍这套机制
+选择"按来源分桶 + 读时排序深合并"换来的是:**四个来源可以同时向同一条路由贡献不同字段,互不抹掉**。约定贡献 `path: ':id'`、文件里的 `definePage` 贡献 `meta: { auth: true }`、扩展钩子贡献 `alias: ['/u/:id']`——三者在各自桶里各占一格,读取时合流成一条完整路由。`<route>` 块改 `meta.auth` 不会丢掉钩子加的 `alias`,钩子加 `alias` 也不会覆盖文件里的 `path`。
 
-下面这段 TS 把"前缀树 + 分桶意见表 + 读时深合并"从零实现了一遍，能直接跑（`bun run file-routing-demo.ts`，或 `npx tsx file-routing-demo.ts`）。为聚焦合并机制，文件名状态机的边界全部省略，约定那栏的路径形态直接手填。
+代价有两个:一是每次读属性都要重新排序 + reduce 深合并（源码留有 perf TODO,暗示这是已知开销）;二是"合并"必须按字段逐一定义语义——`alias` 拼接、`meta` 深合并、`name` 后者胜、`params` 分组……每种字段的合流规则都要单独写、单独想清楚,一处疏漏就会丢字段。
+
+**本质矛盾**:约定想强（保证一致性）、文件想就近声明（开发者想在该路由的文件里写它的 meta）、钩子想兜底（架构师想在最后一关统一加权限）——三种角色都想"拥有"同一条路由的字段。按来源分桶承认了这种多元所有权,用深合并把"谁说了算"从"先来后到"换成"按字段合流"。
+
+### 字符级状态机把文件名解析成路由形态
+
+第三个选择是文件名的解析方式。文件名只是字符串,但路由段的语义有多种:静态（`users`）、动态参数（`[id]` → `:id`）、可选参数（`[[id]]`）、带类型（`[id=parser]`）、通配（`[...path]`）、不贡献路径的 group（`(group)`）、点嵌套（`a.b` → `a/b`）。
+
+最简单的做法是几条 if/else 加字符串切分。但很快会陷入"括号嵌套怎么处理"、"通配前要不要斜杠"、"hex 转义如何识别"这类边界地狱。
+
+选择"字符级状态机"换来的是**一套文法统一表达所有形态**:`[id]` / `[[id]]` / `[id=parser]` / `[...path]` / `[x+HH]` / `.` 都在同一台状态机里走完。每种形态对应一个明确的状态分支,状态机的确定性让边界情况（如可选参数前的斜杠要移入非捕获组）变成可分析、可测试的转换规则,而不是散落在各处的 ad-hoc 判断。
+
+代价是状态机本身分支多、边界细,维护这份文法需要谨慎。但这是把复杂性**集中**到一处,而非散落到所有路由上。
+
+**本质矛盾**:文件名只能是一个字符串,但路由段的语义要表达多种（静态/动态/可选/通配/嵌套/类型化）。状态机把"字符串"和"语义"之间的多对一映射显式化、确定化。
+
+### 约定打底,逃逸舱按层级叠
+
+第四个选择是组织哲学:约定优先,每高一层都开一道逃逸舱。
+
+- **约定**:文件名决定 path/name/段形态——零配置
+- **`<route>` 块 / `definePage` 宏**:在文件内部就近声明 meta/alias/components——文件级定制
+- **`extendRoute` 钩子**:构建期对每条路由可编程改写——架构级定制
+- **`beforeWriteFiles` 钩子**:写文件前对整棵树最后一次扫——全局兜底
+
+每层逃逸舱只覆盖它关心的字段,其余字段走下层的默认。换来的是**渐进式复杂度**——简单场景零配置、复杂场景逐级定制、全程不必 eject。
+
+代价是:同一条路由的元数据可能散落在四处（文件名一段、文件内一块、钩子里又一段）,调试时要追完所有来源才能拼出最终配置。配套的冲突检测（同名视图、重复路由）和明确的优先级规则是这套设计的必要补丁,没有它们,散落的元数据会变成隐性 bug 温床。
+
+**本质矛盾**:约定想强（一致性、零配置）、但又必须可逃逸（应对真实业务的奇形怪状）。强行可定制（无约定）和强行约定（无逃逸）都会失败——这套设计选"约定打底、按层级开逃逸舱",把矛盾化解成"何时使用哪一层"。
+
+## 5. 最小原理演示
+
+下面这段演示只演透两件事:**前缀树按 `/` 递归建树**,和**节点上的属性按来源分桶、读时排序深合并**。文件名状态机的全部分支、命名视图、HMR、watcher 全部省略。
 
 ```ts
-// file-routing-demo.ts
-const CONVENTION = '@@convention' // 文件名约定：座次最低，是地基
-const EDITS = '@@edits'           // 用户扩展钩子：座次最高，是逃生舱
+// 来源标识:约定永远最前,钩子永远最后,文件来源字典序居中
+const CONVENTION = Symbol('convention')
+const EDITS = Symbol('edits')
 
-// 把来源名换算成"座次"：数小的先合并，后合并者覆盖前者
-function rank(src: string): [number, string] {
-  if (src === CONVENTION) return [0, '']
-  if (src === EDITS) return [2, '']
-  return [1, src] // 各文件来源之间，按文件名字典序
-}
-
-// 按字段分策略合并：alias 拼接 / meta 深合并 / 其它后者胜但 falsy 不覆盖
+// 按字段分策略的深合并
 function mergeOverride(a: any, b: any): any {
-  const merged: any = {}
-  for (const key of new Set([...Object.keys(a), ...Object.keys(b)])) {
-    if (key === 'alias') merged.alias = [].concat(a.alias ?? [], b.alias ?? [])
-    else if (key === 'meta') merged.meta = mergeDeep(a.meta ?? {}, b.meta ?? {})
-    else merged[key] = b[key] ?? a[key]
-  }
-  return merged
-}
-function mergeDeep(a: any, b: any): any {
   const out: any = { ...a }
-  for (const k of Object.keys(b))
-    out[k] = a[k] && typeof a[k] === 'object' && b[k] && typeof b[k] === 'object'
-      ? mergeDeep(a[k], b[k]) : b[k]
+  for (const key of Object.keys(b)) {
+    if (key === 'alias') {
+      out[key] = [].concat(a.alias || [], b.alias || [])  // 别名拼接
+    } else if (key === 'meta') {
+      out[key] = { ...(a.meta || {}), ...(b.meta || {}) } // meta 深合并
+    } else {
+      out[key] = b[key] ?? a[key]                          // 后者胜但 falsy 不覆盖
+    }
+  }
   return out
 }
 
 class TreeNode {
   children = new Map<string, TreeNode>()
-  components = new Map<string, string>()        // viewName -> 文件路径
-  private overrides = new Map<string, any>()    // 来源 -> 这一来源的意见块
-  constructor(public segment: string, public parent: TreeNode | null = null) {}
+  _overrides = new Map<symbol | string, any>()  // 按来源分桶的覆盖表
+  components = new Map<string, string>()        // viewName -> filePath
 
-  // 按 / 递归建树，叶子挂组件；_parent 挂当前节点并标 name:false
-  insert(path: string, filePath: string): TreeNode {
-    const [seg, ...rest] = path.split('/')
-    if (seg === '_parent' && rest.length === 0) {
-      this.overrides.set(CONVENTION, { name: false })
+  constructor(public segment: string, public parent: TreeNode | null) {}
+
+  // routePath 已剥掉页面根前缀和扩展名;按 / 切段、逐段下沉、叶子挂组件
+  insert(routePath: string, filePath: string) {
+    const [head, ...tail] = routePath.split('/')
+    if (head === '_parent' && tail.length === 0) {
+      // _parent 约定:挂到当前节点而非新建子节点,且 name:false 不单独参与匹配
       this.components.set('default', filePath)
-      return this
+      this._overrides.set(CONVENTION, { name: false })
+      return
     }
-    if (!this.children.has(seg)) this.children.set(seg, new TreeNode(seg, this))
-    const child = this.children.get(seg)!
-    if (rest.length === 0) child.components.set('default', filePath)
-    else child.insert(rest.join('/'), filePath)
-    return child
+    if (!this.children.has(head)) {
+      this.children.set(head, new TreeNode(head, this))
+    }
+    const child = this.children.get(head)!
+    if (tail.length === 0) {
+      child.components.set('default', filePath)
+      // 约定桶:段形态（演示只处理两种约定）
+      const param = head.match(/^\[(.+?)\]$/)
+      const path = param ? `:${param[1]}` : (head === 'index' ? '' : head)
+      child._overrides.set(CONVENTION, { path })
+    } else {
+      child.insert(tail.join('/'), filePath)
+    }
   }
 
-  // 任意来源往这张表里写一栏
-  setOverride(source: string, block: any) {
-    this.overrides.set(source, { ...(this.overrides.get(source) ?? {}), ...block })
-  }
-
-  // 读时：按座次排序，从低到高逐层深合并
-  get merged(): any {
-    return [...this.overrides.entries()]
+  // 读取时按固定优先级排序、reduce 逐层深合并
+  get overrides(): any {
+    return [...this._overrides.entries()]
       .sort(([a], [b]) => {
-        const ra = rank(a), rb = rank(b)
-        return ra[0] - rb[0] || ra[1].localeCompare(rb[1])
+        if (a === CONVENTION) return -1   // 约定最前
+        if (b === CONVENTION) return 1
+        if (a === EDITS) return 1         // 钩子最后
+        if (b === EDITS) return -1
+        return a < b ? -1 : 1             // 文件来源之间字典序
       })
       .reduce((acc, [, block]) => mergeOverride(acc, block), {})
   }
 }
 
-// ===== 演示 =====
-const root = new TreeNode('')
+const root = new TreeNode('', null)
+
+// 三来源演示
 root.insert('users/index', 'pages/users/index.vue')
-root.insert('users/[id]', 'pages/users/[id].vue')
+root.insert('users/[id]',   'pages/users/[id].vue')
+
+// 文件来源:<route> 块或 definePage 抽出来的字段,按 filePath 入桶
+root.children.get('users')!.children.get('[id]')!
+  ._overrides.set('pages/users/[id].vue', { meta: { auth: true } })
+
+// 钩子来源:用户 extendRoute 写入（EDITS 永远最后,优先级最高）
+root.children.get('users')!.children.get('[id]')!
+  ._overrides.set(EDITS, { alias: ['/u/:id'] })
+
 const idNode = root.children.get('users')!.children.get('[id]')!
-
-// 三个来源，各贡献不同字段
-idNode.setOverride(CONVENTION, { path: 'users/:id' })                  // ① 文件名约定给路径形态
-idNode.setOverride('pages/users/[id].vue', { meta: { auth: true } })   // ② 文件内 definePage 给 meta
-idNode.setOverride(EDITS, { alias: ['/u/:id'] })                       // ③ 用户钩子给别名
-
-console.log(idNode.merged)
-// => { path: 'users/:id', meta: { auth: true }, alias: ['/u/:id'] }
-//    三来源共存：路径来自约定、meta 来自文件、别名来自钩子，谁也没抹掉谁
-
-// 冲突情形：文件又加了个别名，钩子还想重命名参数
-idNode.setOverride('pages/users/[id].vue', { meta: { auth: true }, alias: ['/local/:id'] })
-idNode.setOverride(EDITS, { alias: ['/u/:id'], path: 'users/:userId' })
-
-console.log(idNode.merged)
-// => { path: 'users/:userId', meta: { auth: true }, alias: ['/local/:id', '/u/:id'] }
-//    alias 被收集成两个；path 钩子盖过约定；meta 仍在
+console.log(idNode.overrides)
+// { path: ':id', meta: { auth: true }, alias: ['/u/:id'] }
 ```
 
-最后一行的输出最能说明问题：**alias 是收集（两个都要），path 是后者胜（钩子盖过约定），meta 是合订（仍在）**——三种字段三种待遇，但都活在同一份合并结果里。整棵树再 DFS 一遍、每节点取一次 `merged`，就是那份 `routes` 数组。
+这段代码里每一行都对应上面某个原理点:
 
-## 关键权衡
+- `children = new Map()` + `insert` 按 `/` 切段递归:演的是"前缀树承载拓扑"
+- `_overrides = new Map<来源, 覆盖>()`:演的是"按来源分桶"
+- `sort` 里 `CONVENTION` / `EDITS` 的特殊处理:演的是"固定优先级排序"
+- `mergeOverride` 按 `alias` / `meta` / 其它分策略:演的是"合并语义按字段定义"
+- `_parent` 分支 + `name: false`:演的是"约定优先 + 逃逸舱"
 
-看懂演示之后，回头品这几个设计选择。它们才是这一章真正想交付的"为什么"。
+## 6. 执行轨迹
 
-**权衡一：用前缀树，而不是扁平数组，来装下路由拓扑。**
+把上面这段代码用具体输入走一遍。
 
-这是整个机制的底座。选择树形而不是把所有路由平铺成一个数组，换来的是一整簇能力**免费**成立：嵌套路由的父子关系直接就是树的父子关系、`parent` 链天然存在、参数能沿父链从上往下自然累积、`(group)` 这种"只用来分组、不贡献路径"的文件夹只要让它的段折叠成空串就自动消失、`index` 映射父路径也只需让该段为空。这些在扁平数组里每一条都得手写逻辑去算，在树里它们是结构本身。
+**输入**:
 
-代价也很明确：增删一条路由不再是数组 `push`/`splice`，而是按 `/` 递归切分逐段下沉；删除时要判断节点是否被掏空、空了得向上回溯清理；遍历不能简单 `for`，得走 DFS/BFS。这是一笔用"操作复杂度"换"拓扑表达力"的交易，而路由这个领域天然是嵌套的，所以这买卖划算。
+- 文件 `pages/users/index.vue` → 路由路径 `users/index`
+- 文件 `pages/users/[id].vue` → 路由路径 `users/[id]`
+- `[id].vue` 文件内 `definePage({ meta: { auth: true } })`
+- 扩展钩子:给 `[id]` 节点加 `alias: '/u/:id'`
 
-**权衡二：每个来源各存一栏、读取时才按固定座次深合并，而不是写入时就覆盖出一个最终值。**
+**第 1 步:建树（结构层）**
 
-这是心脏。选择"分桶 + 读时合并"而不是"写时覆盖"，换来的是四来源能同时向**同一条路由**贡献不同字段、互不抹掉——演示里"约定给 path、文件给 meta、钩子给 alias"能共存，靠的就是这个。它还带来一个关键副作用：文件监听（watcher）改了某个文件时，只需要动那一栏，别的来源毫发无伤，合并结果自然就跟着变了。而钩子用专属标识、排序永远最后，是刻意让它成为"无论如何约定和文件怎么设，钩子总能兜底"的最终逃生舱，直接支撑了"渐进式复杂度"这条主线。
+`insert('users/index', 'pages/users/index.vue')`:
 
-代价是：**每次读一个节点的属性，都要重新排序 + 逐层深合并**（源码里就留着一条性能 TODO，暗示大树下这确有开销，未来可能加缓存）。更隐蔽的代价是——"合并"这件事没法一刀切，必须**按字段逐一约定语义**：alias 拼接、meta 深合并、标量后者胜。每加一种字段类型，就得想清楚它该怎么揉，否则会出现"两个来源都设了它，结果莫名其妙丢了一个"的 bug。这是用"读时计算成本 + 合并语义维护成本"换"多来源共存与渐进可定制"。
+- 切段 `['users', 'index']`,根节点 children 没有 `users` → 新建 `users` 节点
+- 下沉到 `users`,切段 `['index']`,children 没有 → 新建 `index` 节点
+- tail 为空,挂组件 `pages/users/index.vue`,约定桶写 `{ path: '' }`（`index` 映射父路径）
 
-**权衡三：约定优先，配一套多层逃逸舱（`<route>` 块 → `definePage` 宏 → `extendRoute` 钩子）。**
+`insert('users/[id]', 'pages/users/[id].vue')`:
 
-这直接回应了开篇那个"撞墙"的场景。选择把定制能力做成一条阶梯，换来的是从"丢个文件进来就生效"到"我要程序化精细控制这一条路由"之间存在一条**平滑梯度**——你要加个 `meta`，不必碰钩子；你要批量改路由，钩子在那等着。全程任何一档都不逼你 eject 整套方案，这是它相对纯约定式（只认文件名）方案最大的胜场。
+- 沿已有的 `users` 节点下沉（不重复建）
+- 新建 `[id]` 节点,挂组件 `pages/users/[id].vue`
+- 约定桶匹配 `[id]` → 写 `{ path: ':id' }`
 
-代价是：**同一条路由的元数据现在可能散落在四处**（文件名、`<route>` 块、`definePage`、钩子），调试时你得知道某个字段最终是从哪一栏来的。配套的代价是必须有一套明确的优先级规则（本章的座次表）和冲突检测（同名视图被多文件覆盖才算冲突、要告警），否则这种分散会变成隐患。一句话：它用"元数据来源的分散与规则维护"换"复杂度的渐进可控"。
+**第 2 步:写文件来源（属性层）**
 
-## 小结
+读 `[id].vue` 文件内容,抽 `definePage` 得 `{ meta: { auth: true } }`,以 filePath 为 key 写入该节点桶。
 
-文件路由这套机制，说白了就两件底层的东西在撑：**一棵前缀树**把文件夹的父子结构原样装下来，**一张分桶的意见表**让文件名约定、`<route>` 块、`definePage`、扩展钩子四个来源各占一栏、读时按固定座次深合并。两者合起来，把"零配置的便利"和"逐条可定制"这两个原本对立的需求，缝成了一条不必 eject 的平滑梯度。它最终产出的 `routes` 数组，交给前置章的匹配表去编译、去匹配。
+此时 `[id]` 节点的 `_overrides` 有两桶:
 
-再往上一层，下一章「导航期数据加载器」会把另一类东西也接进路由的生命周期——数据获取：用一组导航守卫把取数据从组件树提升到导航管线，让数据的可见性跟着导航走，而不是跟着组件挂载走。
+- `CONVENTION` → `{ path: ':id' }`
+- `'pages/users/[id].vue'` → `{ meta: { auth: true } }`
+
+**第 3 步:写钩子来源**
+
+用户的 `extendRoute` 拿到可编辑节点,调 `node.alias = ['/u/:id']`——这个 setter 把字段写入 `EDITS` 桶。
+
+此时三桶齐:`CONVENTION`、`'pages/users/[id].vue'`、`EDITS`。
+
+**第 4 步:读取时合并**
+
+`idNode.overrides` getter 触发:
+
+- 排序:`CONVENTION`（最前）→ `'pages/users/[id].vue'`（字典序居中）→ `EDITS`（最后）
+- reduce:`{}` 合 `CONVENTION` 得 `{ path: ':id' }`;再合文件来源得 `{ path: ':id', meta: { auth: true } }`;再合 `EDITS`,`alias` 走拼接、`meta` 走深合并、`path` 钩子没写保留 `:id`,最终 `{ path: ':id', meta: { auth: true }, alias: ['/u/:id'] }`
+
+**第 5 步:序列化为 routes 数组**
+
+遍历树,对每个"有组件且 `name` 不为 false"的节点产出一条 `RouteRecordRaw`,沿 parent 链拼完整 `path`（`users` + `:id` → `/users/:id`）、累积 `components`、生成 `name`（按文件路径拼）。
+
+最终交给前置章「路由匹配表」的,就是这样一份递归配置数组。
+
+## 7. 教学简化说明
+
+本章演示故意省略了:文件名状态机的全部边界（只演了 `[id]` 和 `index` 两种约定,实际还有 `[[opt]]` / `[id=parser]` / `[...wildcard]` / `(group)` / `.` 嵌套等多种）、命名视图（`@viewName` 后缀、`components` Map 多映射）、HMR 细节（虚拟模块热替换）、watcher 的节流参数（debounce 100ms + throttle 500ms）、dts/codegen 产物（详见下一章）、score 二维结构与节点正则生成（实验 resolver 用,详见对应章节）、paramParsers 目录扫描。
+
+## 8. 小结
+
+文件路由把"路由配置"从手写变成"文件系统 + 多来源属性":结构上前缀树让父子拓扑、参数累积、group 折叠免费成立;属性上按来源分桶、读时排序深合并,让约定、文件内声明、扩展钩子各占一格而不互相抹掉。约定打底,钩子兜底,中间各层按字段合流——这是"零配置"与"可定制"能共存的根因。
+
+紧邻下一章「导航期数据加载器」会把战场从"路由配置怎么来"转到"路由跳转时数据怎么来"——继续把一件事从组件树里抽出来、上提到导航管线。

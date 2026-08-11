@@ -1,16 +1,16 @@
 ---
-title: node-modules-inspector 源码导读
+title: node-modules-inspector 源码解读
 hero:
   name: node-modules-inspector
   text: 逐章深度拆解
-  tagline: 从流式 JSON 解析、依赖图物化、过滤器 DSL，到 WebContainer、CLI 多形态与可视化层。
+  tagline: 把 pnpm/npm/bun 的依赖清单从字节流一路变成可筛、可搜、可可视化、可在浏览器里现装现跑的依赖面板。
   actions:
     - theme: brand
-      text: 开始阅读
-      link: /guide/01-json-stream-parser
+      text: 从导读开始
+      link: /guide/00-prologue
     - theme: alt
-      text: 可视化层（终章）
-      link: /guide/17-visualizations
+      text: 第一章：流式 JSON 解析
+      link: /guide/01-json-stream-parser
 
 features:
   - icon: 🧱
@@ -31,13 +31,13 @@ features:
 
 ---
 
-# node-modules-inspector 源码导读
+# node-modules-inspector 源码解读
 
 > 一份对 [node-modules-inspector](https://github.com/antfu/node-modules-inspector) 工程的逐章深度拆解。每章从「一个工程师会问的真实问题」切入，展开核心机制、最小可跑演示、关键权衡——读完每一章你都能回答「为什么这么设计、换来了什么、代价是什么」。
 
 ## 三层共十七章
 
-全站按 **primitive → composite → system** 三层共 17 章组织，章节顺序严格按依赖关系拓扑排序——后面的章节建立在前面章节建立的物理基础之上，可以按顺序读，也可以跳读。
+全站按 **primitive → composite → system** 三层共 17 章组织，章节顺序严格按依赖关系拓扑排序——后面的章节建立在前面章节建立的物理基础之上，可以按顺序读，也可以跳读。先读 [导读](/guide/00-prologue) 可以快速建立全书脉络。
 
 - **原子层（6 章）**：解决「从磁盘到一份节点表」的全部底层问题。
 - **复合层（6 章）**：在节点表之上构造「富信息节点 + 过滤器 + 响应式数据流」。

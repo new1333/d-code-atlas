@@ -1,256 +1,268 @@
 # 浏览器指纹伪装：作为扩展叠加的传输能力
 
-## 改了 User-Agent，为什么还是被识破
+> 本章属于 composite 层。前置：可插拔传输层：请求中立与处理器竞争。
+> 学完你能：用一句话讲清——"我要伪装成浏览器"这句意图，是怎么不动路由骨架、只往请求里塞一个扩展槽字段、再用一条偏好函数让会伪装的引擎自动胜出的。
 
-你大概遇到过这种事：写了个脚本去抓某个站点，明明把 `User-Agent` 改成了 Chrome，结果人家照样给你弹验证码、甚至封 IP。你以为伪装好了，其实只换了个名牌。
+## 1. 为什么需要它（设计动机）
 
-问题在于：站点识别"你是不是真浏览器"，靠的远不止 User-Agent 这一行字。它在 TLS 握手的那一刻（ClientHello 里的密码套件顺序、扩展排列，俗称 JA3 指纹）、在 HTTP/2 帧的发送顺序里、在默认 header 的细微差别里，早就看出"这握手的姿势不对，不是真 Chrome，是脚本"。光改个 header 字符串，指纹对不上，等于穿着西装却配了双人字拖。
+上一章讲了「约定胜配置」的插件注册机制，把"丢一个文件即可注册新提取器/后处理器/请求处理器"这件事办成了。但它解决的是「类怎么被发现」，没有回答另一个问题：当用户对同一个传输引擎说"假装成 Chrome"时，这句意图应该放在哪里、由谁来响应？本章就接着这条线讲。
 
-这就引出一个诉求：用户只想说一句"假装成 Chrome"，却完全不想关心底层到底用的是哪个网络库、那个库能不能真的改 TLS 指纹。本章讲的就是——怎么把"我要伪装"这句**意图**，变成系统里任何传输引擎都能读懂的东西，并让"能力最强的那一个"自动接管。
+不过本章真正依赖的地基是第 1 章「可插拔传输层」——它当时把"发什么请求"与"用哪个引擎发"解耦了，但故意没说"附加能力"该怎么挂。本章就沿着那条缝接着讲：怎么把"浏览器伪装"这种**附加能力**叠加到那套已经搭好的骨架上。
 
-## 先认识"伪装目标"：一张留空就代表"都行"的四维规格
+具体场景是这样的。很多站点识别"是不是真浏览器"，看的根本不是 User-Agent 字符串——TLS 握手时 ClientHello 里的 cipher/extension 顺序（JA3 指纹）、HTTP/2 帧序与设置帧、甚至 Accept-Language 等默认 header 的细微差异，都会出卖你。光改 UA 字符串没用，指纹一对不上就直接验证码或封 IP。
 
-要描述"假装成谁"，至少得说清四件事：浏览器（client）、它的版本（version）、跑在什么系统上（os）、系统版本（os_version）。比如"Chrome 146 / macOS"。这四个维度组合起来，就是一个**伪装目标**。
+更要命的是，"能真改 TLS 指纹"的网络库屈指可数（curl_cffi 算一个，它底层用 BoringSSL 重放真实浏览器的 ClientHello），大部分库（urllib、requests）连 TLS 指纹是什么都改不了，顶多改改 header。
 
-它有个关键设计：**任何一个维度留空，就代表"这一维随便，都行"**。好比填一张表，名字写了 Chrome，版本那栏空着，意思就是"Chrome 的任意版本我都能接受"。这么一来，用户只填一个 `chrome`，系统就知道这是个宽泛要求。
+那矛盾就来了：
 
-宽泛要求怎么跟引擎实际支持的精确版本对上？靠一条"双向通配"的匹配规则——比较两个目标时，**每一维只要有一方留空就算通过，否则必须相等**：
+- "我要不要伪装"是**上层每个请求都可能表达的意图**；
+- "能不能真伪装"取决于**底层引擎碰巧用了哪个库**。
 
-```
-用户的  chrome            引擎的 chrome-146 / macos   → 通过（用户那三维都空，全放行）
-用户的  chrome-146        引擎的 chrome               → 也通过（这次轮到引擎那三维空）
-用户的  chrome-146        引擎的 safari-18            → 不通过（client 对不上）
-```
+如果让上层直接挑引擎，意图和实现就绑死了。于是设计者借用了第 1 章那两块已经搭好的积木——**请求对象的中立扩展槽**（让意图有地方放，且对所有引擎中立）和**路由器的偏好排序**（让"谁能伪装"在路由层自动胜出，而不是硬编码）。本章要讲的就是：怎么往这套骨架上挂一种全新能力，而骨架本身一行都不用动。
 
-注意上下两个方向都成立——"宽泛的包含精确的"和"精确的落在宽泛里"是一回事。这就是为什么上层只丢一个 `chrome`，引擎就能在自己的支持清单里找出一个匹配的确切版本。这条匹配规则是后面一切的基础。
+## 2. 核心思想
 
-顺带一条小约束：你不能只写版本不写浏览器名（"版本 146"是给谁的版本？），所以目标在校验时会要求"设了 version 就必须有 client，设了 os_version 就必须有 os"，防止出现无意义的规格。
+把"我要伪装成 Chrome"这句**意图**塞进请求对象的一个**可选扩展字段**，再用**一条偏好函数**给"会伪装"的引擎疯狂加分，让路由器在排序时自然挑中它——意图与具体引擎彻底解耦，能真改 TLS 的引擎走真指纹，不能的至少能改 header，二者读的是同一份意图。
 
-## 把意图塞进中立扩展槽（这块积木来自第 1 章）
+## 3. 心智模型
 
-意图有了，放哪？第 1 章已经搭好了一套骨架，本章**一行都不改它**，只复用其中一块积木：
+整条链路长这样（编号方便后面对应到代码）：
 
-> 请求对象身上挂着一个**对所有引擎一视同仁的可选扩展槽**（`request.extensions`）。谁想往里塞什么能力都行，不认识这个能力的引擎可以无视它。
+1. 调用方在请求的扩展槽里塞一个**伪装目标**——可以只说"Chrome"，其余维度留空（留空即通配任意）。
+2. 路由器对每个已注册引擎跑**全部偏好函数求和**排序。"伪装偏好函数"给"既会伪装、本请求又要伪装"的引擎加 1000 分，把它顶到第一。
+3. 路由器按排序逐个校验引擎：伪装能力基类检查"这个目标是否落在我支持的目标集合内"（靠**双向模糊匹配**），不支持就抛"不支持"异常，跳到下一个引擎。
+4. 被选中的引擎把用户的模糊目标**具象化**为它实际支持的确切目标（如 `Chrome 146 / macOS`），并从扩展槽里**取走**该字段（声明已消费）。
+5. 该引擎整理 header：移除所有"值等于程序默认 header"的条目，把 header 控制权让给底层库按目标浏览器生成全套匹配 header。
+6. 引擎把确切目标透传给底层网络库，底层重放真实浏览器的 TLS/HTTP 指纹。
+7. 把"实际用了哪个目标"**写回响应对象的扩展槽**，供上层和重试逻辑知晓。
 
-第 1 章那套"多引擎竞争 + 路由器按偏好打分择优 + 不符者跳过"的骨架已经讲透，这里不重复。本章只做两件事：往这个扩展槽里**定义一种新的语义**（名叫 `impersonate`，值就是一个上面那种伪装目标），再往路由器里**注册一条新的偏好函数**。说人话就是——骨架不动，只挂一种新能力上去。
+四个关键位置：**意图**（请求扩展槽）→ **路由胜出**（偏好加分）→ **校验 + 具象化**（能力基类 + 叶子类）→ **真改指纹**（底层库）。
 
-## 引擎自报"我能伪装成哪些"，模糊意图被具象化
+## 4. 关键权衡（本章重头戏）
 
-光有意图不够，还得有引擎站出来认领。认领的方式沿用第 1 章"自报能力表"的同款做法：每个会伪装的引擎，把"我能伪装成哪些目标"列成一张**有序清单**。清单里每一项是一个精确目标（如 `chrome-146 / macos`），顺带挂一个底层原生对象（curl_cffi 里就是它的 `BrowserType` 枚举值）。
+### 能力走扩展槽、路由走偏好函数
 
-当请求带着一个模糊目标过来时，引擎就在自己的清单里挨个比对，**返回第一个能匹配上的精确目标**——这一步叫"具象化"。它把用户嘴里的"Chrome"，翻译成了"我能真正执行的那个 Chrome 146 / macOS"。注意返回的是**引擎清单里的那项**（带着原生映射值），不是用户的输入，因为真正要喂给底层库的是前者。
+伪装没有做成"某个引擎的专属参数"（比如 `curl_cffi_handler.impersonate=chrome`），而是编码成**请求对象的一个可选扩展字段**——`request.extensions['impersonate']`。任何引擎都看得见这个字段，但只有声明了"会伪装"的引擎才会响应它。
 
-这张清单是**有序的**，匹配时取第一个命中的——这个"顺序"后面会成为一个隐含的偏好规则。
+"会伪装"靠什么胜出？靠一条在模块加载时注册到路由器的**偏好函数**：装饰器 `@register_preference(ImpersonateRequestHandler)` 把它绑定到伪装能力基类上——它只对继承该基类的引擎生效（其它引擎返回 0），当本请求要走伪装时给 +1000 分。1000 这个数字大到足以压过其它所有偏好项，让会伪装的引擎在 `sorted(handlers, key=偏好求和, reverse=True)` 中稳稳排第一。
 
-这里有个精巧的分工：会伪装的引擎其实分两层抽象。**中间那层**（伪装能力基类）只负责"校验这个目标我支不支持"——不支持就抛异常让路由器跳到下一个引擎；但它**不把扩展从请求里拿走**。真正把扩展拿走（声明"这个我消费了"）的，是**最底层的具体引擎**。校验和消费被故意拆到了两层。为什么要这么拆，后面权衡里讲。
+→ 换来：**意图与具体引擎彻底解耦**。能真改 TLS 的 curl_cffi 走真指纹；不能的 urllib/requests 至少能改 header；上层 CLI 和提取器只写一份意图，路由层负责择优。
+→ 代价：请求对象多了一层"扩展协商"——每个引擎都要在 `_check_extensions` 里检查这个字段；还需要一步"把用户给的宽泛目标翻译成引擎实际支持的确切目标"的解析。
 
-## 一条偏好函数，让"会伪装的"自动跑到第一
+化解的**本质矛盾**：上层意图的**普遍性**（每个请求都可能要伪装）vs. 底层能力的**有限性**（只有少数库能真改 TLS）。把意图抽到中立扩展槽、把能力差异交给路由择优——这是"插件化能力"问题的通解骨架。
 
-现在最关键的一步：系统里同时挂着好几个引擎——有能真改 TLS 指纹的（curl_cffi），也有只能普通发请求的（urllib、requests）。一个"我要伪装"的请求过来，怎么保证它**自然地**落到能伪装的那个引擎头上，而不是落到啥也伪装不了的 urllib？
+### 模糊目标 + 自报支持表，双向通配换宽容输入
 
-答案不是硬编码"伪装请求一律走 curl_cffi"，而是**复用第 1 章的偏好排序**，只往里注入一条偏好函数。这条函数的逻辑极其简单：
+伪装目标是一个四维值对象：`(client, version, os, os_version)`，每一维都可空，**缺省即通配**。匹配规则是**双向**的：判断 `A 匹配 B` 时，每一维"任一方为 None 即通过，否则必须相等"。
 
-```
-如果 这个引擎是"会伪装的引擎"（用类型限定，普通引擎直接返回 0）
-并且 (本请求带了伪装扩展) 或 (这个引擎构造时就设了默认伪装目标) —— 两者任一非空
-那么 给它加 1000 分
-否则 0 分
-```
+所以用户只给一个 `chrome`（其它三维全空），就能匹配到引擎声明支持的 `chrome-146:macos-14`；反过来引擎也可以声明"我支持 `chrome`（全空版本）"来兜底任意 Chrome 版本。
 
-1000 分是个压倒性的大数，足以让会伪装的引擎在路由器的降序排序里稳稳排到第一，把普通引擎甩在后面。这条偏好函数是本章对第 1 章路由骨架做的**唯一注入**——骨架本身的"偏好求和、按分排序"逻辑一个字没动。
+引擎支持哪些目标，靠**沿用了第 1 章的"自报能力表"模式**——类属性 `_SUPPORTED_IMPERSONATE_TARGET_MAP: dict[ImpersonateTarget, 原生对象]`，和 `_SUPPORTED_URL_SCHEMES` 是同一种手段。请求来了，引擎在自己的支持表 keys 里逐个问"用户的目标 in 这个支持目标吗"，命中第一个就拿来用。
 
-这里有个容易漏看的细节（对应上面那条"或"）：**不一定要请求显式带着伪装扩展**才会加分。如果一个引擎在构造时就自带了一个默认伪装目标（哪怕这个请求本身没说要伪装），它同样拿 1000 分、同样排到第一，然后用自己的默认目标去发。换句话说，"要不要伪装"既可以由单个请求临时喊出来，也可以由引擎默认值兜底，两条路都通向同一个加分逻辑。
+→ 换来：上层只需给一个**模糊意图**（"Chrome"），各引擎的版本/平台差异被吸收，CLI 不必为每个引擎写专门的版本清单。
+→ 代价：匹配语义是**隐式约定**——`target_a in target_b` 这个 Python 运算符被重载成"双向通配匹配"，理解成本不低；当多个引擎都支持 Chrome 时，靠"支持表是有序 dict、列表顺序即偏好"来决定谁胜，这条规则没有类型系统保障。
 
-## 原理演示：三种命运的请求
+化解的**本质矛盾**：上层表达的**简洁性**（用户只想说"Chrome"）vs. 底层能力的**精确性**（引擎必须知道到底要重放哪个确切版本的指纹）。模糊匹配是"宽输入 + 精执行"问题的通解。
 
-下面这段 TypeScript 把上面三件事——四维目标的双向通配、偏好路由的加分择优、模糊目标的具象化——从零演一遍（约 80 行，存成 `impersonate.ts`，用 `bun run impersonate.ts` 即可跑）。真实的 TLS 指纹改写是 curl_cffi 底层 BoringSSL 的事，演示里用一行 `console.log` 占位，只演"意图如何经偏好路由落到能力最强者"。
+### 中间抽象类只校验、叶子类才消费
+
+伪装能力分**两层抽象**：
+
+- 上层 `ImpersonateRequestHandler`（通用基类）负责**校验**——它的 `_check_extensions` 检测到 `extensions['impersonate']` 时，调 `_check_impersonate_target` 看这个目标是不是落在我支持的目标集合内，不支持就抛 `UnsupportedRequest`；但**它不 pop 掉这个 key**。
+- 真正声明"已消费"的是最底层的具体引擎（`CurlCFFIRH`）——它的 `_check_extensions` 才执行 `extensions.pop('impersonate', None)`。
+
+→ 换来：可有多层抽象叠加（通用传输基类 → 伪装能力基类 → 具体引擎），每层各司其职。新引擎（比如未来某个用 rustls 改指纹的库）只继承最后两层即可获得伪装能力，不必重写校验。
+→ 代价：这是一条**隐式契约**——"基类校验、叶子消费"。中间层若忘记遵守（比如某天有人写了个新的中间基类只校验不消费），会出现"基类声明支持某扩展、实际却没人取走"的悬空——扩展字段会沿着请求一路传到底层网络库，引发难以定位的 bug。
+
+化解的**本质矛盾**：抽象层级的**可组合性**（希望多层基类各管一摊）vs. 副作用的**单一归属**（一个扩展字段最终必须被一个明确的层级"消费掉"，否则会泄漏）。校验与消费的分离是"层次化副作用管理"问题的通解。
+
+### 主动让位默认 header，换指纹一致性
+
+一旦确认本请求要走伪装，引擎会先做一件看似反直觉的事：**遍历请求 header，移除所有"值等于程序默认 header"的条目**。
+
+为什么？因为"看起来像真浏览器"需要 TLS 层指纹 + 应用层 header **全套一致**。如果程序自造了一个默认 UA 字符串塞进去，底层库按 Chrome 146 生成的真实 header 就被覆盖了——指纹就露馅了。所以引擎主动让位，把 header 控制权完全交给底层库。
+
+→ 换来：真正的浏览器指纹不会被程序自造的默认 header 破坏。
+→ 代价：header 清理逻辑依赖一个**全局默认 header 表**（`std_headers`）作为隐式基准——源码里已明确标注为 TODO：不应依赖 `std_headers`。这是个技术债，未来重构时要换成显式的"让位规则"。
+
+化解的**本质矛盾**：库的**默认行为**（自动塞默认 header）vs. 能力对环境的**完全接管**（伪装要求底层库独占 header）。主动清理是"默认值与显式意图冲突时如何让位"问题的通解——核心是：**当某个能力要独占某个通道，它必须先清理掉系统默认值**。
+
+## 5. 最小原理演示
+
+下面这段 TS 演示**只演透三件事**——双向通配匹配、引擎自报支持表、路由器持偏好函数加分使能力强的引擎胜出。不演示真实 TLS 指纹改写、不演示 cookie/代理/重试——那些是真实工程的事，演示只追求把原理演透。
 
 ```ts
-// impersonate.ts — 演示「能力走扩展 + 偏好路由 + 模糊目标具象化」
-
-// 1. 伪装目标：四维，留空 = 通配；双向匹配
+// 伪装目标：四维 + 通配，任一字段 undefined 即"任意"
 class ImpersonateTarget {
   constructor(
-    readonly client: string | null = null, readonly version: string | null = null,
-    readonly os: string | null = null, readonly osVersion: string | null = null,
+    readonly client?: string,
+    readonly version?: string,
+    readonly os?: string,
+    readonly os_version?: string,
   ) {}
-  contains(o: ImpersonateTarget): boolean {
-    const ok = (a: string | null, b: string | null) => a === null || b === null || a === b
-    return ok(this.client, o.client) && ok(this.version, o.version)
-        && ok(this.os, o.os) && ok(this.osVersion, o.osVersion)
-  }
-  toString() {
-    const left = [this.client, this.version].filter(Boolean).join('-')
-    const right = [this.os, this.osVersion].filter(Boolean).join('-')
-    return right ? `${left}:${right}` : left
+
+  // 双向通配匹配：每一维"任一方为空即通过，否则必须相等"
+  // 用户给 {client:'chrome'} 能命中引擎支持的 {client:'chrome',version:'146',os:'macos'}
+  contains(other: ImpersonateTarget): boolean {
+    const dims: (keyof ImpersonateTarget)[] = ['client', 'version', 'os', 'os_version']
+    return dims.every(d => {
+      const a = this[d], b = other[d]
+      return a === undefined || b === undefined || a === b
+    })
   }
 }
 
-// 2. 请求：意图放进中立扩展槽
-interface Extensions { impersonate?: ImpersonateTarget }
-class Request { constructor(readonly url: string, readonly extensions: Extensions = {}) {} }
-class Response { constructor(readonly url: string, readonly extensions: Extensions = {}) {} }
-class Unsupported extends Error {}
+interface Request  { url: string; extensions: Record<string, unknown> }
+interface Response { status: number; extensions: Record<string, unknown> }
 
-// 3. 引擎基类：校验时拒绝「没被消费掉」的扩展
-abstract class Handler {
-  abstract name: string
+// 引擎接口：自报支持表 + 校验 + 发送
+interface Handler {
+  name: string
+  canImpersonate: boolean
+  supportedTargets: ImpersonateTarget[]
+  validate(req: Request): void
+  send(req: Request): Response
+}
+
+// 普通引擎：不会改 TLS 指纹，只能改 header
+class UrllibHandler implements Handler {
+  name = 'urllib'
   canImpersonate = false
-  defaultImpersonate: ImpersonateTarget | null = null
-  supportedTargets(): ImpersonateTarget[] { return [] }
-  checkExtensions(ext: Extensions): Extensions { return { ...ext } }     // 默认一个都不消费
-  validate(req: Request) {
-    const leftover = this.checkExtensions({ ...req.extensions })
-    if (Object.keys(leftover).length)
-      throw new Unsupported(`${this.name}: 未消费的扩展 ${Object.keys(leftover)}`)
+  supportedTargets = []
+  validate() {}
+  send(req: Request): Response {
+    console.log(`  [urllib] 只改 header 发送 ${req.url}`)
+    return { status: 200, extensions: {} }
   }
+}
+
+// 伪装能力基类：负责"校验"目标是否落在我支持集合内
+abstract class ImpersonateHandler implements Handler {
+  abstract name: string
+  abstract supportedTargets: ImpersonateTarget[]
+  get canImpersonate() { return true }
+
+  // 把用户的模糊目标具象化成我支持表里第一个命中的确切目标
+  protected resolve(target: ImpersonateTarget): ImpersonateTarget {
+    const hit = this.supportedTargets.find(t => t.contains(target))
+    if (!hit) throw new Error('unsupported')
+    return hit
+  }
+
+  validate(req: Request): void {
+    const target = req.extensions['impersonate'] as ImpersonateTarget | undefined
+    if (target) this.resolve(target)   // 不命中就抛，会被路由捕获后跳到下一个引擎
+  }
+
+  // 叶子类才"消费"扩展槽：把 impersonate 取走、具象化后透传给底层
+  protected consume(req: Request): ImpersonateTarget {
+    const target = req.extensions['impersonate'] as ImpersonateTarget
+    const resolved = this.resolve(target)
+    delete req.extensions['impersonate']   // 声明已消费
+    return resolved
+  }
+
   abstract send(req: Request): Response
 }
 
-// 4. 伪装能力中间基类：只校验，不消费（消费留给叶子）
-abstract class ImpersonateHandler extends Handler {
-  canImpersonate = true
-  resolveTarget(t?: ImpersonateTarget | null): ImpersonateTarget | null {
-    if (!t) return null
-    for (const s of this.supportedTargets()) if (s.contains(t)) return s   // 表有序，首个命中即偏好
-    return null
-  }
-  checkExtensions(ext: Extensions): Extensions {
-    const leftover = { ...ext }
-    if (leftover.impersonate && this.resolveTarget(leftover.impersonate) == null)
-      throw new Unsupported(`${this.name}: 不支持的目标 ${leftover.impersonate}`)
-    return leftover        // 只校验，没有 delete —— 关键
-  }
-}
-
-// 5. 叶子 A：curl_cffi，真改 TLS 指纹
+// 真叶子引擎：curl_cffi 替身——能真改 TLS 指纹
 class CurlCffiHandler extends ImpersonateHandler {
   name = 'curl_cffi'
-  defaultImpersonate = new ImpersonateTarget('chrome', '146', 'macos')     // 构造时即默认伪装
-  supportedTargets() {
-    return [
-      new ImpersonateTarget('chrome', '146', 'macos'),
-      new ImpersonateTarget('safari', '18', 'macos'),
-    ]
-  }
-  checkExtensions(ext: Extensions): Extensions {
-    const leftover = super.checkExtensions(ext)   // 先让中间基类校验
-    delete leftover.impersonate                    // 叶子才真正消费（pop）
-    return leftover
-  }
-  send(req: Request) {
-    const t = this.resolveTarget(req.extensions.impersonate ?? this.defaultImpersonate)!
-    console.log(`  [curl_cffi] TLS 指纹 ← ${t}`)
-    return new Response(req.url, { impersonate: t })   // 把实际用的目标写回响应
-  }
-}
+  supportedTargets = [
+    new ImpersonateTarget('chrome', '146', 'macos', '14'),
+    new ImpersonateTarget('chrome', '132', 'windows', '11'),
+    new ImpersonateTarget('safari', '18', 'macos', '15'),
+  ]
 
-// 6. 叶子 B：urllib，普通引擎，根本不认识伪装扩展
-class UrllibHandler extends Handler {
-  name = 'urllib'
-  checkExtensions(ext: Extensions): Extensions {
-    const leftover = { ...ext }
-    delete leftover.cookiejar; delete leftover.timeout   // 它只认这两个
-    return leftover        // impersonate 留着 → 基类 validate 判「未消费」而拒绝
-  }
-  send(req: Request) { console.log('  [urllib] 普通发送（无伪装）'); return new Response(req.url) }
-}
-
-// 7. 路由器：偏好求和排序择优（骨架来自第 1 章）
-type Pref = (h: Handler, req: Request) => number
-class Director {
-  handlers: Handler[] = []
-  prefs: Pref[] = []
-  add(h: Handler) { this.handlers.push(h) }
-  // 本章对骨架的唯一注入：一条伪装偏好
-  static impersonatePref: Pref = (h, req) =>
-    !h.canImpersonate ? 0                                              // 只对伪装引擎生效（等价 isinstance 限定）
-      : (req.extensions.impersonate || h.defaultImpersonate) ? 1000    // 请求带扩展 或 引擎默认 —— 任一非空
-      : 0
   send(req: Request): Response {
-    const score = (h: Handler) => this.prefs.reduce((s, p) => s + p(h, req), 0)
-    const order = [...this.handlers].sort((a, b) => score(b) - score(a))
-    const errors: string[] = []
-    for (const h of order) {
-      try { h.validate(req) } catch (e) { errors.push((e as Error).message); continue }
-      return h.send(req)
-    }
-    throw new Error(`NoSupportingHandlers: ${errors.join(' | ')}`)
+    const resolved = this.consume(req)
+    // 真改 TLS 是 curl_cffi/BoringSSL 的事，演示里只占位
+    console.log(`  [curl_cffi] TLS 指纹 ← ${resolved.client}-${resolved.version} on ${resolved.os}`)
+    return { status: 200, extensions: { impersonate: resolved } }   // 写回响应
   }
 }
 
-// 跑三个用例
-const d = new Director(); d.prefs.push(Director.impersonatePref)
-d.add(new CurlCffiHandler()); d.add(new UrllibHandler())
+// 路由器：偏好函数求和 → 排序 → 逐个校验 → 第一个通过者胜出
+type PrefFn = (h: Handler, req: Request) => number
+class Director {
+  private prefs: PrefFn[] = []
+  constructor(readonly handlers: Handler[]) {}
+  registerPreference(fn: PrefFn) { this.prefs.push(fn) }
 
-console.log('用例1：请求带模糊目标 chrome')
-d.send(new Request('https://site', { impersonate: new ImpersonateTarget('chrome') }))
+  route(req: Request): Response {
+    const scored = this.handlers
+      .map(h => ({ h, score: this.prefs.reduce((s, f) => s + f(h, req), 0) }))
+      .sort((a, b) => b.score - a.score)
 
-console.log('用例2：请求带谁都不支持的目标 ie')
-try { d.send(new Request('https://site', { impersonate: new ImpersonateTarget('ie') })) }
-catch (e) { console.log('  ' + (e as Error).message) }
+    for (const { h } of scored) {
+      try {
+        h.validate(req)
+        console.log(`路由选中: ${h.name}`)
+        return h.send(req)
+      } catch { /* 不支持就跳到下一个引擎 */ }
+    }
+    throw new Error('no handler')
+  }
+}
 
-console.log('用例3：请求不带扩展，靠引擎默认伪装目标')
-d.send(new Request('https://site'))
+// 本章对路由骨架注入的唯一一条新偏好函数：
+// 只对会伪装的引擎生效；本请求要走伪装时 +1000，否则 0
+function impersonatePreference(h: Handler, req: Request): number {
+  if (!h.canImpersonate) return 0
+  return req.extensions['impersonate'] ? 1000 : 0
+}
+
+// —— 跑一遍 ——
+const director = new Director([new UrllibHandler(), new CurlCffiHandler()])
+director.registerPreference(impersonatePreference)
+
+const req: Request = {
+  url: 'https://protected-site.example/api',
+  extensions: { impersonate: new ImpersonateTarget('chrome') },   // 用户只说"chrome"
+}
+director.route(req)
 ```
 
-跑出来的轨迹：
+输出：
 
 ```
-用例1：请求带模糊目标 chrome
-  [curl_cffi] TLS 指纹 ← chrome-146:macos
-用例2：请求带谁都不支持的目标 ie
-  NoSupportingHandlers: curl_cffi: 不支持的目标 ie | urllib: 未消费的扩展 impersonate
-用例3：请求不带扩展，靠引擎默认伪装目标
-  [curl_cffi] TLS 指纹 ← chrome-146:macos
+路由选中: curl_cffi
+  [curl_cffi] TLS 指纹 ← chrome-146 on macos
 ```
 
-三个用例正好覆盖三条命运：**用例 1** 是主路径——curl_cffi 拿 1000 分排第一，校验通过，把模糊的 chrome 具象化成 chrome-146/macOS 再发；**用例 3** 演示那条"或"分支——请求啥都没带，但 curl_cffi 构造时设了默认目标，照样拿 1000 分、照样走它，用默认目标发；**用例 2** 最值得细看，下一节专门讲它。
+`urllib` 引擎虽然在 handler 列表里，但因为 `canImpersonate=false`，偏好函数给它 0 分；`curl_cffi` 拿到 +1000 直接胜出，校验时把自己支持表里第一个含 `chrome` 的目标找出来（具象化为 `chrome-146:macos-14`），把扩展槽里的字段消费掉，再把真实指纹交给底层库重放——这就是"意图经偏好路由落到能力最强者"的全过程。
 
-## 真正改指纹的那一下，与一个容易误解的"降级"
+## 6. 执行轨迹
 
-在叶子引擎 `send` 里，具象化后的精确目标会被映射成底层库认识的 native 对象，透传给 `curl_cffi`，底层用 BoringSSL 把真实浏览器的 TLS ClientHello / JA3 和 HTTP/2 帧指纹**原样重放**出去。这才是"真改 TLS"的落点——它只发生在有能力改 TLS 的具体引擎内部，上层完全看不到。
+把"§5 跑一遍"那一段拆开看时序：
 
-发出去之前还有一步:一旦确定本请求要走伪装，引擎会先把"值等于程序默认 header"的那些条目移除，把 header 的控制权**让给底层库**，让它按目标浏览器生成一整套匹配的 header。因为真正的浏览器指纹要求 TLS 层和应用层 header 必须一致才像，要是程序自造的默认 header 还杵在那儿，反而会露馅。发完之后，"实际用了哪个目标"会被写回响应对象的扩展槽，方便上层和重试逻辑知道这次到底用了什么指纹。
+**输入**：请求 `url='https://protected-site.example/api'`，扩展槽 `impersonate = ImpersonateTarget(client='chrome')`（其余三维空）。系统里挂着两个引擎——urllib（普通，0 分）、curl_cffi（指纹引擎，待评分）。
 
-现在回到用例 2——那个谁都不支持的 `ie` 目标。这里有个**特别容易讲错的点**：它并不会"悄悄降级成 urllib 的无伪装发送"。
+1. **路由排序**：对每个引擎跑 `impersonatePreference` 求和：
+   - urllib：`canImpersonate=false` → 0 分
+   - curl_cffi：`canImpersonate=true` 且本请求有 `impersonate` 扩展 → +1000 分
+   - 排序后：`[(curl_cffi, 1000), (urllib, 0)]`
+2. **校验第一个**：curl_cffi 继承 `ImpersonateHandler.validate`，调 `resolve(chrome)`——在支持表里逐项 `contains` 匹配，命中 `chrome-146:macos-14`，校验通过。
+3. **发送（消费扩展）**：curl_cffi.`send` 调 `consume`，把模糊的 `chrome` 具象化为 `chrome-146:macos-14`，并 `delete req.extensions['impersonate']`（声明已消费）。
+4. **让位 header**：遍历请求 header，移除所有"值等于程序默认 header"的条目（演示里省略），把控制权让给底层库。
+5. **透传底层**：把 `chrome-146:macos-14` 经 `_SUPPORTED_IMPERSONATE_TARGET_MAP` 映射成 curl_cffi 的原生 `BrowserType`，调 `session.request(impersonate=...)`——curl_cffi 底层用 BoringSSL 重放 Chrome 146 的真实 ClientHello/JA3 与 HTTP/2 帧序。
+6. **写回响应**：`response.extensions['impersonate'] = chrome-146:macos-14`，让上层和重试逻辑知晓"实际用了哪个指纹发的"。
 
-为什么？因为伪装扩展是一个**硬契约**。引擎要么声明消费它（像 curl_cffi 那样把它 pop 走），要么就得拒绝整个请求。具体到这条链路：
+**输出**：HTTP 200 响应，扩展槽里回写了确切目标。整个过程上层只写了一句 `impersonate=chrome`，意图经偏好路由自动落到了唯一能真改 TLS 的引擎上。
 
-```
-curl_cffi：校验时发现 ie 不在自己支持的目标里 → 抛「不支持」→ 路由器跳过
-urllib   ：根本不认识 impersonate 扩展，不会 pop 它 → 扩展槽里有残留 → 抛「未消费的扩展」→ 路由器跳过
-所有引擎都跳过 → 路由器抛 NoSupportingHandlers → 请求失败
-```
+## 7. 教学简化说明
 
-所以第 1 章那套机制所谓的"优雅"，**仅仅是指路由器会逐个尝试、不被单个引擎的拒绝卡死**；它**并不意味着**"没人能伪装时就偷偷退化成普通请求"。对伪装这种硬扩展而言，一旦没有任何引擎能消费它，请求就是直接失败——这反而是一种诚实：与其发一个指纹对不上的请求被站点识破，不如一开始就告诉用户"你要的目标我伪装不了"。演示里普通引擎（`UrllibHandler.checkExtensions`）遇到带 `impersonate` 扩展的请求时，会因为这个扩展没被消费而判不支持并跳过，正是为了忠实反映这条契约。
+本章演示故意省略了：
 
-## 关键权衡
+- **真实 TLS 指纹改写**：那是 curl_cffi 底层 BoringSSL 的事，演示只用 `console.log` 占位。
+- **目标字符串解析正则**：CLI 的 `--impersonate chrome:windows-10` 这种字符串怎么解析成四维对象。
+- **curl_cffi 版本兼容映射表**：不同 curl_cffi 版本支持的浏览器目标略有差异，多键排序键极其复杂（不可靠目标降权、移动端降权、tor<edge<firefox<safari<chrome 的引擎优先级、取最新版）。
+- **`keep_header_casing` 等 secondary 扩展**：那些和伪装是平级的其它扩展槽字段。
+- **编排器层接入**：`YoutubeDL._impersonate_target_available` 怎么遍历 handler 问"你支持吗"、`_parse_impersonate_targets` 怎么把 CLI 的布尔/字符串/列表统一解析——这些属于后续「YoutubeDL 编排器」的范围。
+- **HTTP 错误处理、重试、cookie、代理**：与本章主线无关。
 
-本章机制集中，集中在"怎么把一种新能力干净地挂到已有骨架上"，因此展开这 4 条核心权衡。
+## 8. 小结
 
-**权衡 1：能力走扩展，路由走偏好（核心权衡）**
-- **选择**：把"要伪装"编码成请求的一个可选扩展字段（而不是某个引擎的专属参数），再用一条偏好函数给"会伪装的引擎"加 1000 分。
-- **换来**：意图和具体引擎彻底解耦。同一个"假装 Chrome"的意图，能真改 TLS 的引擎（curl_cffi）走真指纹；将来若出现只能改 header 的伪装引擎，它读的也是这同一份意图——上层完全不用为每个引擎写一套分支。
-- **代价**：请求对象多了一层扩展协商；而且这 1000 分是个压倒性的"硬加分"，等于在通用排序里塞了一个隐性的"伪装优先"特权，新人若不知道这个魔法数字，会想不通为什么伪装引擎总能赢。更进一步的代价正是上一节那个反直觉点：伪装是硬契约，无人能消费就整体失败，**不会**降级成无伪装发送——"优雅降级"在这儿不成立。
+伪装这一种能力之所以能挂上去，靠的不是改路由骨架，而是路由骨架本来就预留了两条缝——**请求对象的中立扩展槽**让意图有地方放，**偏好函数注册**让能力差异自动胜出。第 1 章把"能力探测 + 偏好路由"那条骨架设计得足够中立，本章只需往里塞一个新字段、注册一条新偏好，整套伪装机制就长出来了——这是好抽象的标志：**它对未来的能力是开放的，不需要回头改自己**。
 
-**权衡 2：模糊目标 + 有序自报支持表，换来宽容的输入**
-- **选择**：目标"缺省即通配"+ 双向模糊匹配；引擎把支持的目标列成一张**有序**表，具象化时取首个命中。
-- **换来**：上层只需说"我要 Chrome"，引擎自己在表里找出一个匹配的确切版本（如 Chrome 146/macOS）。CLI 和提取器完全不用关心各引擎的版本/平台差异。
-- **代价**：匹配语义是隐式约定（那个双向 `contains`），新人要花点功夫才看懂；更要命的是"多个引擎都支持 Chrome 时谁胜"这件事，靠的是**支持表的排列顺序**——这是一条藏在数据顺序里的偏好规则，从代码表层很难一眼看出来。
-
-**权衡 3：中间抽象类只校验，叶子类才消费**
-- **选择**：把伪装能力拆成两层抽象。中间那层负责"校验目标支不支持"（不支持就抛异常），但不把扩展取走；真正取走（声明消费）的是最底层的具体引擎。
-- **换来**：可以多层抽象叠加（通用基类 → 伪装能力基类 → 具体引擎），每层各司其职；新引擎只要继承最后两层，就自动获得伪装能力，不用重写校验。
-- **代价**：这是一条**隐式契约**——"中间层只校验、不消费"。中间层若忘记这条去 pop 了，或叶子层忘记 pop，就会出现"基类声明支持这个扩展、实际却没人消费"的悬空状态；这时请求会带着残留扩展被基类的检查判为不支持，错误现象还很迷惑。
-
-**权衡 4：主动让位默认 header，换指纹一致**
-- **选择**：确定要走伪装后，先把"值等于程序默认 header"的条目移除，把 header 控制权让给底层库按目标浏览器生成全套匹配 header。
-- **换来**：真正的浏览器指纹（TLS 层 + 应用层 header 必须一致才像）不会被程序自造的默认 header 破坏，避免"TLS 像 Chrome、header 却露了程序的马脚"这种穿帮。
-- **代价**：这套清理逻辑依赖一张**全局默认 header 表**作为隐式基准——哪天这张表的内容变了，这里的"相等就删"判断可能悄悄失效（源码里已把这处依赖标成待清理的技术债）。
-
-## 小结
-
-浏览器伪装这件事，难点不在"怎么改 TLS"（那是 curl_cffi / BoringSSL 的活），而在怎么把"我要伪装"这句**意图**，干净地接进一个已经有了多引擎竞争骨架的系统里。本章给出的答案是：复用第 1 章的中立扩展槽放意图，复用偏好排序让"会伪装的引擎"自动胜出，再用四维通配目标 + 有序支持表吸收各引擎的版本差异——骨架不动，只挂一种新能力。代价是扩展协商、隐式的匹配与排序规则、以及"伪装是硬契约、无人消费即失败"这条不那么直觉的行为。
-
-至于一个请求从被提取器发起到拿到响应，中间还要经过哪些环节——下一章会拉开视野，看那个贯穿全系统的 `info_dict` 数据总线是怎么把"解析一个站点"压缩成几十行的。
+下一章会离开传输层，进入提取器——看那个贯穿全系统的胖字典 `info_dict` 是怎么作为数据总线把提取器、下载器、后处理器串起来的。

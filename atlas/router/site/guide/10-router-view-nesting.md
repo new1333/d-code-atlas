@@ -1,202 +1,183 @@
+---
+title: RouterView 嵌套渲染
+---
+
 # RouterView 嵌套渲染
 
-## 一个后台，三层套娃
+> 本章属于 composite 层。前置：Router 核心与导航主循环、路由匹配表。
+> 学完你能用一句话讲清：嵌套视图为什么能"零配置对齐路由层级"——以及这套设计押在了哪几个隐式契约上。
 
-想象你在做一个后台管理系统。地址是 `/admin/users/42`，页面的"形状"长这样：最外面一层是 `AdminLayout`（带侧边栏和顶栏），它肚子里要装东西；而 `UserDetail` 这个详情页，又该渲染在 `AdminLayout` 内部某个"留好的坑"里。
+## 1. 为什么需要它
 
-URL 一变，坑里渲染的东西得自动跟着变；而且坑里还能再挖坑——列表页里点一行，详情页又渲染在更里面一层。这种"一层套一层、每层对应路由的一级"的需求，几乎每个非平凡应用都有。
+上一章把 `currentRoute` 用 `shallowRef` 在最外层替换驱动视图这件事讲完了——导航一旦落定，那根响应式 ref 就是"现在该走哪条 matched 链"。但它只告诉应用"该走哪条链"，没告诉应用"这条链上每一级路由记录分别该渲染到模板的哪个槽位"。本章就接这个口子讲：链有了，怎么把它落到屏幕上。
 
-如果没有自动机制，使用者就得自己干一件很烦的事：把当前 URL 拆出来的每一级路由记录，逐一对应到模板里嵌套的若干个出口，还得自己维护"第几个出口该渲染第几层"。路由层级一调整，整套模板跟着改。
+设想一个常见的后台界面：访问 `/users/42/profile`，希望 `UserLayout` 占住外层（侧边栏 + 顶栏），里面某个 `<main>` 区域再渲染 `UserProfile`。这种"路由嵌套、视图也嵌套"的需求几乎在每个非平凡应用里都会出现。
 
-我们需要的是：**在任意层级随手写一个出口，它就能自动对齐到正确的路由层**，使用者完全不用关心自己嵌在第几层。
+如果没有自动嵌套机制，使用者得自己干两件事：
 
-## 把"我在第几层"变成一个往下传的整数
+- 把"当前 URL 解析出的每一级路由记录"逐一对应到模板里嵌套的若干出口组件上；
+- 自己维护"第几层渲染谁"，路由配置一改层级，模板就得跟着改。
 
-这块的核心想法，说人话就是：**给每一个出口编个楼层号**。
+这是把"路由表的结构信息"硬抄一份到模板里，抄一份就得维护一份。我们真正想要的是：在任意子组件模板里写一个出口组件，它就自动对齐到正确的路由层——不用接线，路由层级变了模板也不动。
 
-路由匹配完成后，会产出一条 `matched` 链——一个从外到内排好序的数组：`matched[0]` 是最外层那条路由记录，`matched[1]` 是它里面那层，依此类推。这条链是怎么从用户的父子路由配置编译出来的，是「路由匹配表」那一章的内容，这里只把它当成一个**已经排好序的数组**来用，不重演它的构造。
+## 2. 核心思想
 
-> 类比一下：`matched` 链就像一排从外到内套在一起的俄罗斯套娃，最外面那个是 0 号。每个出口只要知道"我是第几号娃娃"，就能从这排里精准拿到自己该渲染的那一个。
+把"该渲染第几层路由"这件事，变成一个沿组件树向下传递的整数 `depth`；每个出口凭 `depth` 从 matched 链里取出对应那一级的组件。
 
-那"我是第几号"这个信息从哪来？答案是**靠依赖注入往下传**。最外层的出口默认是 0 号；它渲染完之后，会把"1 号"这个消息悄悄递给它肚子里的子组件树；子组件树里若再写一个出口，一伸手就能拿到"1 号"，于是自动渲染 `matched[1]`；这个出口再往下递"2 号"……
+`depth` 是这套设计的承重墙：它在组件树里隐式流动，把"路由表的层级结构"和"模板的嵌套结构"对齐起来。
 
-> 依赖注入你可以理解成"按地址精准投递"：出口不用通过 props 一层层显式地传楼层号，而是把号写在一张沿组件树向下传递的公共留言板上（`provide`），后代里的任何一个出口只要去读这块板（`inject`）就能拿到自己的号。
+## 3. 心智模型
 
-于是零配置嵌套就成立了：使用者在任意子组件里随手写一个出口，它就自动接上了正确的楼层，路由层级怎么变都不用改模板。这一章要回答的，就是这个"楼层号往下传 + 凭号取娃娃"的机制到底怎么实现，以及它为这个极简 API 付了哪些代价。
+整个机制只在干一件事：让 `depth` 在组件树里正确流动，并让每个出口用 `depth` 选出该渲染的组件。具体走 7 步：
 
-## 心智模型：七步看懂一次嵌套渲染
+1. **起点（外部接续点）**：根应用 install 时把 `currentRoute`（一个响应式 ref）provide 到全局——这是「Router 核心与导航主循环」的产物，本章只消费它的一个新侧面：把它当作 matched 链的来源。
+2. **取 depth**：最外层出口 inject 它，并 inject 一个默认 `depth = 0`（无父级时）。
+3. **算有效 depth**：从初始 `depth` 起，只要 `matched[depth]` 没有 `components` 字段（即这条记录只用于复用 path 前缀、自身不渲染），就让 `depth` 自增继续往后找，直到命中一条有组件的记录。这一步得到的是"有效 depth"。
+4. **选组件**：取 `matched[有效depth].components[出口名]`（出口名默认 `'default'`），这就是要渲染的目标。
+5. **向后代注入 depth+1**：把"有效 depth + 1"重新 provide 给后代——于是这个组件模板里若再写一个出口，它会自动取 matched 的下一项。零配置嵌套就靠这一行。
+6. **交出 vnode**：渲染时把目标组件包成 vnode 交给作用域插槽；使用者没提供 slot 时，兜底直接渲染该 vnode。
+7. **登记实例**：组件挂载后，把实例写回 `matched[有效depth].instances[出口名]` 供导航守卫查找；卸载时把这个位置空。
 
-把整个机制拆成七步，从应用到最里层的出口：
+这套模型成立的前提只有一条：**matched 是从父到子的有序数组**（这是「路由匹配表」一章的产物，本章只是这条不变量的消费者）。
 
-1. **注入驱动源**：根应用安装时，把"当前路由"（一个响应式 ref）放到留言板上，所有出口共用这一个源。（这个源是怎么用一个 `shallowRef` 只在最外层替换来驱动视图的，是「Router 核心与导航主循环」的内容，这里只把它当成 matched 链的来源，不重演。）
-2. **最外层出口报到**：它 inject 到当前路由，并 inject 到一个楼层号——没有父级时默认是 `0`。
-3. **算有效楼层**：它用这个号去 `matched` 里取；但取到的记录可能是个"空壳"（只为复用路径前缀、自己不渲染组件），那就让号自增，继续往后找，直到命中一个真有组件的记录。
-4. **取出要渲染的组件**：`matched[有效楼层]` 上对应出口名（默认 `default`）的那个组件，就是渲染目标。
-5. **往下传下一层**：把"有效楼层 + 1"重新写到留言板上。于是这个组件模板里若再写一个出口，它一读就拿到下一层。
-6. **交出渲染权**：把目标组件包成一个 vnode，交给使用者的作用域插槽；使用者没提供插槽就兜底直接渲染。
-7. **登记实例**：组件挂载后，把它的实例写回 `matched[有效楼层]` 这条记录上，供导航守卫查找；卸载时把这个位置清空。
+## 4. 关键权衡
 
-第 3、5 两步是嵌套能"自动对齐"的关键。下面用一个能跑的演示把第 1～5 步演透，第 6、7 步因为更贴近 Vue 的组件组合，用代码片段配文字轨迹说明。
+「靠 inject 把 depth 往下传」是这套设计的灵魂，但它押上的几个隐式契约才是真正值得看清的地方。下面四条都是"选了什么 → 换来什么 → 付了什么代价"。
 
-## 原理演示：跑一遍 `/admin/users/42` 的嵌套轨迹
+### 隐式 inject 换零配置嵌套
 
-这份演示剥离掉 Vue 的响应式和真实 DOM，只用一个"provide 栈"模拟依赖注入沿组件树向下传的过程，把 **depth 传递 + matched 下标 + 跳过空壳** 这三件事演透。存成 `nesting-trace.ts`，用 `bun run nesting-trace.ts` 或 `npx tsx nesting-trace.ts` 就能跑：
+选择用 `provide/inject` 把 depth 往下传，而不是让使用者在每个出口上显式 `:depth="n"` 传 props。
 
-```ts
-// nesting-trace.ts
-type RouteRecord = {
-  path: string
-  component?: string            // 缺失 = passthrough，只为复用路径前缀
-}
+换来的是**真正的零配置**：在任意子组件模板里写一个 `<RouterView>`，就自动接上正确层级；使用者完全不用知道当前在第几层，路由层级变了模板也不用动。这是嵌套视图"开箱即用"的来源。
 
-// ---- 微型 provide/inject：每个出口 setup 时压一个栈帧 ----
-const stack: Map<symbol, any>[] = [new Map()]
-const provide = (k: symbol, v: any) => stack.at(-1)!.set(k, v)
-const inject = <T>(k: symbol, fallback: T): T => {
-  for (let i = stack.length - 1; i >= 0; i--)
-    if (stack[i].has(k)) return stack[i].get(k) as T
-  return fallback
-}
+代价是 depth 成了**看不见的隐式依赖**——你读模板时不知道这个出口对应 matched 的第几项，要查 inject 链才能定位。更承重的是 matched 数组的父子顺序：它从"路由表内部的一个排布细节"上升为"模板必须信赖的隐式契约"。一旦顺序被某种方式打乱（自定义 matcher、记录变形），出口会**静默渲染错组件**，不报错。库为此额外做的事是：在 devtools 下把 `{depth, name, path, meta}` 戳记到所渲染组件实例上——隐式依赖必须靠可观测性补回来。
 
-const ROUTE = Symbol()          // matched 数组的来源（= 当前路由）
-const DEPTH = Symbol()          // 当前出口的楼层号
+化解的本质矛盾是：**"使用上零配置的便利"** 和 **"数据流显式可追溯"** 之间的取舍。前者赢，后者靠 devtools 找补。
 
-// ---- 教学版出口 ----
-function routerView(indent = '') {
-  const matched: RouteRecord[] = inject(ROUTE, null).matched
-  const injectedDepth = inject(DEPTH, 0)            // 从父级留言板读楼层号
+### while 跳过 passthrough 记录换"只为前缀的中间层"透明工作
 
-  // 跳过没有 component 的 passthrough 记录，算出"有效楼层"
-  let depth = injectedDepth
-  while (matched[depth] && !matched[depth].component) depth++
+选择在算 depth 时用 while 循环跳过没有 `components` 的中间路由记录，而不是要求每条路由记录都必须挂一个组件。
 
-  const record = matched[depth]
-  console.log(
-    `${indent}出口拿到 injectedDepth=${injectedDepth} → 有效 depth=${depth} → 渲染 ${record.component}`
-  )
+换来的是**只为复用 path 前缀、自身不渲染东西**的中间路由能透明工作。比如 `/admin` 下挂 `/admin/users`、`/admin/settings`，使用者只为 `admin` 这条记录配 layout、不为"只是为了把 `admin/` 前缀聚拢"的抽象层配假组件——这一切照常工作。
 
-  // 把"下一层"写回留言板，供肚子里的子出口读取
-  provide(DEPTH, depth + 1)
+代价是 **depth 不再是注入进来的那个原始值**，而是"有效下标"：matched 数组下标和 depth 之间多了一层"跳过几个 passthrough"的换算。子出口拿到的 provide 值是基于"有效 depth + 1"，而不是"注入 depth + 1"——这一点不读源码很难想到。换句话说，一个数值有了两层含义（"在数组里的位置" vs "在第几层出口"），调试时容易混淆。
 
-  // 模拟"在 record.component 模板里又写了一个出口"：压栈渲染子出口
-  if (matched[depth + 1]) {
-    stack.push(new Map())
-    routerView(indent + '  ')
-    stack.pop()
-  }
-}
+化解的本质矛盾是：**"路径层级的完整性"**（matched 要忠实地反映 URL 的所有路由段）和 **"渲染层级的稀疏性"**（中间段未必都要画东西）之间的不对齐。库选择把"对齐"的责任放在出口里，而不是让使用者补假组件。
 
-// ---- 执行轨迹：访问 /admin/users/42 ----
-const route = {
-  matched: [
-    { path: '/admin',           component: 'AdminLayout' },
-    { path: '/admin/users',     component: undefined },   // passthrough
-    { path: '/admin/users/:id', component: 'UserDetail' },
-  ],
-}
+### scoped slot 交出 vnode 换组合权让渡
 
-stack.push(new Map())
-provide(ROUTE, route)
-provide(DEPTH, 0)
-routerView()
-stack.pop()
-```
+选择把目标组件作为 vnode 交给使用者的作用域插槽（`v-slot="{ Component }"`），而不是在 RouterView 内部直接内置 `<transition>` / `<keep-alive>`。
 
-跑出来的轨迹只有两行，但信息量很大：
+换来的是**组合权完全交到使用者手里**：要不要过渡、要不要缓存、要不要配 `<suspense>`，都由使用者在 slot 里自己决定；库不再绑定那些会随 Vue 版本变动的控制流组件——库的升级路径因此清爽很多。
 
-```
-出口拿到 injectedDepth=0 → 有效 depth=0 → 渲染 AdminLayout
-  出口拿到 injectedDepth=1 → 有效 depth=2 → 渲染 UserDetail
-```
+代价是**旧的"直接用 `<transition>` 包住出口"的写法失效**。原因不是库刻意刁难：Vue 3 里函数式组件不再 eager 求值，包在外层的 `<transition>` 抓不到内层组件的真实生命周期，过渡根本不触发。库为此专门发了一条诊断码（`VUE_ROUTER_R0060`），检测到旧包裹写法就报警，提醒迁移到 slot 形式。这是个真实的迁移成本——本来"加个过渡"是一行模板的事，现在要重写成 `v-slot` 形式。
 
-逐行拆开看：
+化解的本质矛盾是：**"组合能力的开放"**（让使用者自由组合控制流）和 **"API 的向后稳定性"**（内置控制流能让使用者的代码不跟着 Vue 变动）之间的取舍。库选了前者，承担了发诊断码 + 教育使用者的成本。
 
-- **第一层出口**：`injectedDepth=0`（最外层没有父级，默认 0），`matched[0]` 是 `AdminLayout`，有组件，`while` 不进入，有效 `depth=0`，渲染 `AdminLayout`。然后它把 `depth+1=1` 写回留言板。
-- **第二层出口**（写在 `AdminLayout` 模板里的那个）：从留言板读到 `injectedDepth=1`。注意——它读到的不是 `2`，而是 `1`，因为父级传的是"自己的有效 depth + 1"。它拿 `matched[1]` 一看，是 `AdminSection`，**没有 component**，于是 `while` 把 `depth` 自增到 `2`；`matched[2]` 是 `UserDetail`，有组件，停手，渲染它。
+### 实例登记回记录换守卫按命名视图找得到
 
-这正是设计上最妙的一点：中间那个只为复用 `/admin/users` 路径前缀、自己不画任何东西的 `AdminSection`，被两层出口**透明地跳过**了。使用者根本不需要为它配一个假组件，也不用知道它存在。两层出口稳稳对齐到 `AdminLayout` 和 `UserDetail`。
+选择把已挂载的组件实例登记回 `matched[depth].instances[出口名]`，并在"实例复用但路由记录变了"时把守卫从旧记录迁移到新记录。
 
-把这套数据流画成一张图，就是：
+换来的是**导航守卫（update/leave）和"beforeRouteEnter 的 next 回调"能按命名视图找到当前实例**——而不管这个实例是新建的还是复用的。被复用的实例其 `leaveGuards` / `updateGuards` 不会因为路由记录从 A 换到 B 就丢掉，守卫的归属跟着实例走。
 
-```
-根 provide(ROUTE) ──┐
-                    ▼
-        最外层出口 inject(DEPTH=0)
-                    │  while 跳空壳 → 有效 depth=0
-                    │  matched[0] = AdminLayout  → 渲染
-                    │  provide(DEPTH=1)
-                    ▼
-        内层出口 inject(DEPTH=1)
-                    │  while 跳空壳 → 有效 depth=2
-                    │  matched[2] = UserDetail   → 渲染
-                    │  provide(DEPTH=3)
-                    ▼
-               （matched[3] 不存在，停止）
-```
+代价是要维护一组**多重副作用**：
 
-## 第 6、7 步：把组件交出去，把实例登记回来
+- 登记时机必须是 `flush: 'post'` 的 watch——DOM 挂载后才能拿到组件实例 ref；
+- 卸载时要手动把 `instances[name]` 置 null，否则记录上残留失效实例引用，下次守卫查到一个已经卸载的实例；
+- 实例被复用但 matched 记录变了时，要把守卫从旧记录搬到新记录，否则守卫挂在已经不再渲染的记录上、永远不被触发。
 
-前五步解决了"对齐到哪一层"。剩下两步发生在真正的 Vue 组件里。
+这三条都是边界处理，不是核心算法，但少任何一条都会出现难定位的"守卫偶尔失效"。
 
-**第 6 步——把组件作为 vnode 交给作用域插槽**，render 时是这样：
+化解的本质矛盾是：**组件实例的生命周期**（被 Vue 的渲染器管）和 **路由记录的生命周期**（被导航管线管）天然不一致——实例可以跨多次记录变更被复用，记录也可以在实例还活着的时候被替换。库选择让"守卫归属"跟着实例走、让"实例登记"落在记录上，于是要手动维护两者的一致性。
+
+## 5. 最小原理演示
+
+下面这段 TS 用 Vue 真实的 `h` / `provide` / `inject` / `defineComponent` 演透上面四条权衡的核心闭环。它故意不追求工程完整：不处理 attrs 转发、不做命名视图多分支、不实现守卫迁移的全部细节——只演"depth 流动 + 跳过 passthrough + slot 交出 vnode + 实例登记回记录"。
 
 ```ts
-return () => {
-  const component = h(ViewComponent, { ref: instanceRef })
-  // 把 vnode 交给使用者的作用域插槽；没插槽就兜底直接渲染
-  return slots.default?.({ Component: component }) ?? component
+import {
+  computed, h, inject, provide, defineComponent,
+  type InjectionKey, type Ref, type Component,
+} from 'vue'
+
+type MatchedRecord = {
+  components?: Record<string, Component>
+  instances?: Record<string, Component | null>
 }
-```
+type RouteRef = Ref<{ matched: MatchedRecord[] }>
 
-注意它**没有**在库内部把组件包进 `<Transition>` 或 `<KeepAlive>`，而是把做好的 vnode 原样递给使用者。于是组合权完全在使用者手里：
+// 类型化的 Symbol 当 DI 接缝——depth 是隐式依赖，至少让类型层能看见它
+const routeKey: InjectionKey<RouteRef> = Symbol('currentRoute')
+const depthKey: InjectionKey<Ref<number>> = Symbol('viewDepth')
 
-```vue
-<!-- 想要过渡：自己包，库完全不插手 -->
-<RouterView v-slot="{ Component }">
-  <Transition mode="out-in">
-    <component :is="Component" />
-  </Transition>
-</RouterView>
+export const MiniRouterView = defineComponent({
+  name: 'RouterView',
+  props: { name: { type: String, default: 'default' } },
+  setup(props, { slots }) {
+    const route = inject(routeKey)!
+    const injectedDepth = inject(depthKey, () => 0)
 
-<!-- 不需要过渡：什么都不写，出口兜底直接渲染 -->
-<RouterView />
-```
+    // 跳过没有 components 的 passthrough 记录：
+    // depth 是"有效下标"，可能比注入进来的原始值大
+    const depth = computed(() => {
+      let d = injectedDepth.value
+      const { matched } = route.value
+      while (matched[d] && !matched[d].components) d++
+      return d
+    })
 
-**第 7 步——实例登记回路由记录**，靠一个 `flush: 'post'` 的 watch（DOM 挂载后才能拿到实例）：
+    const matchedRoute = computed(() => route.value.matched[depth.value])
 
-```ts
-const instanceRef = ref()
-watch(
-  [instanceRef, matchedRouteRef, () => props.name],
-  ([inst, to, name], [oldInst, from]) => {
-    if (!to) return
-    to.instances[name] = inst                  // 挂载后登记，供守卫按命名视图查找
-    // 实例被复用、但路由记录换了：把守卫从旧记录搬到新记录，防守卫丢失
-    if (from && from !== to && inst && inst === oldInst) {
-      to.leaveGuards  = from.leaveGuards
-      to.updateGuards = from.updateGuards
+    // 把"有效 depth + 1"注入后代：
+    // 子模板里再写一个出口就自动取 matched 的下一项——零配置嵌套就靠这一行
+    provide(depthKey, computed(() => depth.value + 1))
+
+    return () => {
+      const record = matchedRoute.value
+      const component = record?.components?.[props.name]
+      if (!component) return null
+
+      const vnode = h(component, {
+        // 卸载时把实例引用置 null，防记录残留失效实例
+        onVnodeUnmounted: () => {
+          if (record.instances) record.instances[props.name] = null
+        },
+      })
+
+      // 把 vnode 交给 scoped slot，由使用者决定要不要包过渡/缓存；
+      // 没提供 slot 就兜底直接渲染
+      const slot = slots.default?.({ Component: vnode })
+      return slot && slot.length ? slot : vnode
     }
   },
-  { flush: 'post' }
-)
+})
+
+// 真实库还维护一个 flush:'post' 的 watch：实例挂载后写回 record.instances，
+// 并在记录变更时把守卫从旧记录迁移到新记录——这里省略以保持演示聚焦。
 ```
 
-挂载时把实例写进 `to.instances[name]`；如果同一个实例被复用、但它对应的路由记录从 `from` 变成了 `to`，就把离开/更新守卫从旧记录搬到新记录上。卸载时则把 `instances[name]` 置 `null`，防止记录上残留失效引用。
+## 6. 执行轨迹
 
-## 关键权衡：极简 API 背后的四个代价
+把路由配成三层：
 
-这套机制换来的是"任意层级写一个出口就自动接上"的极简体验。但每一个选择都有代价，下面四条是这一章真正想交付给你的"为什么"。
+```
+/admin/users/42 → matched = [
+  { components: { default: AdminLayout } },     // 有组件
+  { /* 无 components，passthrough */ },
+  { components: { default: UserDetail } },      // 有组件
+]
+```
 
-**① 用隐式的依赖注入向下传 depth，而不是显式的 props 链。** 选择依赖注入，换来的是零配置嵌套：使用者在任意子组件模板里写一个出口就自动接上正确层级，路由层级变了模板一行都不用改。代价有两层。其一，`matched` 数组的"父子顺序"成了一份**承重的隐式契约**——只要这张表从外到内的顺序错了，或者哪里多塞了一层，所有出口会静默地渲染错组件，而且不会报错。其二，depth 是个**看不见的隐式依赖**：一个出口到底在第几层，从它的模板和 props 里完全看不出来，调试时必须额外靠 devtools 把 `{depth, name, path, meta}` 戳到组件实例上，使用者才能看见"这个实例对应 matched 的第几层"。换句话说，这个 API 之所以能简到只有一个标签，是因为把复杂性藏进了注入链和数组顺序里。
+第一步：根模板里的出口拿到 `injectedDepth = 0`（没有父出口，inject 的默认值）。`matched[0]` 有 components → 不进 while 循环 → 有效 depth = 0 → 取 `matched[0].components.default` = `AdminLayout` → 渲染。同时 `provide(depthKey, 0 + 1 = 1)` 给后代。
 
-**② 取 depth 时用 while 循环跳过"无组件"的路由记录。** 选择跳过，换来的是"只为复用 path 前缀、自身不渲染组件"的中间路由能**透明工作**——演示里的 `AdminSection` 就是这种，使用者无需为它配一个空壳组件，路由层级怎么组织都不影响出口对齐。代价是 depth 的语义变厚了一层：它不再等于"父级注入进来的那个原始值"，而是"从原始值开始、跳过若干空壳后的**有效下标**"。演示里第二层出口 `injectedDepth=1` 但有效 `depth=2` 就是这个差距。所以 `matched` 的数组下标和 depth 不再一一对应，理解这套机制时脑子里得多绕一个弯：传给后代的是"有效 depth + 1"，不是"原始值 + 1"。
+第二步：`AdminLayout` 模板里又写了一个出口。这个出口 `inject(depthKey)` 拿到 1。`matched[1]` 没有 components → while 循环自增 → depth = 2 → `matched[2].components.default` = `UserDetail` → 渲染。同时 `provide(depthKey, 2 + 1 = 3)` 给后代（若有）。
 
-**③ 把要渲染的组件作为 vnode 交给作用域插槽，而不是在库内部包过渡/缓存组件。** 选择交出去，换来的是使用者**完全掌控组合**——要不要过渡、要不要缓存、用哪个版本的控制流组件，全由使用者决定，库不绑定任何会随 Vue 版本变动的内置组件。代价是旧写法直接失效：以前那种用 `<transition>` 或 `<keep-alive>` 直接包住 `<router-view>` 的用法（Vue 2 时代的习惯）在 Vue 3 行不通了，因为函数式组件不再 eager 求值，外层包裹拿不到正确的组件实例。库不得不专门发一条诊断码来警告这个迁移，使用者必须改写成上面那种 `v-slot` 形式。这是同一个决策的两面：库主动放弃了对控制流组件的所有权，灵活性和迁移成本是绑在一起的。
+结果：两层出口分别对齐到 `AdminLayout` 与 `UserDetail`，中间那条只为聚合 `/admin/` 前缀的 passthrough 记录被透明跳过——使用者既没给它配假组件，也没在模板里多写任何东西。整条链路靠 depth 在 inject 里的流动 + while 跳过两个动作就完成了。
 
-**④ 把已挂载的组件实例登记回路由记录，并在实例复用、记录变更时迁移守卫。** 选择挂在"路由记录"上而不是"出口组件实例"上，换来的是导航守卫（更新/离开）和"进入守卫的 next 回调"能**按命名视图找到当前实例**，而且被复用的实例其守卫在跨路由变更时不会丢失——多个 app 共用同一张匹配表时，守卫还能按记录聚合。代价是一串边界处理：得维护一个 `flush: 'post'` 的 watch 确保 DOM 挂载后才登记实例；卸载时要手动把实例置 `null` 防止泄漏；最棘手的是"实例复用但路由记录换了"这种情形，得把 `leaveGuards`/`updateGuards` 从旧记录搬到新记录，否则守卫就跟着旧记录一起失踪了。可见，把可观测性和守卫存活绑在路由记录上，是拿一个简洁的查找模型换来的。
+## 7. 教学简化说明
 
-## 小结
+本章演示故意省略：`routeProps`（true / 函数 / 对象三态派发，把 params 作为 props 注入子组件）、命名视图多 name 分支、devtools 把 `{depth, name, path, meta}` 戳记到实例、`flush:'post'` watch 的全部守卫迁移细节、`inheritAttrs: false` 下的手动 attrs 转发、`compatConfig` 兼容、`RouteMap` 泛型按名收窄。这些都是工程细节，演透原理用不到。
 
-这一章只讲了一件事：**把"该渲染第几层路由"变成一个沿组件树向下传递的整数 depth**。最外层出口默认是 0，每个出口凭 depth 从 matched 链里取出对应那一级，再把"有效 depth + 1"递给后代——于是任意深的嵌套视图无需任何接线就能自动对齐，中间那些只为复用路径前缀的空壳路由也被透明跳过。围绕这条主线，库用依赖注入换来了零配置 API，用作用域插槽换来了组合自由，用实例登记换来了守卫的可靠存活，每一项都附带了顺序敏感、隐式依赖、迁移成本这些具体代价。
+## 8. 小结
 
-下一章我们会看 `<RouterLink>`：它把一个路由位置 resolve 成 href，并基于"matched 链包含 + params 子集"来判定链接的激活态——你会发现，那里对 matched 链的用法，和这里的"按 depth 下标"是同一条链的另一种消费方式。
+嵌套视图能零配置对齐路由层级，靠的是把"第几层"抽成一个隐式 inject 下去的整数 depth——出口们各凭下标在 matched 链里取自己那一级，跳过只为前缀的中间层。这条优雅换来了四个隐式契约：matched 顺序承重、depth 与数组下标不再一一对应、旧包裹写法失效、实例与记录生命周期要手动同步。下一章会继续沿着 matched 链走——不过这次不是"渲染谁"，而是"判定一个链接是否指向当前路由"。

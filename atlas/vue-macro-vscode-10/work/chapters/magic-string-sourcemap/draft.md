@@ -1,156 +1,206 @@
-# magic-string：改代码却不丢位置，靠一张「编辑账本」换回 sourcemap
+# magic-string：sourcemap 友好的源码就地变换
 
 > 本章属于 primitive 层。前置：靠 AST 而非正则识别宏调用节点。
-> 学完你能：用一句话讲清「为什么宏变换必须用 offset 级的就地改写、而不是随手拼字符串，以及这么做换来可回溯调试的代价」。
+> 学完你能：用一句话讲清「为什么宏改写代码必须用 offset 账本而非字符串替换，以及它付出的代价」。
 
-## 1. 为什么需要它
+## 1. 为什么需要它（设计动机）
 
-上一章解决了「怎么认出宏」——靠 AST 按节点类型加调用名精确匹配，顺带从节点上拿到它在源码里的字符 offset。但拿到 offset 只是第一步。真正动手改代码那一刻，位置信息就开始流失，而这正是上一章那个「报错难还原到用户写法」代价的根源。本章就接住这个口子：怎么在改写代码的同时，不让原始位置丢掉。
+上一章把「找得准」办成了——靠 AST 精确命中宏调用节点，并拿到了它在源码里的字符 offset。但这留下了一个更棘手的口子：找到节点之后呢？你总要对源码动刀，把 `defineProps()` 改写成 `__props`。这一刀下去，麻烦就来了。
 
-想象你在用 `defineProps` 或 Vue Macros 的 `defineModel`。你写的是一套声明式语法，编译产物里这段变成了 `__props` 或 `ref(...)`。然后你打开浏览器调试，想在那一行打个断点，结果断点要么落空、要么落进一段你从没写过的代码里；报错堆栈的行号指向编译产物的某一行，你对不上自己写的源码。
+想象一下：用户写了 `const props = defineProps<{ msg: string }>()`，编译期你把它改成了 `const props = __props`。看起来皆大欢喜——直到用户在浏览器里打断点，断点落不到自己写的那行；运行时报错，调用栈指向一段自己从没写过的代码。编译期擦除换来的运行时红利，在调试这一刻变成了灾难。
 
-这就是编译期变换要交的「调试税」。如果不补一张把产物位置换算回源码位置的翻译表，宏省下的运行时开销，会在调试体验上连本带利还回去。
+调试要能继续，浏览器/IDE 就得有一张翻译表，把产物里的行列号换算回源码的行列号，这就是 sourcemap。问题在于：朴素的 `.replace('defineProps', '__props')` 一旦执行，原始字符位置就永远丢失了——你没法事后问出「`__props` 这 7 个字符，原来对应源码的哪 14 个字符」。
 
-这张翻译表从哪来？最直觉的想法是：改完代码之后，给产物里每个字符标上它对应源码的哪个字符。但这要求改写过程中始终记得「这段新代码替换的是源码的哪一段」。朴素的字符串拼接做不到这件事。你一旦把新字符串拼好、把旧的丢掉，原始字符的位置就永久消失了，没法事后重建这张表。
-
-magic-string 就是来填这个坑的。
+所以「改写代码」和「保留原始位置」必须同时成立。但它们看起来天然矛盾——你改了，位置不就乱了吗？magic-string 就是为填这个坑而生的。
 
 ## 2. 核心思想
 
-所有改写都以「**原始源码的字符偏移量**」为坐标就地登记，原始位置永不丢弃，最后一次性把这张「编辑账本」逆向翻译成 sourcemap。
+所有改写都以**原始源码的字符偏移量**为坐标就地登记，原始位置永不丢弃，最后一次性把这张「编辑账本」逆向翻译成 sourcemap。
 
-这句话里有个关键约束值得单独记住：原始串构造完就不再改动，改写只发生在账本上。
+换句话说，magic-string 不重新生成代码，而是把源码当成一张手术台——你要替换的、要插入的，都登记在源码的 offset 坐标系里；输出时把账本里的新内容和原始未被改动的片段缝合成产物，并同时吐出映射关系。
 
 ## 3. 心智模型
 
-打一个比方。想象你在一份纸质合同上手改条款。你不会把整份合同重抄一遍，而是用红笔在原文上划掉一段、在旁边写上新内容，并在边上注明「这里原是第 3 条第 2 款」。最后要誊清时，你按原文顺序走一遍：遇到划掉的就誊新内容、没划的就誊原文，同时顺手记下「誊清稿的第几行对应原稿的第几行」。magic-string 干的就是这件事，只不过坐标不是「第几条第几款」，而是字符在原始串里的 offset。
+按 7 步建立心智：
 
-它的运作可以拆成五步：
+1. **建立坐标系**：`new MagicString(source)` 把整段源码装进来，原始 offset 从这一刻起就是绝对坐标系，永不变更。
+2. **取节点 offset**：从 AST 拿到宏调用节点的 `start`/`end`——上一章已经办好的事。
+3. **overwrite 就地替换**：`s.overwrite(start, end, 新代码)`，账本上多一条「这个原始 offset 区间换成新内容」，区间两端的原始 offset 仍钉在那里。
+4. **appendLeft / prependRight 就地插入**：`s.appendLeft(offset, 代码)`，插入物挂在某个原始 offset 的左侧或右侧。
+5. **toString() 输出产物**：所有编辑登记完毕后调用一次，按 offset 顺序把账外原始片段与账内新内容缝合出来。
+6. **generateMap() 输出映射**：遍历账本，未编辑片段天然映射到自身位置，被替换/插入的内容映射到它所锚定的那个原始 offset（「假装这段新代码来自原文本的那个位置」）。
+7. **下游回溯**：产物 + sourcemap 交给打包器、运行时、调试器，断点与报错栈经 sourcemap 换算后落回用户写的源码。
 
-1. **建坐标系**。`new MagicString(source)` 把整段原始源码当成一个覆盖 `[0, 长度)` 的整体，原始 offset 从此刻起成为所有操作的绝对坐标。这个坐标是不可变的。
-2. **取节点 offset**。遍历 AST 命中宏调用，读出该节点在源码里的 `start / end`（这正是上一章的产出）。
-3. **就地改写**。对要替换的节点调 `overwrite(start, end, 新代码)`。内部会在 start、end 两处把整体「劈开」成相邻的小片段，被换掉的那个片段挂上新内容，但它绑定的原始位置仍是 start，不会跟着新内容走。
-4. **一次性输出**。所有编辑登记完毕后，调 `toString()`，按片段顺序缝出最终产物。
-5. **一次性映射**。调 `generateMap()` 遍历片段：没动过的代码天然映射回它自己的原始位置；被替换或新插入的内容，则映射到它所替换掉、所依附的那个原始 offset——相当于「假装这段新代码来自原文本的那个位置」。
-
-贯穿这五步的不变量只有一条：**所有坐标都指原始串，永远不指改完之后的产物**。这条不变量是 sourcemap 能成立的根基。
-
-这里有个容易看漏的点：`overwrite(14, 44, '__props')` 并不去原串里找第 14 到 44 个字符再就地替换。原串从头到尾不动。它只是在账本上记一笔：「把原始 `[14,44)` 这段换成 `__props`」。真实 magic-string 为了支持快速定位，内部用双向片段链表加起止索引表来维护这些片段（劈开 = split），但那是为了性能；原理上，一张按 offset 排序的编辑数组就够演透了。
+整个模型的关键不变量：**原始 offset 永远是真理之源**。无论做了多少次编辑，账本上每一条都还能溯源回源码的某个位置。
 
 ## 4. 关键权衡
 
-这一节是全章重点。magic-string 的几个核心设计取舍，每一条都在化解「两个对立需求打架」的矛盾。
+这是本章的重头戏。magic-string 每一条设计都对应一个被化解的矛盾。
 
-### 权衡一：只能用 offset 定位的就地操作，放弃自由字符串替换
+### 4.1 牺牲自由字符串替换，换 offset 坐标系贯穿到底
 
-- **选择**：所有改写的坐标都钉死在原始 offset 上，`overwrite` / `remove` / `appendLeft` 一律按原始串的偏移量定位。
-- **换来**：原始位置信息贯穿整个编辑过程不丢失，sourcemap 可以在最后逆向重建出来。可回溯调试成了改写的免费副产物。
-- **代价**：你必须先有一份 AST 给出每个节点的 `start / end`，不能像写脚本那样随手 `.replace()`；而且后续所有操作仍得以原始 offset 为坐标系，不能用「改完之后的第几个字符」来定位——那个坐标系在每次编辑后都会失效。
-- **化解的本质矛盾**：**自由度 vs 可回溯性**。你越想让改写像写脚本一样随意（按改完后的文本去定位下一次编辑），就越无法事后重建位置映射；反过来，要让 sourcemap 成立，就得约束自己只能用改写前的坐标系。magic-string 选了后者，把可回溯做成默认能力，代价是改写动作必须先经 AST 翻译成 offset。
+**选择**：所有编辑操作（overwrite / remove / appendLeft / prependRight）只接收原始 offset 作为定位参数，明确禁用「按改完之后的位置定位」或「按内容自由替换」。
 
-这一条直接决定了 magic-string 和上一章 AST 识别的关系：上一章给的 offset 不是可有可无的便利，而是本章整套机制能运转的唯一入口。没有 offset，就没有 offset 级的改写。
+**换来**：原始位置信息贯穿整个编辑过程，永不丢失——每条编辑都钉在原始 offset 上，账本本身就是 sourcemap 的源头，最后那次 generateMap 只是把账本逆向翻译成标准格式。
 
-### 权衡二：用片段链表加劈开记录编辑，而非每次重拼字符串
+**代价**：你必须先有 AST 给出每个节点的 start/end offset，随手 `.replace()` 的脚本式改写范式被堵死了；所有后续操作都以原始 offset 为坐标系，读者得换一种心智——**问「原始第几个字符」而非「改完之后第几个字符」**。
 
-- **选择**：内部用片段（chunk）组成的链表记录编辑，`overwrite` 只是劈片段、改标记，绝不整体重算字符串。
-- **换来**：多次编辑互不干扰，定位到任意 offset 接近 O(1)，还支持 `move` 把一段代码整体搬到别处。
-- **代价**：内部数据结构比一段朴素字符串复杂得多，最终输出和 sourcemap 生成都要额外跑一次对全部片段的遍历。
-- **化解的本质矛盾**：**简单性 vs 可叠加编辑**。朴素字符串每改一次，其后所有字符的位置都要整体重算，多次编辑互相踩踏；要支持「无数次小手术叠加在同一份代码上」，就得把单段字符串拆成可独立标记的片段。这其实是「可变状态如何承载多步编辑」的通解骨架：把每一步编辑做成对独立单元的标记，而不是每次重建整体。数据库的 MVCC、编辑器的 piece table，都是同一个骨架的不同化身。
+**本质矛盾**：这是「编辑的便利性」与「位置的可追溯性」之间的取舍。一旦允许自由字符串替换，就再也无法保证每段产物都能溯源到源码，因为替换会改写文本结构、原始 offset 立刻作废。magic-string 选了后者，把便利性让渡给前置的 AST 阶段。
 
-### 权衡三：sourcemap 默认走低分辨率
+### 4.2 用区块链表记账，不每次重拼字符串
 
-- **选择**：`generateMap` 默认只在有限位置（行边界、词边界）打映射点，配合 VLQ 差值编码压缩体积；要逐字符精度得显式开 `hires`。
-- **换来**：sourcemap 体积小，比逐字符映射通常小一个数量级。sourcemap 是要随产物一起被加载、解析的，这个体积差很实在。
-- **代价**：映射粒度粗，列级精度丢失。断点可能只精确到「这一行的某个词」而不是精确列；开了 `hires` 又会让体积膨胀。
-- **化解的本质矛盾**：**精度 vs 体积**。逐字符精确意味着每个产物字符都要留一条记录，体积会爆炸。默认粗粒度，是把「大多数调试场景不需要列级精度」这条经验固化成默认值。这同样是「默认值该怎么取」的通解：选覆盖大多数场景的便宜档位，把贵的精确档留给显式开启的人。
+**选择**：内部维护一个 chunk 链表（双向链表 + 起止索引表），每次 overwrite 都是「劈开相邻 chunk + 给目标 chunk 打标」，绝不重新拼接整个字符串。
 
-三条权衡放在一起看，magic-string 的立场很清楚：它把「可回溯」当成不可妥协的默认值（权衡一），用一套可叠加的片段账本支撑无数次编辑（权衡二），再用粗粒度默认值控制 sourcemap 体积（权衡三）。代价是改写动作受限、内部结构更重、精度可调但默认偏粗。
+**换来**：多次编辑互不干扰、O(1) 定位到任意位置、甚至支持 `move()` 把一段代码搬到别处——编辑只是改 chunk 属性，chunk 之间的链接关系从未被破坏。
+
+**代价**：内部数据结构比朴素字符串复杂得多；最终 toString 与 generateMap 都需要一次 O(n) 遍历整个链表。不过这次遍历是「摊到所有编辑上」的一次性成本，远好于每改一次就重拼一次。
+
+**本质矛盾**：这是「单次编辑的简单性」与「多次编辑的可组合性」之间的取舍。朴素字符串每改一次都得重新建立 offset 对照（字符串长度变了），N 次编辑是 O(N²)；链表把每次编辑成本摊到 O(1)，代价是引入「chunk 是 sourcemap 的最小单元」这层抽象。
+
+### 4.3 默认走低分辨率 sourcemap，按词/行边界打点
+
+**选择**：`generateMap({ hires: false })`（默认值）只在有限的几个位置打映射点——通常是行边界或词边界，而非每个字符都打。
+
+**换来**：sourcemap 体积小，配合 VLQ 差值编码后比逐字符映射小一个数量级，加载与解析都快。
+
+**代价**：映射粒度粗，列级精度丢失。断点可能只精确到「这一行的某个词」而非精确列。要逐字符精度得显式开 `hires: true`，但 sourcemap 体积会膨胀。
+
+**本质矛盾**：这是「调试精度」与「产物体积」之间的取舍。多数场景下行/词级精度够用（断点通常落到行就够了），所以默认走低分辨率；当用户真的需要列级调试时再显式 opt-in。这是把决策权交给使用者，而非替使用者拍板。
 
 ## 5. 最小原理演示
 
-下面这段从零实现，只演透核心思想，不追求工程完整。每一行都对应上面某个原理点。
+下面这几十行实现，只演示核心思想：**原始 offset 作为坐标系 + 编辑账本 + 逆向翻译成 sourcemap**。不演示性能优化、不演示完整 API。
 
 ```ts
 class MiniMagicString {
-  // ① 原始串即绝对坐标系，构造后永不改动（原理点：offset 坐标系）
-  constructor(private readonly source: string) {}
+  private original: string;
+  // 编辑账本：每条记录「原始 [start,end) 区间被换成 content」
+  // 未在账本里的 offset 区间原样保留
+  private edits: Array<{ start: number; end: number; content: string }> = [];
 
-  // ② 编辑账本：每条 = 「把原始串 [start,end) 换成 content」
-  private edits: { start: number; end: number; content: string }[] = [];
+  constructor(source: string) {
+    this.original = source;
+  }
 
-  // ③ overwrite 只往账本追加一条——原始串纹丝不动（原理点：就地登记）
+  // 就地登记一条编辑：仅记账，不动原始串
   overwrite(start: number, end: number, content: string) {
     this.edits.push({ start, end, content });
   }
 
-  // ④ 输出：按原始 offset 顺序走，账本外的誊原文、账本内的誊新内容
-  toString(): string {
-    const sorted = [...this.edits].sort((a, b) => a.start - b.start);
-    let out = "";
-    let cursor = 0; // 当前誊到原始串的哪里
-    for (const e of sorted) {
-      out += this.source.slice(cursor, e.start); // 账本外的原文
-      out += e.content;                          // 账本内的替换
-      cursor = e.end;
-    }
-    return out + this.source.slice(cursor);      // 收尾原文
+  // 在某个原始 offset 的左侧插入，本质是「替换 0 长度区间」
+  appendLeft(at: number, content: string) {
+    this.edits.push({ start: at, end: at, content });
   }
 
-  // ⑤ 逆翻译：账本外片段映射到自身 offset；账本内片段映射回它替换掉的原位置
-  //    （原理点：新代码「假装」来自它替换掉的那个原始 offset）
-  generateMap() {
-    const sorted = [...this.edits].sort((a, b) => a.start - b.start);
-    const map: { fragment: string; mapsToOffset: number }[] = [];
+  // 输出产物：按原始 offset 顺序，缝合账外原始片段与账内新内容
+  toString(): string {
+    this.edits.sort((a, b) => a.start - b.start);
+    let out = "";
     let cursor = 0;
-    for (const e of sorted) {
-      if (e.start > cursor)
-        map.push({ fragment: `原文[${cursor},${e.start})`, mapsToOffset: cursor });
-      // ↓ 关键：替换进来的新内容，映射回它替换掉的原位置 e.start
-      map.push({ fragment: `替换为"${e.content}"`, mapsToOffset: e.start });
-      cursor = e.end;
+    for (const e of this.edits) {
+      out += this.original.slice(cursor, e.start); // 账外片段，原样保留
+      out += e.content;                            // 账内片段，用新内容
+      cursor = Math.max(cursor, e.end);            // 跳过被替换掉的原始区间
     }
-    if (cursor < this.source.length)
-      map.push({ fragment: `原文[${cursor},${this.source.length})`, mapsToOffset: cursor });
-    return map;
+    out += this.original.slice(cursor);            // 尾部原始片段
+    return out;
+  }
+
+  // 输出 decoded sourcemap：每段产物映射到它对应的源码行列
+  // 这里只演映射规则，VLQ 编码留给下游 codec
+  generateDecodedMap() {
+    const gen: Array<[number, number]> = []; // 产物的 [行, 列]
+    const ori: Array<[number, number]> = []; // 源码的 [行, 列]
+    this.edits.sort((a, b) => a.start - b.start);
+    let genCol = 0;
+    let cursor = 0;
+    for (const e of this.edits) {
+      // 账外片段：产物与源码行列完全一致
+      for (let i = cursor; i < e.start; i++) {
+        gen.push([0, genCol++]);
+        ori.push(offsetToLineCol(this.original, i));
+      }
+      // 账内片段：产物用新内容的列推进，但映射回原始区间起点的源码位置
+      for (let i = 0; i < e.content.length; i++) {
+        gen.push([0, genCol++]);
+        ori.push(offsetToLineCol(this.original, e.start));
+      }
+      cursor = Math.max(cursor, e.end);
+    }
+    for (let i = cursor; i < this.original.length; i++) {
+      gen.push([0, genCol++]);
+      ori.push(offsetToLineCol(this.original, i));
+    }
+    return { generated: gen, original: ori };
   }
 }
 
-// 上一章 AST 给出的宏调用节点 offset：defineProps<{ msg: string }>() 落在 [14,44)
-const s = new MiniMagicString("const props = defineProps<{ msg: string }>()");
-s.overwrite(14, 44, "__props");
-
-console.log(s.toString());
-// → "const props = __props"
-
-console.log(s.generateMap());
-// → [
-//     { fragment: '原文[0,14)',       mapsToOffset: 0  },
-//     { fragment: '替换为"__props"',   mapsToOffset: 14 }   ← 新代码「假装」来自 offset 14
-//   ]
+// offset 转 [line, col] 的工具
+function offsetToLineCol(s: string, off: number): [number, number] {
+  let line = 0, col = 0;
+  for (let i = 0; i < off; i++) {
+    if (s[i] === "\n") { line++; col = 0; } else col++;
+  }
+  return [line, col];
+}
 ```
 
-最后那行就是全章的「啊哈」时刻：产物里新插进去的 `__props`，在 sourcemap 里被映射回了 offset 14，也就是 `defineProps` 原本所在的位置。于是用户在产物 `__props` 上打的断点、看到的报错，经 sourcemap 一换算，落回源码里 `defineProps` 那一行。变换「可回溯」这件事，在这行输出里直接显形了。
+跑一遍下面这个输入：
+
+```ts
+const src = "const props = defineProps<{ msg: string }>()";
+const s = new MiniMagicString(src);
+s.overwrite(14, 46, "__props");   // 把宏调用整段换成 __props
+console.log(s.toString());
+// → "const props = __props()"
+
+const m = s.generateDecodedMap();
+// 产物里 "__props" 那 7 个字符，每一条记录的 original 都是 [0, 14]
+// 也就是「假装这 7 个字符来自源码 offset 14（defineProps 原本所在）」
+```
+
+这一刻——新插入的 `__props` 被映射回了它替换掉的原始 offset 14——是全章的「啊哈」瞬间。变换「可回溯」这件事就这么落地了。
 
 ## 6. 执行轨迹
 
-拿一个具体输入走一遍，看账本和产物怎么联动。
+拿上面的输入走一遍内部状态：
 
-**输入**：源码 `const props = defineProps<{ msg: string }>()`，AST 给出宏调用节点 `defineProps<{ msg: string }>()` 的 offset 为 `[14, 44)`。
+```
+原始源码：const props = defineProps<{ msg: string }>()
+offset:   0         14       23                 46   48
+```
 
-**登记**：`s.overwrite(14, 44, "__props")`。此时账本里多了一条 `{start:14, end:44, content:"__props"}`，原始串 `const props = defineProps<{ msg: string }>()` 一个字没动。
+**步骤 1 · 构造**：`new MiniMagicString(src)` 装入原始串，账本为空，坐标系确立。
 
-**输出 `toString()`**：`cursor` 从 0 起步。先誊原文 `[0,14)` 得到 `const props = `，再誊账本内容得到 `__props`，`cursor` 跳到 44；44 已到串尾，没有收尾原文。产物：`const props = __props`。
+**步骤 2 · 登记编辑**：`s.overwrite(14, 46, "__props")`，账本多一条 `{start:14, end:46, content:"__props"}`。原始串本身没动。
 
-**映射 `generateMap()`**：原文片段 `[0,14)` 映射到 offset 0（它自己原来的位置）；替换进来的 `__props` 映射到 offset 14（它替换掉的原位置）。于是产物里 `const props = ` 的每个字符各自回指自己，`__props` 回指 `defineProps` 当年所在之处。
+**步骤 3 · toString**：按 offset 顺序遍历账本——
+- 账外片段 `src.slice(0, 14)` = `"const props = "`，原样输出。
+- 账内片段 `"__props"`，新内容输出。
+- cursor 跳到 46。
+- 账外尾部 `src.slice(46)` = `"()"`，原样输出。
 
-**下游效果**：产物加 sourcemap 一起交给打包器和浏览器。在产物 `__props` 处的断点和报错，经 sourcemap 还原到源码里 `defineProps` 的位置——用户看到的始终是自己写的那份代码。
+最终产物：`"const props = __props()"`。
+
+**步骤 4 · generateDecodedMap**：逐字符标注——
+- 产物第 0～13 个字符（`const props = `），每个映射到源码同样 offset 的行列。
+- 产物第 14～20 个字符（`__props`），**每个**都映射到源码 offset 14 的行列，也就是 `defineProps` 原本所在位置。
+- 产物第 21、22 个字符（`()`），映射到源码 offset 46、47。
+
+**步骤 5 · 下游使用**：浏览器拿到产物 + 这张 map 后，当用户在产物 `__props` 处打断点，调试器查 map 发现这位置对应源码 offset 14，于是断点落回用户写的 `defineProps` 上——变换「可回溯」达成。
 
 ## 7. 教学简化说明
 
-这段演示故意省了几样东西：双向片段链表和起止索引表是性能优化，不是原理，所以只用了一张排序数组；`move` / `reset` / `indent` 等高级操作、`appendLeft` 与 `prependRight` 在 move 场景下的归属差异都没涉及；sourcemap 的 VLQ 编码（把每个映射值差值再压成 Base64 串）也省了，演示里直接用 offset 数组，编码是下游 codec 的事；多文件、链式 sourcemap 合并（输入本身已带 sourcemap 时要复合）也没展开。这些不影响理解「为什么改写还能保住位置」这条主线。
+本章演示故意省略了：
+
+- **双向链表 + byStart/byEnd 索引**：那是 magic-string 真实源码的性能优化，不是原理。演示用「账本数组 + 排序」就能演透同样的思想。
+- **VLQ 的 Base64 编码**：那是 sourcemap 字符串层面的压缩算法，与「offset 坐标系」无关。演示里 decoded 映射直接用行列数组。
+- **`move` / `reset` / `indent` 等高级操作**：它们是就地编辑的延伸能力，不是核心思想。
+- **链式 sourcemap 合并**：当输入本身已经带 sourcemap（如 TS → JS 之后再做宏变换），需要 `@jridgewell/trace-mapping` 这类工具做合并，magic-string 自身不处理。
+- **`appendLeft` vs `prependRight` 在 move 场景下的归属差异**：纯 overwrite 场景下两者行为接近，move 才有区别。
 
 ## 8. 小结
 
-一句话收束：magic-string 让「改代码」和「保住原始位置」同时成立，靠的是把所有改写钉在不可变的原始 offset 上记成账本，最后再逆翻译成 sourcemap。它的代价是改写动作必须先经 AST 翻译成 offset、内部结构更重、精度可调但默认偏粗。
+magic-string 把「改写代码」和「保留原始位置」这件看似矛盾的事，用一个简单的思想统一起来：**别动原始串，只登记改写**。所有编辑都钉在原始 offset 上，sourcemap 就成了编辑的免费副产物——逆向把账本翻译一遍就行。代价是放弃随手 `.replace()` 的脚本式便利，把定位权交给前置的 AST。
 
-到这里，连续两章给出了宏变换的两个支柱：上一章的 AST 负责「认出宏、给出 offset」，本章的 magic-string 负责「按 offset 安全改写并保住 sourcemap」。这两件事拼到一起，就成了宏变换的一个标准动作单元。下一章「Vue Macros 的宏变换流水线」要做的，就是把这样的动作单元串成一条可插拔的流水线。
+下一章「Vue Macros 的宏变换流水线」会看到，每个特性宏都被做成了「AST visitor 命中节点 + 对 magic-string 实例做 overwrite/appendLeft」的标准化动作单元——本章建立的这套 offset 账本范式，正是那条流水线上每个变换器都遵循的共同动作。

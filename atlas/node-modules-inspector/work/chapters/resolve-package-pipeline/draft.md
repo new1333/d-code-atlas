@@ -1,243 +1,97 @@
 # resolvePackage：把磁盘包变可读节点
 
-## 起点：刚物化完的节点是个干骨架
+> 本章属于 composite 层。前置：包管理器策略、依赖图物化、静态推断模块类型、安装体积测算、package.json 字段规范化。
+> 学完你能用一句话讲清：为什么这条流水线选择"同一对象渐进喂字段"而不是"每道工序新建一份"，以及换来什么、付出什么。
 
-想象你刚把一个项目的依赖图跑通：你拿到了 lodash@4.17.21、express@4.18.2、react@18.3.1 ……几万个节点，每个节点都知道自己叫啥、版本号、磁盘在哪儿、依赖谁、被谁依赖。这套字段可以拿来做依赖树画图、做依赖闭包查询，已经够好用了。
+## 1. 为什么需要它
 
-但只要你想在前端给用户多展示一点点东西——「这包是 CommonJS 还是 ESM？」「作者是谁？」「仓库地址给个链接」「安装体积多大」「协议是 MIT 还是 GPL」——你就会发现眼前这个节点啥都答不上来。
+上一章我们写完了 `normalizePkgAuthors`、`normalizePkgRepository` 这一组归一化函数——它们各自能从一份 `package.json` 里抽出干净整齐的作者/仓库/协议/赞助。但归一化函数本身只是被动的："你给我 JSON，我给你结果"。没有人主动调它们。
 
-干骨架缺的是给**人**看的富信息。
+更关键的是，前面几章走完后，依赖图长这样：每个节点只有 `name`、`version`、`spec`、`filepath`、`dependencies` 这套骨架字段（外加第 3 章物化阶段补上的 `flatDependencies`/`depth`/`shallowestDependent` 这套闭包字段）。一个节点拿在手里，你只知道它叫 lodash 4.17.21、住在磁盘哪个目录、依赖谁——但它到底是 cjs 还是 esm？谁写的？多大？什么协议？有没有官方仓库链接？一无所知。前端拿到这种节点什么都展示不出来。
 
-富信息不会从天上掉下来——它在磁盘上每个包目录里的 `package.json` 里躺着。把这块从磁盘里捞出来、规整成统一形态，再挂回到原来那个骨架上——这就是 `resolvePackage` 这道工序干的活。
+需要一个工序把这些"给人看的信息"从磁盘上的 `package.json` 里抽出来、规整成统一形态，挂回到同一个节点对象上。这就是 `resolvePackage` 干的事。
 
-注意「挂回」这两个字。本章最大的设计选择就在这里：**不重建对象，直接在原对象上贴字段**。
+这件事听起来不难：读个 JSON、调一组函数、挂结果，写完不就完了？难就难在量大、且不能重建对象。一个大型 monorepo 的依赖图动辄几万个节点，每个节点都已经被前端 reactive 系统引用着（地图上每个色块都指着它）。如果你每解析一个就 new 一个新对象返回，整个图都要重渲一遍。所以这条流水线做了一个看似奇怪的决定：**永远不返回新对象，所有字段直接 mutate 到入参上**。
 
-## 类型分三层：身份、闭包、富信息
+## 2. 核心思想
 
-你已经拿到一个有骨架+闭包字段的节点，下一步要给它长出富信息。但这个「长出」不是凭空发生——节点对象从无到有走了三道工序，每道工序加一类字段。类型上对应三层 extends：
+把整条流水线想成一条传送带：节点从一头进来，沿途经过几个工位，每个工位给它加一点东西，但节点本身（那个对象引用）从头到尾没换过。前几章的工位给它身份字段和依赖闭包；本章这个工位给它富信息（也就是 `resolved` 子对象）；后续章节的工位（npm 元信息拉取、publint 检查）会再往 `resolved` 里补字段。
 
-```ts
-// 第一层：身份。这是「谁」
-interface PackageNodeRaw {
-  name: string
-  version: string
-  spec: string          // 形如 lodash@4.17.21
-  filepath: string      // 磁盘绝对路径
-}
+**同一对象，渐进喂字段**——这条原则贯穿全章。调用方拿到的永远是同一个对象引用，可以放心塞进 Map、塞进 reactive state。"这个字段还没有"是用类型层的 `?:` 和运行时的 `undefined` 共同表达的，节点一直在那里，只是有些字段还在路上。
 
-// 第二层：闭包。这是「依赖关系」
-interface PackageNodeBase extends PackageNodeRaw {
-  dependencies: Set<PackageNodeBase>     // 我直接依赖谁
-  flatDependencies: Set<PackageNodeBase> // 我的全部子孙（递归）
-  dependents: Set<PackageNodeBase>       // 谁直接依赖我
-  flatDependents: Set<PackageNodeBase>   // 我的全部祖先
-  depth: number
-}
+## 3. 心智模型
 
-// 第三层：富信息。这是「给展示用的」
-interface PackageNode extends PackageNodeBase {
-  resolved: {
-    module: 'cjs' | 'esm' | 'dual' | 'faux' | 'dts' | 'unknown'
-    packageJson: object
-    installSize?: { bytes: number; categories: Record<string, number> }
-    authors?: Author[]
-    repository?: { url: string }
-    license?: string
-    fundings?: { url: string; type?: string }[]
-    // 下面这三个字段本章不填，留给后续阶段
-    npmMeta?: NpmMeta
-    npmMetaLatest?: NpmMetaLatest
-    publint?: PublintMessage[]
-  }
-}
-```
+整个流水线对一个节点干 7 件事：
 
-说人话就是：身份层只够回答「这是谁」；闭包层多了「依赖关系」；只有富信息层出现 `resolved`——里面才装着前端要展示的东西。
+1. **进来一个"骨架+闭包层"节点**：身份字段、依赖闭包字段都在，磁盘路径 `filepath` 也已知，但 `resolved` 字段还不存在。
+2. **幂等守门**：检查 `resolved` 是不是已经有值——有就直接返回。这一行让"storage 层失效后重跑"完全安全。
+3. **双重断言升格类型**：把入参的类型从 `PackageNodeBase` 升格成 `PackageNode`，相当于向编译器打一张欠条："我承诺在 return 之前会把 `resolved` 填上"。
+4. **定位文件**：拼 `join(filepath, 'package.json')`。
+5. **文件不存在 → 静默降级**：清空 `filepath`、`resolved` 设成 `{ module: 'unknown', packageJson: {} }`。这层兜底专为 optional dependencies 没装上的场景准备。
+6. **文件存在 → 解析**：剥 BOM → `JSON.parse` → 跑一组分析函数（模块类型推断、白名单字段裁剪、目录递归测体积、4 个 normalize 函数）。
+7. **挂回 `resolved`**：把全部产物一次性挂到 `_pkg.resolved` 上，return 那个"已经被改了"的入参。
 
-注意 `resolved` 上面那一堆可选字段（`installSize?`、`npmMeta?`、`publint?`）——这是「按需慢慢挂」的留口。本章只负责填前面 7 个，后面那 3 个留给后续阶段（npm registry 拉取、publint 检查）补。
+这套流程的不变量是：**对象引用从头到尾不变**。幂等性、副作用、类型演化都围绕这个不变量展开。
 
-类型上分三层有个直接好处：下游函数可以按需 narrow。做依赖图遍历的代码，参数声明成 `PackageNodeBase` 就行——它根本不需要知道 `resolved` 存不存在；只有做展示的代码才声明成 `PackageNode`。类型即文档。
+类型上，节点经过三道工序，每道工序对应一层 interface：
 
-代价是？代价是每道工序都得告诉编译器「我下一步要给这对象升格」，下一节就看到这点。
+- `PackageNodeRaw`：身份层——名字、版本、磁盘路径、直接依赖
+- `PackageNodeBase extends Raw`：闭包层——加上 `flatDependencies`/`depth` 等依赖图闭包字段
+- `PackageNode extends Base`：富信息层——加上非可选的 `resolved` 子对象
 
-## resolvePackage 干的事
+本章做的就是 `Base → Node` 的跨越。
 
-先把骨架函数放出来，再逐句解释：
+## 4. 关键权衡
 
-```ts
-async function resolvePackage(
-  pkg: PackageNodeBase,
-): Promise<PackageNode> {
-  // 第 1 步：把类型从 Base 升格到 Node——打欠条
-  const _pkg = pkg as unknown as PackageNode
+### mutate 入参而不是新建对象
 
-  // 第 2 步：幂等守门
-  if (_pkg.resolved) return _pkg
+这条流水线最显眼的决定：函数签名声明返回 `PackageNode`，但函数体从来不 `return { ...pkg, resolved: ... }`——它直接 `_pkg.resolved = {...}`，最后 `return _pkg`（就是入参本身）。
 
-  // 第 3 步：定位 package.json
-  const path = join(pkg.filepath, 'package.json')
+换来的是**零拷贝**。对一个几万节点的依赖图，这意味着内存峰值不会因为这道工序翻倍；前端 reactive 系统对节点的引用全部保持有效，不会因为 resolve 触发整树重渲。这是这个工具能撑住大型 monorepo 的根本原因之一。
 
-  // 第 4 步：文件不存在 → 静默降级
-  if (!existsSync(path)) {
-    _pkg.filepath = ''
-    _pkg.resolved = { module: 'unknown', packageJson: {} }
-    return _pkg
-  }
+代价是**调用方必须接受副作用契约**：同一个对象在流水线不同阶段字段会变——今天你拿到时还是骨架，明天同一引用上就长出了 `resolved`。这种"承诺稍后填齐"的暂时性类型不一致，类型系统没法精确描述，只能用双重断言绕过结构检查（见下一条权衡）。
 
-  // 第 5 步：读文件，剥 BOM，解析 JSON
-  const content = await readFile(path, 'utf-8')
-  const json = JSON.parse(stripBomTag(content))
+背后化解的本质矛盾是：富信息获取代价高（多次 fs I/O + 多种归一化），但调用方又需要一个稳定的对象引用以便塞进 Map / reactive state。这两个需求在"返回新对象"的常规写法里没法同时满足。本章选了"先在前置工序建好骨架对象（稳定引用），再在本章把富信息喂上去（高代价获取）"这条路。任何"渐进富化 + 稳定身份"的场景（ORM 实体懒加载、Vue reactive 字段补充、IDE LSP 增量补全）都会撞到同一个矛盾、做出同样的取舍。
 
-  // 第 6 步：算 7 个字段，全部挂到 resolved
-  _pkg.resolved = {
-    module:      analyzeModuleType(json),
-    packageJson: pickAllowedKeys(json),
-    installSize: await measureInstallSize(_pkg),
-    authors:     parseAuthors(json),
-    repository:  parseRepository(json),
-    license:     parseLicense(json),
-    fundings:    parseFundings(json),
-  }
+### 类型按工序分三层 extends
 
-  return _pkg
-}
-```
+类型设计上，节点演化被切成三层 `interface extends`：身份层、闭包层、富信息层。每层只关心本工序的字段，下游函数按需 narrow——骨架阶段不会误读到富信息字段、富信息阶段也不会缺骨架。
 
-### 双重断言：把 Base 升格成 Node 的「欠条」
+换来的是**每道工序有清晰类型边界**：函数签名精确表达"我接受什么、我返回什么"，工具提示精确，类型即文档。
 
-函数签名收的是 `PackageNodeBase`，返回的是 `PackageNode`。中间的类型转换不能靠 `as PackageNode`——TS 会拒绝，因为 `PackageNode` 的 `resolved` 字段是必填的，而 `Base` 上根本没有。所以走的是 `as unknown as PackageNode` 这条更暴力的通道：先把类型擦到 `unknown`，再断言成目标。
+代价是**流水线节点函数必须用双重断言先把自己升格成最终类型**：入参声明为 `PackageNodeBase`，函数内立刻 `const _pkg = pkg as unknown as PackageNode`。这本质上是向编译器打欠条——"我承诺在 return 前填齐 `resolved`，但填齐之前的中间代码里访问 `_pkg.resolved.xxx` 你必须放行"。这张欠条靠运行时字段填充逻辑保证正确，TS 不再帮你查。如果哪天有人重写函数、忘了填 `resolved` 就 return，TS 不会报错，bug 会延后到运行时才暴露。
 
-这条 `as unknown as` 在告诉编译器：「我承诺在返回之前，一定会把 `resolved` 字段填好。」所以叫**打欠条**。
+背后化解的本质矛盾是：你想用类型精确描述"对象的字段集会随时间扩大"，但 TS 的类型系统是结构化的、静态的，没法表达"同一个对象在 t0 和 t1 类型不同"。三层 extends + 双重断言是个折中：用 extends 描述"工序之间的类型差异"，用断言跨过"同一对象在函数前后类型不同"这道结构检查的坎。这是所有"类型演化 + 同一对象"场景（Builder 模式的链式 builder、状态机迁移）的共同痛点。
 
-欠条好不好兑现，TS 不再检查——全靠你函数体里自己保证。如果你写了 `_pkg.resolved = {...}` 之后再访问 `_pkg.resolved.module`，没事；但如果你不小心在赋值之前先访问了 `_pkg.resolved.foo`，运行时崩，TS 静默放行。这是 mutate + 类型演化这套设计的内生代价——编译器放手，运行时兜底。
+### 并发在包之间、串行在包内
 
-### 幂等守门：同一个包可以重复 resolve
+外层 `listPackageDependencies` 用 `pLimit(10)` 同时跑 10 个 `resolvePackage`；单个包内的 7 个字段挂载却是顺序的（没用 `Promise.all`，尽管只有 `installSize` 一步是 async）。
 
-第一行 `if (_pkg.resolved) return _pkg`。意思很直白：如果这个包之前已经被 resolve 过（`resolved` 已挂），直接返回，不重复读磁盘。
+换来的是**对文件系统 I/O 的合理扇出**：体积测算要递归遍历目录，是真正的 fs I/O；10 个目录并发刚好能压满磁盘吞吐而不爆事件循环。而单个包内其余 6 步都是微秒级同步操作（`JSON.parse` 完直接调函数），`Promise.all` 反而引入微任务调度开销。
 
-这在生产里很重要。`node_modules` 里同一个对象会被 storage 层缓存、可能被多次重新触发解析、可能在「先 list 再补 npmMeta」的多阶段流水线里来回穿过。幂等守门让流水线对重复调用是安全的——成本只有一次属性读取。
+代价是**单个包的总耗时 = 串行 N 步之和**，且整个流水线的吞吐瓶颈永远是 fs I/O 而不是 CPU——如果以后 CPU 步骤变多（比如加新的归一化函数），不会显著变慢；但如果 fs 变慢（比如 webcontainer 里的虚拟 fs），整体会跟着慢。
 
-幂等隐含了一个契约：你不能绕过守门然后重新调。比如有人手贱在已经 resolve 过的对象上把 `_pkg.resolved = undefined` 删掉再调一次，函数会重新读磁盘；如果 `_pkg.filepath` 之前被静默降级清空过，再调一次 `join('', 'package.json')` 会拼成相对路径 `package.json`，去读 cwd 下的同名文件——这是未定义行为。**幂等是契约的一部分**，别绕过它。
+背后化解的本质矛盾是：fs I/O 是异步的、要并发扇出才能压满吞吐；CPU 归一化是同步的、并发反而引入调度开销。两者节奏完全不同。把扇出边界划在"包"这一层（fs I/O 的天然单位）既能让 I/O 并发，又避免 CPU 步骤的微任务调度浪费。任何"异步重 I/O + 同步轻 CPU"混合的流水线（编译器多文件并行解析、ORM 多实体并行 hydrate）都适用这个划界思路。
 
-### 静默降级：optional 包没装上不抛错
+### 文件缺失走静默降级而不是抛错
 
-optional dependencies 是 npm/pnpm 里的一种「装不上就算了」的依赖——典型的比如平台专用的 native 包（fsevents on macOS、某 windows-something on win）。这些包在 Linux 上不会装，磁盘上根本没目录，但仍然会出现在依赖图里。
+optional dependencies 没装上时，磁盘上根本没有这个包的目录——`existsSync(filepath)` 返回 false。此时不抛错、不退场，而是清空 `filepath`、模块类型标 `'unknown'`、`packageJson` 设空对象，让节点继续在图里存在。
 
-如果遇到这种情况直接 `throw new Error(...)`，整个流水线就废了——本来该装上的都装了，就因为一个 optional 没装上，整个分析退场，太脆。
+换来的是**对 optional/缺失包的容错**：依赖图保持完整、调用方不需要 try/catch、前端可以正常显示"这个 optional 没装"。
 
-所以代码走的是不抛、不退场的分支：
+代价是**下游必须显式处理 `'unknown'` 这个状态分支**（筛选、统计、分类都要单独考虑这种情况），并且 `filepath === ''` 这个哨兵值需要全栈感知——任何用 `filepath` 拼路径的代码都得先判空字符串。
+
+背后化解的本质矛盾是：optional dependencies 在"声明层"是依赖图的一部分（要显示在图里），但在"安装层"可能根本不存在（没装就没目录）。走抛错的话，调用方要为"没装"这种正常情况写一堆 try/catch；走跳过的话，依赖图就缺了节点、断了拓扑。静默降级让节点"在但残缺"——既保留拓扑完整性，又用 `'unknown'` 这个显式状态标记残缺，把"如何处理残缺节点"的决定权交给下游。任何"声明与实现可能脱节"的场景（懒加载失败、可选插件未启用）都适用这个"占位 + 显式 unknown"的解法。
+
+## 5. 最小原理演示
+
+下面这段 40 来行的脚本只演核心思想——同一对象渐进喂字段、双重断言打欠条、幂等守门、静默降级、外层并发。真实的 7 个归一化函数用 provider stub 代替，文件读取抽象成可注入的回调，避免演示依赖真实磁盘。把这段粘到 `bun run` 或 `tsx` 里能直接跑出文末那两行注释。
 
 ```ts
-if (!existsSync(path)) {
-  _pkg.filepath = ''
-  _pkg.resolved = { module: 'unknown', packageJson: {} }
-  return _pkg
-}
-```
-
-代价是下游必须显式处理 `'unknown'` 这个状态分支：模块类型筛选、目录计算、展示，都要为 `'unknown'` 留一个独立分支。`filepath` 被清空成空字符串也是一个全栈都要感知的哨兵值——「这个节点磁盘上没有，是幽灵」。
-
-### 7 个字段挂载，其中 1 个是异步
-
-文件读到、JSON 解析完，下一步就是把这 7 个字段塞到 `_pkg.resolved`：
-
-| 字段 | 怎么算 | 是否异步 |
-|------|--------|----------|
-| `module` | 看 `exports`/`module`/`type` 等字段推断 | 同步纯函数 |
-| `packageJson` | 白名单裁剪约 25 个允许字段 | 同步 |
-| `installSize` | 递归遍历目录按后缀分类累加字节 | **异步（fs I/O）** |
-| `authors` | 解析 `author`/`authors` 字段 | 同步 |
-| `repository` | 解析 `repository` 字段 | 同步 |
-| `license` | 解析 `license` 字段 | 同步 |
-| `fundings` | 解析 `funding`/`fundings` 字段 | 同步 |
-
-注意这 7 步在代码里是**顺序执行**的，没 `Promise.all`。直觉上「7 步互不依赖，应该并行」——但实际不需要：6 步是纯同步操作，微秒级；唯一异步的是 `installSize`，那个真要扫目录，会做 fs I/O。把它们 `Promise.all` 起来反而引入 microtask 调度开销，得不偿失。
-
-真正的并发应该发生在**包与包之间**——见下一节。
-
-## 外层并发，内层串行
-
-光看单个 `resolvePackage` 不够，还要看它在 orchestrator 里怎么被批量调用：
-
-```ts
-async function listPackageDependencies(options) {
-  const pm = await getPackageManager(options)
-  // ↓ 又一处「先转后填」的欠条
-  const result = await listPackageDependenciesRaw(pm, options)
-    as ListPackageDependenciesResult
-
-  const limit = pLimit(10)
-  await Promise.all(
-    Array.from(result.packages.values())
-      .map(pkg => limit(() => resolvePackage(pkg)))
-  )
-  return result
-}
-```
-
-`pLimit(10)` 是个并发限流器——最多 10 个 `resolvePackage` 同时在跑。10 是个经验值，刚好压满磁盘 I/O 而不爆事件循环。
-
-注意这里又出现一处 `as ListPackageDependenciesResult` 的强转——它发生在 `await Promise.all` **之前**。在那一刻，`result` 里每个 Map 值的实际类型还是 `PackageNodeBase`（只有骨架+闭包字段），但代码已经把它当 `PackageNode` 用了。
-
-这种「先转后填」的写法是 mutate 哲学的直接体现：类型表达的是「这一刻我想象它已经是的样子」，运行时再去兑现。兑现的动作就是下一行的 `Promise.all(...resolvePackage...)`——跑完之后，每个值都真的有 `resolved` 字段了。
-
-## 关键权衡（本章核心）
-
-这一节是本章最该读的地方。前面所有机制都是为这几条权衡服务的。
-
-### 权衡 1（核心）：mutate 而非重建，换零拷贝
-
-**做了什么**：直接在传入的 `PackageNodeBase` 对象上挂 `resolved` 字段，返回同一引用。不新建对象、不复制原对象。
-
-**换来什么**：对几万节点的依赖图来说，零拷贝意味着内存峰值不翻倍。前端用 Vue/Pinia 这种 reactive 系统时，对象引用稳定意味着不会因为 resolve 触发整树重渲——幂等守门 + 同一引用 = 重复调用一次啥都不发生。
-
-**代价**：调用方必须接受「同一对象在不同阶段字段会变」这个事实。今天拿到的是骨架，明天再读发现 `resolved` 长出来了。更要命的是，为了在 TS 里描述这种「承诺稍后填齐」的暂时性不一致，函数必须用 `as unknown as PackageNode` 这条暴力通道，编译器对中间代码不再做检查——欠条要你自己兑现。
-
-### 权衡 2：类型分三层，换每道工序的清晰边界
-
-**做了什么**：`PackageNodeRaw`（身份）→ `PackageNodeBase extends Raw`（+ 闭包）→ `PackageNode extends Base`（+ `resolved`），三层各自对应一道工序。
-
-**换来什么**：每道工序的输入输出类型边界清晰。依赖图遍历的代码声明参数为 `PackageNodeBase`，展示代码声明为 `PackageNode`，工具提示精确。下游函数一眼能看出「这函数需要 resolve 完才能调」。类型即文档。
-
-**代价**：流水线节点函数必须用双重断言（`as unknown as`）先把自己升格成最终类型，本质上是在向编译器「打欠条」——欠条的正确性由运行时的字段填充逻辑保证，TS 不再帮你查。
-
-### 权衡 3：外层并发 10、内层串行，换 fs I/O 的合理扇出
-
-**做了什么**：`pLimit(10)` 在 orchestrator 层限流，单个 `resolvePackage` 内部 7 步顺序跑。
-
-**换来什么**：把宝贵的并发额度花在真正的瓶颈（fs I/O 的目录递归）上，而不是浪费在微秒级的同步操作上。10 个目录同时递归刚好压满磁盘而不爆事件循环——再高就会让其他 RPC 请求等不到 CPU。
-
-**代价**：单个包的总耗时 = 7 步之和（其中 6 步微秒级，1 步是 fs I/O）。整体流水线的吞吐瓶颈永远是 fs I/O，不是 CPU——这意味着 SSD vs HDD 的差距在这套设计上会被放大。
-
-### 权衡 4：静默降级而非抛错，换 optional 包的容错
-
-**做了什么**：optional 依赖没装上时，不抛、不退场，把 `filepath` 清空、`module` 标 `'unknown'`、`packageJson` 设空对象。
-
-**换来什么**：流水线对 optional / 缺失包完全容错。一个 macOS 专用包在 Linux 项目里被列为 optional，没装上，依赖图照样跑得通——前端会看到一个 module 为 `'unknown'` 的幽灵节点，用户可以选择忽略或筛选掉。
-
-**代价**：下游必须显式处理 `'unknown'` 这个状态分支。模块类型筛选、目录计算、UI 展示，都要为它留分支。`filepath = ''` 这个哨兵值也要全栈感知——任何用 `filepath` 去做 fs 操作的代码都得先判空。
-
-## 原理演示：跑通整个流程
-
-下面这段是一个能直接用 `bun run demo.ts` 或 `npx tsx demo.ts` 跑起来的最小骨架。它故意把所有「真实」的东西（7 个字段解析函数、目录递归、BOM 处理）都换成占位实现——目的是让你看清**类型演化、双重断言、mutate、幂等、静默降级**这套机制，而不是被具体业务逻辑分心。
-
-```ts
-// demo.ts —— resolvePackage 流水线最小骨架
-// 跑法：bun run demo.ts  或  npx tsx demo.ts
-
-// ─── 类型分层：身份 → 闭包 → 富信息 ──────────────
-interface PackageNodeRaw {
-  name: string
-  version: string
-  filepath: string
-}
-
-interface PackageNodeBase extends PackageNodeRaw {
-  dependencies: Set<PackageNodeBase>
-  depth: number
-}
-
-interface PackageNode extends PackageNodeBase {
+// 类型按工序分三层 extends：身份层 → 闭包层 → 富信息层
+interface NodeRaw { name: string; version: string; filepath: string; dependencies: Set<string> }
+interface NodeBase extends NodeRaw { depth: number }
+interface NodeFinal extends NodeBase {
   resolved: {
     module: 'cjs' | 'esm' | 'unknown'
     packageJson: Record<string, unknown>
@@ -245,93 +99,113 @@ interface PackageNode extends PackageNodeBase {
   }
 }
 
-// ─── 假装做字段解析的 stub（真实代码里是 analyzeModuleType 等） ──
-function fakeAnalyzeModuleType(_json: Record<string, unknown>) {
-  return Math.random() > 0.5 ? 'esm' as const : 'cjs' as const
-}
-function fakeMeasureSize(_path: string) {
-  return Promise.resolve(Math.floor(Math.random() * 100000))
-}
+// 真实环境里这一步是 readFile + JSON.parse + 7 个归一化函数。演示里用 provider stub 代替
+type ResolveFn = (filepath: string) =>
+  Promise<{ module: 'cjs' | 'esm'; packageJson: Record<string, unknown>; installSize: number } | null>
 
-// ─── 核心工序：把 Base 升格为 Node ───────────────
-async function resolvePackage(pkg: PackageNodeBase): Promise<PackageNode> {
-  // 双重断言：先承诺「我会填好 resolved」
-  const _pkg = pkg as unknown as PackageNode
+const stubResolve: ResolveFn = async (filepath) =>
+  filepath
+    ? { module: 'esm', packageJson: { name: 'lodash' }, installSize: 42 }
+    : null
 
-  // 幂等守门
-  if (_pkg.resolved) return _pkg
+// 本章主角：把骨架+闭包节点升格为富信息节点，永远 mutate 入参
+async function resolvePackage(pkg: NodeBase, resolve: ResolveFn = stubResolve): Promise<NodeFinal> {
+  // 双重断言：把 Base 升格为 Final，承诺在 return 前填好 resolved
+  const _pkg = pkg as unknown as NodeFinal
 
-  // 静默降级：filepath 空就走幽灵分支
-  if (!pkg.filepath) {
+  if (_pkg.resolved) return _pkg // 幂等守门：已 resolve 过就直接返回
+
+  const result = await resolve(pkg.filepath)
+  if (result) {
+    _pkg.resolved = result // 同一对象被喂字段；不返回新对象
+  }
+  else {
+    _pkg.filepath = '' // 静默降级：清空磁盘路径作哨兵
     _pkg.resolved = { module: 'unknown', packageJson: {} }
-    return _pkg
   }
-
-  // 正常分支：模拟读 + 解析 + 挂字段
-  const json = { name: pkg.name, type: 'module', author: 'someone' }
-  _pkg.resolved = {
-    module: fakeAnalyzeModuleType(json),
-    packageJson: json,
-    installSize: await fakeMeasureSize(pkg.filepath),
-  }
-  return _pkg
+  return _pkg // 返回的就是入参本身
 }
 
-// ─── orchestrator：外层并发（这里用 Promise.all 简化） ──
-async function resolveAll(pkgs: PackageNodeBase[]) {
-  await Promise.all(pkgs.map(p => resolvePackage(p)))
+// 外层 orchestrator 的并发限流器简化版（真实代码用 p-limit 库）
+function pLimit(n: number) {
+  let active = 0
+  const queue: (() => void)[] = []
+  return <T>(fn: () => Promise<T>) => new Promise<T>((res, rej) => {
+    const run = () => {
+      active++
+      fn().then(res, rej).finally(() => { active--; queue.shift()?.() })
+    }
+    if (active < n) run()
+    else queue.push(run)
+  })
 }
 
-// ─── 跑一下，看 mutate 的效果 ─────────────────
-async function main() {
-  const before: PackageNodeBase = {
-    name: 'lodash',
-    version: '4.17.21',
-    filepath: '/abs/node_modules/lodash',
-    dependencies: new Set(),
-    depth: 1,
-  }
-  const refBefore = before
-
-  await resolvePackage(before)
-
-  console.log('after resolve, before.resolved =', before.resolved)
-  console.log('Object.is(before, refBefore) =', Object.is(before, refBefore))   // true
-  console.log('Object.is(before, await resolvePackage(before)) =',
-    Object.is(before, await resolvePackage(before)))                            // true（幂等）
-
-  // 静默降级：filepath 为空
-  const ghost: PackageNodeBase = {
-    name: 'fsevents',
-    version: '2.3.0',
-    filepath: '',
-    dependencies: new Set(),
-    depth: 2,
-  }
-  await resolvePackage(ghost)
-  console.log('ghost.module =', ghost.resolved.module)                          // 'unknown'
-
-  // 顺便跑一下批量
-  await resolveAll([before, ghost])
+async function resolveAll(packages: NodeBase[]) {
+  const limit = pLimit(10)
+  return Promise.all(packages.map(p => limit(() => resolvePackage(p))))
 }
 
-main()
+// 演示 mutate 契约
+const node: NodeBase = {
+  name: 'lodash',
+  version: '4.17.21',
+  filepath: '/nm/lodash',
+  dependencies: new Set(),
+  depth: 0,
+}
+const same = await resolvePackage(node)
+console.log(Object.is(node, same), node.resolved.module)
+// true 'esm' —— 同一对象，被喂了字段
+
+// 演示静默降级分支
+const missing: NodeBase = {
+  name: 'opt',
+  version: '1.0.0',
+  filepath: '',
+  dependencies: new Set(),
+  depth: 1,
+}
+const degraded = await resolvePackage(missing)
+console.log(degraded.resolved.module, degraded.filepath)
+// 'unknown' '' —— 节点残缺但还在图里
 ```
 
-跑完你会看到三件事，每一件都对应本章一个原理点：
+`Object.is(node, same) === true` 是 mutate 契约最直接的证据：返回的不是新对象，是入参本身。`before.resolved` 跟着 `after.resolved` 一起出现，纯粹是因为它们是同一个对象。
 
-1. `Object.is(before, refBefore) === true` —— 返回的是同一引用，没新建对象。这就是 mutate 契约最直接的证据。
-2. 第二次调 `resolvePackage(before)`，函数体第一行就 return，不重读磁盘——幂等守门在工作。
-3. `ghost.resolved.module === 'unknown'` —— 文件不存在分支走的是静默降级，不抛错。
+## 6. 执行轨迹
 
-如果你想感受 mutate 的力量，把 `await resolvePackage(before)` 改成 `const after = await resolvePackage(before); console.log(Object.is(before, after))`——结果还是 `true`。这正是整套工具能扛几万节点不爆内存的关键。
+把 lodash 这个具体节点送进 `resolvePackage`，看它内部状态怎么一步步变。
 
-## 收束：mutate 是流水线的底色
+**进入前**：节点是 `{ name: 'lodash', version: '4.17.21', filepath: '/abs/node_modules/lodash', dependencies: Set(), depth: 0 }`，`resolved` 字段不存在。
 
-整个章节其实只讲了一件事：**对象不重建，按工序渐进挂字段**。
+**幂等检查**：读到 `_pkg.resolved` 是 undefined，不返回，继续往下走。
 
-这一句话撑起了所有机制：类型为什么要分三层（每道工序对应一层）、为什么要双重断言（描述「承诺稍后填齐」的暂时性不一致）、为什么要幂等守门（mutate 不能重复执行有副作用的步骤）、为什么要静默降级（mutate 不能让一个失败拖垮全图）、为什么外层并发内层串行（mutate 的瓶颈是 fs I/O 不是 CPU）。
+**双重断言**：运行时无操作，只是让 TS 放行后续对 `_pkg.resolved.xxx` 的访问。`_pkg` 和 `pkg` 指向内存里同一个对象。
 
-`resolved` 上的字段是「部分填充」——本章填 7 个，后面还有 npm registry 拉取填 3 个。渐进挂载、部分填充——这就是把 mutate 哲学推到底后的自然产物。
+**路径拼接 + 存在性检查**：`join('/abs/node_modules/lodash', 'package.json')` 得到 `/abs/node_modules/lodash/package.json`，`existsSync` 返回 true。
 
-理解了这套机制，再看下游的过滤器、action 算法、可视化，你会发现一件有趣的事：**所有下游消费者拿到的都是同一个对象引用**，只不过在不同的执行阶段，对象上的字段数量不一样。这种「字段会随时间生长」的对象，是这套工具全栈能跑得动的隐含契约。
+**读取并解析**：`readFile` 拿到字符串，`stripBomTag` 检查首字符不是 BOM 原样返回，`JSON.parse` 得到 `{ name: 'lodash', main: 'lodash.js', license: 'MIT', ... }`。
+
+**字段挂载**：一次性给 `_pkg.resolved` 赋值 7 个字段——
+
+- `module: 'cjs'`（lodash 4 实际是 cjs）
+- `packageJson: { name, main, license, ... }`（白名单裁剪后的 25 字段子集）
+- `installSize: { bytes: 1_200_000, categories: {...} }`（递归遍历得到的，这一步唯一 await 的）
+- `authors: [{ name: 'John-David Dalton', github: 'jdalton' }]`
+- `repository: { type: 'git', url: 'https://github.com/lodash/lodash.git', github: 'lodash/lodash' }`
+- `license: 'MIT'`
+- `fundings: []`
+
+**返回**：`return _pkg`，还是原来那个 lodash 节点对象。
+
+**进入后**：调用方手里那个 `before` 变量现在多了一个 `resolved` 字段。因为它和 `after` 是同一个对象，`before.resolved.module` 也是 `'cjs'`。这就是 mutate 契约的全部效果：调用方什么都没做，节点自己"长好了"。
+
+## 7. 教学简化说明
+
+本章演示故意省略了：7 个归一化函数的内部实现（各自有专门章节）；BOM 处理的具体逻辑（一句"检查首字符是不是 0xFEFF"够了）；npm registry 元信息和 publint 报告——它们也挂在 `resolved` 上，但由后续阶段填充，不在本章流水线内；`@keep-sorted` / `@keep-unique` 这些 lint 宏的工作机制；真实 fs 目录递归（用 provider stub 代替）。
+
+## 8. 小结
+
+这一章自己几乎不"造"东西——它把前面五章的产物（依赖图骨架、模块类型推断、体积测算、字段归一化）用一条流水线串了起来。真正属于本章的只有两个决定：永远 mutate 同一个对象、类型按工序分三层 extends。前者换来零拷贝与稳定引用，后者换来类型边界清晰，代价是调用方要接受"同对象字段会变"的副作用契约、编译器要被双重断言放行。
+
+下一章会把这些富信息节点交给前端：把它们塞进一个声明式的筛选 schema，按字段组合出 `license:MIT and not author:foo` 这样的查询。

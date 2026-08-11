@@ -1,285 +1,196 @@
 # 文件路由：类型生成与构建期集成
 
-你刚在 `pages/users/[id].vue` 里写好一个用户详情页。你希望接下来发生几件事：敲 `router.push({ name: '...' })` 时编辑器能自动补全路由名，写 `params` 时能检查字段对不对，改了这个文件不用整页刷新——最好连 dev server 都不用重启。
+> 本章属于 system 层。前置：「文件路由：约定与前缀树」「类型安全路由的编译期推导」「新一代路由解析器」。
+> 学完你能：讲清为什么文件路由要做成构建期三产物投影，并用一个虚拟模块当运行时与构建期之间的契约边界。
 
-但问题马上就来了：**路由表是从磁盘文件扫出来的、要等构建期才存在的数据**。你写代码的时候，编辑器看不见它；程序跑起来的时候，它才被组装出来。这就尴尬了——信息产生在构建期，类型检查发生在编码期，路由消费又发生在运行期，三个时间点完全错位。
+## 1. 为什么需要它（设计动机）
 
-如果不解决这个错位，用户要么手写一份和文件重复的路由声明（改一处得改两处），要么干脆放弃类型安全，外加每次改文件都手动重启。
+上一章讲了「新一代路由解析器」，把路由表「构建期固定、无运行时增删」，让 path/query/hash 三段在匹配层各自负责——但它留下的口子是：那张「构建期固定」的表，到底是哪一步生成的、从什么东西变出来的？本章接着这个口子讲。
 
-核心思想一句话：**把构建期扫出来的那棵路由树当成唯一事实源，一次性投影成三种产物——运行时能跑的路由数组、编辑器能查的类型表、（实验性的）固定匹配器——再用一个"虚拟模块"当作这三者进运行时的入口。** 同一棵树，三张面孔，不会互相打架。
+回到用户的真实场景：用户写完一个 `pages/users/[id].vue` 文件，期待三件事同时成立——`router.push({ name: '/users/:id', params: { id: 123 } })` 的参数能被编辑器检查；不需要再手写一份 routes 数组跟这个文件重复维护；改了文件不刷新页面、路由能直接热替换。
 
-打个比方：虚拟模块就像一个"不存在的文件"。你的代码里写 `import routes from 'vue-router/auto-routes'`，但磁盘上根本没有这个文件——它是打包器在加载阶段当场编出来的。而那棵路由树就是唯一的"真身"，三种产物都从它拓印下来。
+但这三件事分别发生在三个时间点：
 
-下面自底向上拆。
+- 编辑器检查发生在**编码期**（写代码时）；
+- 路由消费发生在**运行期**（用户访问页面时）；
+- 路由信息本身——磁盘上有哪些文件、文件名长什么样——是**构建期**才知道的数据。
 
-## 一、契约边界：那个不存在的文件
+三条时间线对不上：编辑器在写代码时看不到运行时才存在的路由表，运行时拿不到「文件系统扫描出来的那一刻」之外的状态。如果按传统做法，要么用户手写一份 routes 声明跟文件一一维护（双份维护、容易漂移），要么放弃类型安全。
 
-最底层的机制件，是**虚拟模块**。
+这个机制就是来解决这条错位的：用一个**虚拟模块**当作「构建期产物」的投递口，再额外生成一份磁盘上的**类型声明文件**，让同一棵路由树同时投递到运行时、编辑器和固定匹配器三个时间点。
 
-说人话就是：约定几个"假的模块名"，用户像 import 普通模块一样 import 它们，但这些模块磁盘上根本不存在——是打包器在加载阶段拦截、现场编出来的。
+## 2. 核心思想
 
-这里约定了两个（还有一个专门用来把 `<route>` 块 stub 掉）：
+**把从文件系统扫描出的那棵路由树当成唯一事实源；在构建期把它同时投影成「运行时路由数组」「编辑器类型表」「固定匹配器」三种产物；用一个虚拟模块当作三者与运行时之间的契约边界。**
 
-- `vue-router/auto-routes` → 当场生成运行时路由数组
-- `vue-router/auto-resolver` → 当场生成实验性固定匹配器
+一句话：一棵树、三次投影、三个时间点对齐。
 
-打包器处理它是两步走：`resolveId` 先把这个裸模块名认领下来（标记"这归我管"），`load` 再按具体是哪个名字，分发到不同的生成函数：
+## 3. 心智模型
 
-```
-import 'vue-router/auto-routes'
-        │
-        ▼
-  resolveId 认领 → 加上虚拟前缀 (\0)
-        │
-        ▼
-  load 按名字分发：
-        ├─ 'vue-router/auto-routes'   → 生成运行时路由数组
-        ├─ 'vue-router/auto-resolver' → 生成固定匹配器
-        └─ 路由块 id                  → 返回空对象（内容已消费，stub 掉）
-```
+数据流大概是这样：
 
-有两个细节特别能说明"为什么这么设计"：
+1. 文件系统被扫描成一棵带属性的路由树（前置「文件路由：约定与前缀树」已讲过）。
+2. 打包器加载阶段拦下一个约定的虚拟模块名，现场调用生成函数。
+3. 同一棵树被遍历若干次，分别投影出三份字符串：
+   - 运行时路由数组（嵌套 children 结构）
+   - 类型声明文件（扁平的路由名映射 + 文件→路由名映射 + 参数类型）
+   - 排好序的固定匹配表（扁平、按 score 排序的记录数组）
+4. 页面内的路由配置宏（`definePage()`）与 `<route>` 自定义块这两种「逃逸舱」，在树构建期被静态抽取出能影响拓扑的字面量；其运行时部分（如 meta）被变换成一个独立模块，在路由数组里与按约定生成的记录做深合并（多来源深合并机制见前置章）。
+5. 类型声明文件通过「模块增强」把路由名映射反向注入库的类型配置接口，库内部的条件类型由此自动从 `string` 收窄为精确字面量联合（注入点本身的设计见前置类型章，这里只看填充侧）。
+6. 文件一改动，监听器重写类型声明文件、让打包器重载那个虚拟模块；虚拟模块内部的热更新回调把新路由表热替换进当前路由器实例。
 
-1. **为什么是连字符 `auto-routes`，而不是更自然的斜杠 `auto/routes`？** 因为斜杠形式和 TypeScript 配合不好——TS 看到带斜杠的模块名会按真实路径去磁盘找，找不到就报错。连字符对 TS 来说只是一个普通的裸模块名，它会乖乖等打包器编内容。
-2. **TS 不认虚拟模块。** 你 `import` 一个磁盘上不存在的模块，TS 直接报"找不到模块"。所以光有虚拟模块还不够——还得额外生成一份**真实落在磁盘上的类型声明文件**（`typed-router.d.ts`）兜底，让 TS 能读到里面的类型。这个文件顶部特意标了 `@ts-nocheck`（它本身不需要被类型检查，它只是个产物），并提示用户把它提交进仓库、写进 tsconfig。
+关键的契约点是：那三个虚拟模块名（连字符形式 `vue-router/auto-routes`，不是斜杠 `auto/routes`——源码注释里明说斜杠在 TS 下解析不顺），是构建期与运行时之间的**伪模块**。打包器的 `resolveId` 把这个裸名映射成带虚拟前缀的 id，`load` 钩子按 id 分发到三个生成入口；TS 不认虚拟模块，所以又得额外生成一份磁盘上的 `.d.ts` 兜底。虚拟模块是给打包器看的，磁盘 dts 是给 TS 看的，两份文本同步从同一棵树投影出来。
 
-这就是第一层权衡（文末展开）。一句话：**用虚拟模块换来了"用户像 import 普通模块一样拿路由表"，代价是得绕两道弯——加前缀绕打包器，再生成实体 .d.ts 绕 TS。**
+## 4. 关键权衡
 
-## 二、单源多投影：一棵树，三张面孔
+### 单源多投影：用一棵树换三种产物的天然一致
 
-契约边界定好了，剩下的核心动作就一个：**遍历那棵树，投影出三种产物。**
+这个机制选择把那棵路由树当**唯一事实源**——只维护这一处，运行时数组、编辑器类型表、固定匹配器都从它投影出来。
 
-同一个 load 钩子被触发时，会根据虚拟模块名，对同一棵树跑不同的遍历函数：
+换来的是「三者天然永远一致、不会漂移」：用户改了文件名，三份产物都从下一次扫描里重新生成，不存在「routes 数组改了但类型表没改」这种双份维护漂移。
 
-```
-        构建期的路由树（唯一事实源）
-                    │
-        ┌───────────┼───────────┐
-        ▼           ▼           ▼
-     投影①       投影②       投影③
-   嵌套         扁平         扁平 + 排序
-  children    路由名表     匹配记录数组
-        │           │           │
-        ▼           ▼           ▼
-  运行时        类型声明     固定匹配器
-  路由数组       .d.ts        (实验)
-```
+代价是构建期要对同一棵树遍历多次、生成大量字符串代码，类型声明文件可能极大、拖慢编译。大路由表的类型膨胀与编译开销这个代价在前置类型章里已经讲透，本章直接复用。
 
-- 投影①（给运行时数组）：遍历树，产出**嵌套的 `children` 结构**，每条记录带 `path / name / component`，组件是 `() => import('...')` 懒加载。
-- 投影②（给类型声明）：遍历树，产出**扁平的路由名映射表**——每个路由名一条记录，记下它的完整路径和参数类型。
-- 投影③（给固定匹配器）：遍历树，产出**扁平且按优先级排好序**的匹配记录数组。
+本质矛盾是「**用户想要单一来源、但三个时间点各需要不同形状的数据**」——单源多投影是用构建期做这个形状转换，让用户感知不到三份产物的存在。
 
-三张面孔从同一棵树拓印，所以**永远一致、不会漂移**——你绝不会遇到"运行时认得这个路由、类型表里却没有"的鬼故事。
+### 虚拟模块当投递口：让构建产物像普通 import 一样被消费
 
-下面用一段极简 TS 演透投影①和投影②（投影③是第 15 章的主角，这里略过）：
+第二层选择是用**虚拟模块**（一个约定的伪模块名）当作路由表的投递口，而不是让用户手写 `routes` 数组、也不是生成一个实体 `.ts` 路由文件给用户维护。
+
+换来的是「用户像 import 普通模块一样拿到路由表」：享受 tree-shaking、类型推导、HMR，并且磁盘上不产生需要用户维护的中间文件——用户改完文件直接生效，没有「中间产物没同步」的中间状态。
+
+代价是必须处理虚拟模块在各类打包器/TS 下的解析差异。打包器那侧靠约定前缀（`\0` 之类）区分虚拟模块；TS 那侧不认虚拟模块，必须额外生成一份磁盘上的实体类型声明文件兜底，顶部带 `@ts-nocheck`，因为它是产物、自己不需要被类型检查。换句话说，运行时模块保住了纯净，但类型那一侧必须有磁盘兜底。
+
+本质矛盾是「**编辑器想要零中间文件、但 TS 必须吃磁盘文件**」——虚拟模块把这个矛盾在运行时和类型侧分别处理：运行时走虚拟模块，类型侧走磁盘 dts。
+
+### 配置宏的双面变换：拓扑属性前移，运行时属性后置
+
+第三层选择针对页面内路由配置宏（`definePage()`）：让它做**双面变换**。
+
+宏在源码里出现，但运行时组件不应残留——它是一个编译期宏，不是运行时函数。变换函数有两种模式，由模块 id 是否带 `?definePage` 查询串区分：
+
+- **静态抽取**：在树构建期，从宏的对象参数里读出 `name`/`path`/`alias`/`params` 这些**字面量**——能影响路由树拓扑与类型的属性，必须能在不引用组件作用域变量的前提下求值（非字面量就发诊断码降级）。这部分进路由树、参与类型推导。
+- **整体提取**：宏的整个对象参数被提取成一个独立的「路由配置模块」（`export default {...}`），保留对 import 的引用；运行时与按约定生成的记录做深合并。这一侧装的是 meta 等可引用组件内 import 的属性。
+
+换来的是「**决定树结构的属性在构建期就生效、能直接进入类型推导；而 meta 等可引用组件内变量的属性仍能在运行时合并**」。同一份配置被切到两个时间点：拓扑属性前移到构建期，运行时属性保留在运行时。
+
+代价是同一份配置要走两条代码路径，而且提取模式下必须禁止它引用组件 setup 作用域里的变量——跨模块提取后引用会断裂，需要专门的作用域校验。
+
+本质矛盾是「**用户想要在组件里就近写路由配置（包括 meta），但影响路由拓扑的属性又必须在构建期就有值**」——双面变换是把这个矛盾的字面量侧与运行时侧拆开处理。
+
+### 匹配器排序的构建期移植：换零运行时排序开销
+
+第四层选择来自前置「新一代路由解析器」章留下的口子：那张固定匹配器表，是在 codegen 阶段被排好序物化的。
+
+具体做法是把运行时匹配器那套 `compareScoreArray`/`compareRouteScore` 比较**移植**到 codegen——源码里直接注释标了「移植自 pathParserRanker」。在构建期就把可匹配记录按二维 score 排好，生成静态有序数组；相同 score 时再按路径深度兜底排序保证一致顺序。
+
+换来的是「生成的固定匹配器在运行时零排序开销、表是静态有序的」——这正是前置解析器章「构建期固定、无运行时增删」目标的最终落地。
+
+代价是同一套排序语义存在两份实现：运行时一份、codegen 一份。源码里多处 TODO/FIXME 也暗示作者意识到偏离风险。
+
+本质矛盾是「**运行时匹配器仍要支持动态 `addRoute`，所以排序不能删；但固定匹配器又要在构建期就排好——只能两份并存**」。
+
+## 5. 最小原理演示
+
+下面这段演示只演透两件事：同一棵树如何投影成运行时数组字符串；同一棵树如何投影成 `declare module` 类型注入字符串，并在编码期把库的某个条件类型从 `string` 收窄为字面量联合。前置章的注入点机制本身（空接口 + 条件类型的三态设计）不重演。第三个产物（固定匹配器）的投影原理同构，省略以保持聚焦。
 
 ```ts
-// ===== 唯一事实源：构建期扫出来的那棵树（前置章产物）=====
-type RouteNode = { name: string; path: string; file: string }
-const tree: RouteNode[] = [
-  { name: '/',          path: '/',          file: 'pages/index.vue' },
-  { name: '/users/:id', path: '/users/:id', file: 'pages/users/[id].vue' },
-]
-
-// ===== 投影①：树 → 运行时路由数组字符串 =====
-function genRoutes(tree: RouteNode[]): string {
-  const items = tree.map(n =>
-    `  { path: ${JSON.stringify(n.path)}, name: ${JSON.stringify(n.name)},`
-    + ` component: () => import(${JSON.stringify('/src/' + n.file)}) },`
-  ).join('\n')
-  return `export const routes = [\n${items}\n]\n`
+// 极简路由树：根下挂一个子节点
+type RouteNode = {
+  name: string
+  path: string
+  component: string  // 组件文件路径（占位）
+  children?: RouteNode[]
 }
 
-// ===== 投影②：树 → 类型声明字符串（含"模块增强"）=====
-function genDTS(tree: RouteNode[]): string {
-  const entries = tree.map(n => {
-    const params = extractParamTypes(n.path)            // ':id' → { id: string }
-    const paramsTS = Object.keys(params).length
-      ? `{ ${Object.entries(params).map(([k, v]) => `${k}: ${v}`).join('; ')} }`
-      : 'Record<never, never>'
-    return `  ${JSON.stringify(n.name)}: RouteRecordInfo<${JSON.stringify(n.name)}, ${JSON.stringify(n.path)}, ${paramsTS}>`
-  }).join('\n')
-  return `declare module 'vue-router/auto-routes' {
-  export interface RouteNamedMap {
-${entries}
-  }
-}
-declare module 'vue-router' {
-  export interface TypesConfig {
-    RouteNamedMap: import('vue-router/auto-routes').RouteNamedMap
-  }
-}
-`
+const tree: RouteNode = {
+  name: '',
+  path: '/',
+  component: 'pages/index.vue',
+  children: [
+    { name: '/users/:id', path: '/users/:id', component: 'pages/users/[id].vue' },
+  ],
 }
 
-// 从路径模式静态派生参数类型：'users/:id' → { id: 'string' }
-// （真实实现还要处理 ? * + 修饰符，这里只演示最简单的 :param）
-function extractParamTypes(path: string): Record<string, string> {
-  const out: Record<string, string> = {}
-  for (const seg of path.split('/')) {
-    const m = seg.match(/^:([^?*+]+)/)
-    if (m) out[m[1]] = 'string'
-  }
+// 把树投影成「运行时路由数组」字符串
+function genRoutes(node: RouteNode, depth = 0): string {
+  const indent = '  '.repeat(depth)
+  const children = node.children?.map(c => genRoutes(c, depth + 1)).join(',\n') ?? ''
+  const childrenLine = children ? `,\n${indent}  children: [\n${children}\n${indent}  ]` : ''
+  return `${indent}{
+${indent}  path: '${node.path}',
+${indent}  name: '${node.name}',
+${indent}  component: () => import('${node.component}'),${childrenLine}
+${indent}}`
+}
+
+console.log('export const routes = [\n' + genRoutes(tree) + '\n]')
+
+// 把树投影成「类型声明」字符串——同一棵树再遍历一次，扁平化成路由名映射
+function collectNamed(node: RouteNode, out: RouteNode[] = []): RouteNode[] {
+  if (node.name) out.push(node)
+  node.children?.forEach(c => collectNamed(c, out))
   return out
 }
 
-console.log(genRoutes(tree))
-console.log('---')
+function genDTS(node: RouteNode): string {
+  const named = collectNamed(node)
+  // RouteRecordInfo 是库内已定义的类型；演示只示意它的调用形状
+  const mapLines = named
+    .map(n => `      '${n.name}': RouteRecordInfo<'${n.name}', '${n.path}'>`)
+    .join('\n')
+  // 关键：用 declare module 把这张表反向注入库的 TypesConfig 接口
+  return `// typed-router.d.ts（生成产物，顶部带 @ts-nocheck）
+declare module 'vue-router' {
+  interface TypesConfig {
+    RouteNamedMap: {
+${mapLines}
+    }
+  }
+}`
+}
+
 console.log(genDTS(tree))
 ```
 
-跑一下，你能肉眼看到**同一棵树投影出两种截然不同的文本**——一种是 JS 运行时数组，一种是 TS 类型声明。这就是"单源多投影"的全部魔法。类型声明那段产物长这样：
+把生成的 dts 内容粘进项目、纳入 tsconfig 后，前置类型章留下的「空 `TypesConfig` 接口」就被填上了 `RouteNamedMap`——库内部的条件类型（`TypesConfig extends { RouteNamedMap: ... } ? 精确 : string`）自动从 `string` 收窄为 `'/' | '/users/:id'` 字面量联合。
+
+再附一个极简的「虚拟模块 load 钩子按 id 分发」骨架，演契约边界：
 
 ```ts
-declare module 'vue-router/auto-routes' {
-  export interface RouteNamedMap {
-    "/": RouteRecordInfo<"/", "/", Record<never, never>>
-    "/users/:id": RouteRecordInfo<"/users/:id", "/users/:id", { id: string }>
-  }
-}
-declare module 'vue-router' {
-  export interface TypesConfig {
-    RouteNamedMap: import('vue-router/auto-routes').RouteNamedMap
-  }
+// 极简 unplugin load 钩子（演示用，省略前缀处理）
+function load(id: string): string | undefined {
+  // 同一棵树背后，按 virtual id 分发到不同生成函数
+  if (id === 'vue-router/auto-routes')   return 'export const routes = [\n' + genRoutes(tree) + '\n]'
+  if (id === 'vue-router/auto-resolver') return 'export const resolver = createFixedResolver([...])'
+  return undefined
 }
 ```
 
-注意最后那个 `declare module 'vue-router' { interface TypesConfig {...} }`——这是整章的点睛之笔，下一节展开。
+虚拟模块作为契约边界的「形状」就在这几行：用户写 `import { routes } from 'vue-router/auto-routes'`，打包器拦下、按 id 现场生成、把字符串当模块源码返回。
 
-## 三、把路由表"反向注入"库的类型配置
+## 6. 执行轨迹
 
-这一节是承前的。**"空接口 + 条件类型当可选注入点"这个设计本身，第 13 章已经讲透**——那里解释了为什么 vue-router 内部要留一个空的 `TypesConfig` 接口、为什么所有对外类型都用条件类型去"读"它、为什么要维护 Generic / Typed / TypedList 三态。**本章只看这个注入点的"填充侧"：谁来填、用什么填、在构建期何时填。**
+输入：磁盘上原本只有 `pages/index.vue`；用户新增了 `pages/users/[id].vue`。
 
-谁来填？就是上节那段 `genDTS` 生成的代码。它做的事可以叫"**反向注入**"：通常你是 `import` 库的类型来用，这里反过来，是构建期生成的产物去**修改库内部的类型**——往那个空的 `TypesConfig` 接口里塞进真实的 `RouteNamedMap`。
+1. **构建期建树**：扫描 `pages` 目录，得到一棵树——根 `/`（index）下挂一个 `/users/:id`（users）。
+2. **load 虚拟模块**：打包器看到代码里有 `import { routes } from 'vue-router/auto-routes'`，触发 `load('vue-router/auto-routes')`，分发到 `generateRoutes()`，遍历树产出：
+   ```js
+   export const routes = [
+     { path: '/', name: '/', component: () => import('/pages/index.vue'), children: [
+       { path: '/users/:id', name: '/users/:id', component: () => import('/pages/users/[id].vue') }
+     ]}
+   ]
+   ```
+3. **同时写类型声明文件**：另一个生成入口 `generateDTS()` 遍历同一棵树产出一份扁平的 `typed-router.d.ts`——里面用 `declare module 'vue-router'` 把 `RouteNamedMap` 注入 `TypesConfig`，并对 `/users/:id` 这一行派生出参数类型 `id: string`。
+4. **编码期效果**：用户在某个组件里写 `router.push({ name: '/users/:id', params: { id: 123 } })`，TS 据注入的类型表校验 name 必须是字面量联合、`params.id` 必须是 string。
+5. **文件改动（拓扑未动）**：用户编辑 `pages/users/[id].vue` 的 template，监听器先节流地重算 dts 文本——发现内容没变，不写盘、不重载虚拟模块，纯组件体改动只走组件自己的 HMR。
+6. **拓扑改动**：用户新增 `pages/users/[id]/settings.vue`，监听器重算 dts 文本——内容变了，写盘 + 重载虚拟模块。虚拟模块的 `import.meta.hot.accept` 回调通过 `import.meta.hot.data.router` 跨重执行边界拿到当前路由器实例，执行 `clearRoutes()` + 逐条 `addRoute(新表)` + `force` 重匹配当前路由，页面不刷新、路由表已热替换。
 
-再打个比方：`TypesConfig` 就像一块挂在公共墙上的留言板，库里所有条件类型都盯着这块板子决定自己该长什么样。codegen 之前板子是空的，条件类型全都退回默认值（路由名 = `string`）；codegen 之后板子上写满了真实路由名，条件类型瞬间收窄成精确的字面量联合。
+## 7. 教学简化说明
 
-下面这段演示能让你**当场看到注入前后的差异**。我们用同名的 `interface` 合并来模拟 `declare module` 的效果（TS 里同名 interface 会自动合并，这正是模块增强的底层机制）：
+本章演示故意省略了：虚拟模块前缀（`\0`）的处理细节、`definePage` 宏的 AST 抽取与作用域校验算法、`<route>` 自定义块的三种语言（json5/json/yaml）解析、HMR 跨边界存实例的 `import.meta.hot.data` 完整协议、参数解析器的 raw 检测、固定匹配器三段匹配（path/query/hash）的细节、alias 在 codegen 里新建临时树重新解析、命名视图的多组件 import 生成、写盘节流参数。这些都是工程脚手架与旁路，原理上不增加新思想。
 
-```ts
-// 极简的库类型（真实库里 RouteRecordInfo 有 5 个类型参数，这里只用 3 个演示）
-interface RouteRecordInfo<Name, Path, Params> { name: Name; path: Path; params: Params }
+## 8. 小结
 
-// ===== 库内部（vue-router 源码侧）：一个空接口 + 一个盯着它的条件类型 =====
-interface TypesConfig {}
-type RouteName<C = TypesConfig> =
-  C extends { RouteNamedMap: infer M } ? keyof M : string
-
-type Before = RouteName        // => string  （注入前）
-
-// ===== 模拟 codegen 生成的"模块增强"：往留言板上写字 =====
-interface TypesConfig {
-  RouteNamedMap: {
-    '/':          RouteRecordInfo<'/', '/'>
-    '/users/:id': RouteRecordInfo<'/users/:id', '/users/:id', { id: string }>
-  }
-}
-
-type After = RouteName         // => '/' | '/users/:id'  （注入后，收窄！）
-```
-
-`Before` 是 `string`，`After` 是 `'/' | '/users/:id'`——**同一行类型定义 `RouteName` 一字未改，仅仅因为 `TypesConfig` 被填了内容，结果就从"任意字符串"收窄成了"只有这两个字面量"。**
-
-这就是为什么你在组件里写 `router.push({ name: '/users/:id', params: { id: 123 } })` 时，编辑器能检查路由名对不对、`id` 字段在不在——这些信息不是 vue-router 自带的，是构建期从你的文件树扫出来、再反向注入回去的。
-
-## 四、逃逸舱的构建期处理：definePage 宏的双面变换
-
-前一章讲过文件路由"约定优先 + 多层逃逸舱"的设计——文件名约定不够用时，可以用 `<route>` 块、`definePage()` 宏、`extendRoute` 钩子来覆盖。**多来源深合并这个机制本身第 14 章已展开**，这里只看：`definePage` 这个宏在 codegen 阶段被怎么处理。
-
-`definePage()` 长得像个运行时函数调用：
-
-```vue
-<script setup>
-definePage({
-  name: 'user-detail',                    // 能影响路由树拓扑
-  path: '/u/:id',                         // 能影响拓扑
-  alias: ['/user/:id'],                   // 能影响拓扑
-  meta: { requiresAuth: role.isAdmin },   // 可引用组件内变量
-})
-</script>
-```
-
-但**它其实是个编译期宏**——运行时组件里不该残留它。codegen 对它做的是"双面变换"，关键判据是：**这条属性，能不能在不碰组件作用域的前提下得到值？**
-
-- 能影响路由树拓扑的属性（`name / path / alias / params`）**必须是字面量**。这些在树构建期被**静态抽取**出来，直接进类型推导和路由树。正因为必须是字面量，抽取时一旦撞上非字面量就会报错。
-- 其余属性（如 `meta`）**允许引用组件里 import 进来的东西**（比如 `role.isAdmin`）。这些没法静态抽取——它们走另一条路：**整个 `definePage` 对象被提取成一个独立的模块**（`export default {...}`），在运行时和按约定生成的记录做深合并。
-
-为什么要拆成两条路？因为前者要进类型（类型必须编译期已知），后者要引用运行时变量（变量编译期还不存在）。说人话就是：**能进类型的进类型，能引用变量的留到运行时——同一份配置，按"能不能在编译期确定"被劈成两半，各走各的。**
-
-代价随之而来：被整体提取成独立模块的那部分，**不能再引用组件 `setup` 作用域里的局部变量**——一旦跨了模块边界，那些变量就找不到了，引用会断裂。所以 codegen 会专门做一道作用域校验：发现 `definePage` 引用了 setup 里的局部变量，就报错并把它的运行时部分降级成空对象。这是第三层权衡（文末展开）。
-
-## 五、固定匹配器的构建期物化（简述）
-
-第 15 章是"新一代路由解析器"的主场——它讲透了**为什么要把路由表做成构建期固定、无运行时增删，为什么用 path / query / hash 三段分别匹配，为什么用抛异常当"不匹配"的统一控制流**。**本章只看一个新侧面：这张固定表是怎么在 codegen 阶段从树物化出来的。**
-
-物化时有一个细节特别能说明问题：**路由的匹配优先级排序，被从运行时匹配器"移植"了一份到 codegen。** 实现里的注释直接写着"移植自 pathParserRanker"。这么做是为了让生成的匹配表一出来就排好序——运行时拿到的是一张静态有序的数组，匹配时零排序开销。这是第四层权衡（文末展开）：换来运行时零开销，代价是同一套排序语义存在两份实现，有双重维护、二者偏离的风险。
-
-## 六、不刷新页面的路由热替换
-
-最后一块拼图：你改了一个 `.vue`，怎么做到不刷新整页就更新路由？
-
-```
-磁盘文件改动
-    │
-    ▼
-监听器：重写类型声明文件（只有内容真变了才写盘）
-    │
-    ▼
-让打包器重载那个虚拟模块
-    │
-    ▼
-虚拟模块内部的 import.meta.hot.accept 回调触发：
-    1. 从 import.meta.hot.data 取出之前存的路由器实例（跨重执行边界）
-    2. router.clearRoutes()                       // 清空旧表
-    3. for (route of 新表) router.addRoute(route)  // 逐条加新的
-    4. router.replace({ ...当前路由, force: true }) // 强制重匹配当前路由
-    │
-    ▼
-页面不刷新，路由表已热替换
-```
-
-两个关键设计：
-
-1. **只在声明内容真变了才写盘 + 重载**——你只改了组件 `<template>`、路由声明没动，就不会触发路由重载，避免"随便改个样式也重载路由"的浪费。
-2. **路由器实例靠 `import.meta.hot.data` 跨边界存活**——虚拟模块每次重载都是一次全新执行，普通变量会丢；`hot.data` 是打包器专门留的"跨执行持久化口袋"，用来存那个已经挂载好的路由器实例。
-
-> 一个诚实的小盲点：这个机制里有个 `ROUTES_LAST_LOAD_TIME`（上次加载时间戳），每次 load 虚拟模块都会 `.update()` 它，但在本次精读的文件范围内没找到谁在读它的 `.value`——推测是供外部（类型插件或 HMR 辅助）判断新鲜度用的，留待后续核对。
-
-## 关键权衡
-
-这一章机制密集，挑四条最能说明"为什么这么设计"的展开。前三条是主线。
-
-**权衡一：单一事实源（那棵路由树）→ 一次性多目标投影**
-
-- **选择**：路由定义只在文件系统里维护一处，构建期把同一棵树投影成运行时数组、类型表、匹配器三种产物。
-- **换来**：三者天然永远一致，不会漂移——你绝不会遇到"运行时认得这个路由、类型表却查不到"。改文件一处，三张面孔同步更新。
-- **代价**：构建期要对同一棵树遍历多次、生成大量字符串代码；路由一多，类型声明文件会膨胀到很大、拖慢 TS 编译（类型膨胀的代价第 13 章已建立，这里复用）。
-- **一句话**：用"构建期多干点活"换"运行时启动快、编码期不出错"。一处的活，换三处的省心。
-
-**权衡二：用虚拟模块当入口，而不是手写 routes / 生成实体 .ts**
-
-- **选择**：约定几个不存在的"假模块名"（`vue-router/auto-routes` 等），让用户像 import 普通模块一样拿到路由表。
-- **换来**：用户享受打包器的一切好处——tree-shaking（没用的路由不进 bundle）、类型推导、HMR；而且磁盘上不产生需要用户手动维护的中间文件。
-- **代价**：必须处理虚拟模块在"各类打包器"和"TS"两套体系下的解析差异——打包器侧要加 `\0` 前缀认领，TS 侧干脆不认虚拟模块，只好再额外生成一份实体 `.d.ts` 兜底。同一个"拿路由表"的需求，绕了两道弯。
-- **一句话**：换来"像用普通模块一样用路由"，代价是"底层得伺候两套解析器"。
-
-**权衡三：definePage 宏的双面变换**
-
-- **选择**：宏里能影响拓扑的字面量属性（name/path/alias/params）在构建期静态抽取进类型；其余属性整体提取成独立模块、运行时深合并。
-- **换来**：路由名、路径、参数这些"决定树结构"的东西在构建期就生效、直接进类型推导；而 `meta` 这类需要引用组件变量的属性，仍能在运行时和按约定生成的记录合并——两边都不委屈。
-- **代价**：同一份配置要走两条代码路径；而且被提取成独立模块的那部分，**禁止引用组件 `setup` 作用域的局部变量**（跨模块后引用断裂），需要专门一道作用域校验，违反就报错降级。
-- **一句话**：用"配置劈成两半各走各的"换"类型能精确、变量能引用"，代价是"两条路径 + 作用域校验"。
-
-**权衡四：把匹配优先级排序从运行时移植到 codegen**
-
-- **选择**：把运行时匹配器那套"按二维 score 排序"的逻辑，照搬一份到构建期 codegen，让生成的固定匹配表一出来就是有序的。
-- **换来**：运行时拿到的是静态有序数组，匹配时零排序开销——和第 15 章"构建期固定路由表"的目标严丝合缝。
-- **代价**：同一套排序语义现在有两份实现（运行时 ranker + codegen 比较函数），双重维护，存在二者偏离的风险——代码里那几处 TODO/FIXME 暗示作者自己也清楚这点。
-
-## 小结
-
-这一章把第 14 章扫出来的那棵路由树，变成了三种能用的东西。整条链路收束成一句话：**路由信息本质是构建期才知道的数据，但只要把它当成唯一事实源、一次性投影到运行时 / 编码期 / 匹配器三个时间点，三个时间点就不再错位。**
-
-你在这章看到的几个反复出现的设计取向，其实是同一个哲学的不同侧面：**把能在构建期确定的事，都尽量推到构建期**——路由表构建期固定、参数类型构建期推导、排序构建期物化、类型注入构建期填充。动态性被一步步从运行时往前挪，换来的全是"启动更快、编码更安全"。代价也很统一：构建期更重、生成的产物更大、同一套语义有时得维护两份。
-
-这是全书最后一章。回看整条线：从最底层的一段 URL 编码、一条路径模式的优先级评分，一路搭到导航状态机、嵌套视图、类型推导，最后落到这章——文件系统里的一个个 `.vue`，怎么自动变成一套类型安全、热更新、零配置启动的路由。路由此处闭环。
+到这一步，前置章留下的几个口子都被合流掉了：空接口注入点被填上了 `RouteNamedMap`、固定匹配器的表从树物化出来、多来源深合并落到了 codegen 里与按约定生成的记录做。文件系统不再是路由表的「输入参数」，而是它的**唯一事实源**——所有运行时与编码期需要的数据都从这棵树投影出来。本章是全书的末章：从 URL 编码一路到文件路由的整套机制拼图，到这里就完整了。

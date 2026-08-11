@@ -1,229 +1,239 @@
----
-title: "响应式语法糖：赋值即 .value"
----
-
 # 响应式语法糖：赋值即 .value
 
-写过 Composition API 的人，大概都干过这种事：明明只想让一个数字自增，却每次都得惦记着那个 `.value`。
+> 本章属于 composite 层。前置：SFC 解析与增量 AST 编辑。
+> 学完你能：用一句话讲清「响应式糖为什么选编译期静态改写、而非运行时 Proxy，代价是什么」。
+
+## 1. 为什么需要它
+
+写 Composition API 的人大概都有过这种体会：每个 `ref` 都得拖一个 `.value` 才能碰它真正的值。一段十来行的逻辑里，`count.value++`、`user.value.name = '...'`、`total.value = a.value + b.value` 满眼都是 `.value`——既啰嗦，又容易漏写，模板字符串里尤其碍眼。
+
+更扎心的是：声明成响应式之后，你心里其实是在把它当一个普通变量用的，只是 Vue 偏要让你每次都提醒自己「这是个 ref」。理想很朴素——**声明成响应式之后，就当普通变量用**。
+
+上一章 `better-define` 把「类型层面的样板」收掉了一截，让 TS 类型直接成为运行时校验的真相来源；但它没动 setup 内的**书写**本身，`.value` 满天飞的问题还在原地。要解决它，需要的是另一类机制：**在源码标识符层面做一次定向重写**。
+
+这一章就来回答：怎么在不发明任何新运行时能力的前提下，让 `count = $ref(0)` 之后的 `count` 像普通变量一样被读写。
+
+## 2. 核心思想
+
+**编译期记账，引用处补 `.value`**。
+
+把这套糖分成两件事：先在编译期把「谁是响应式变量」**登记成册**，再在源码里对它的每一处读 / 写，**就地补上 `.value`**。运行时拿到的代码，跟你手写 `ref().value` 一模一样，没有新魔法，只是把 `.value` 的填写工作搬到了编译期。
+
+## 3. 心智模型
+
+转换的执行可以拆成 7 步，本质就「登记 → 改写」两个阶段：
+
+1. **正则粗筛**：源码里若没有 `$ref` / `$()` / `$computed` / `$$()` 这类痕迹，直接原样返回，连解析都不做。
+2. **第一遍登记**：扫描全部声明，凡是 `const x = $ref(...)` 或 `const x = $(...)` 这种形态的，把 `x` 记进「响应式绑定表」，标注它是不是 const、是不是来自 props 解构。普通声明也占位记一笔（记成 `false`），免得后面误判。函数体、块、catch 各开一层新作用域。
+3. **第二遍改写**：遍历每一处**标识符引用**，从最内层作用域向外逐层查表。
+4. **命中响应式绑定**：在标识符后面插入 `.value`；对象简写 `{ foo }` 补成 `{ foo: foo.value }`；若它是 `const` 却出现在赋值 / 自增的左侧，直接报错。
+5. **命中 props 绑定**：改写成对 `__props` 的属性访问（`__props.foo`）。
+6. **遇到解构声明**：把被 `$()` 包住的解构模式整体替换成一个临时变量，再在后面追加「逐字段取值并包成响应式」的语句。
+7. **遇到 `$$()`**：把它标为「转义区域」，区域内对响应式变量的引用**不加** `.value`（取原始 ref 对象本身），并删掉 `$$` 符号。最后把用到的 helper（`ref` / `computed` / `toRef`）统一注入到顶部。
+
+底下那套「懒解析、magic-string 增量改写、setupOffset 偏移」的解析底座已在第 1 章讲过，本章不重演——我们关心的是它**之上**针对标识符读写的一层定向重写。
+
+## 4. 关键权衡
+
+> 本章的主角。
+
+### 静态文本改写，换零运行时开销
+
+要消掉 `.value`，理论上只有两条路。
+
+一条是**运行时**路：用 Proxy 包一层，访问 `count` 时自动解包到 `count.value`。另一条是**编译期**路：在源码上做静态改写——读者写 `count`，编译器在背后把它变成 `count.value`，运行时拿到的就是 `count.value`，根本不知道有人写过 `count`。
+
+vue-macros 选了第二条。
+
+- **换来**：零额外运行时开销（运行时跑的还是原生 `ref().value`，没有任何代理层）；与原生 `ref` 完全兼容（同一个 ref，外面不包任何东西）；类型推导不受影响（TS 看到的仍是 `Ref<number>`）。
+- **代价**：失去**语法透明性**——看 setup 源码时，肉眼分不清哪些变量被宏接管、哪些是普通变量；为了让改写不误伤，必须做大量**保守的静态判定**：作用域分析、排除声明位标识符、跳过类型节点、跳过属性键……每一个边界都是一处潜在的误伤点。
+
+> 这条权衡化解的是「**书写体验 vs. 运行时透明**」这对矛盾：要么让运行时替你包一层（多一道开销），要么让编译器替你填 `.value`（多一堆判定）。它选了后者。
+
+### 两遍遍历，换引用的正确性
+
+转换器完全可以「单遍边走边改」——扫到一个声明就改一个，扫到一个引用就查一次。但它没这么做，而是分了两遍：先 `walkScope` 把全文件的声明都扫完、建好绑定表，再 `walkAST` 遍历引用查表改写。
+
+为什么非得两遍？因为**引用可以出现在声明之前**：
+
+```js
+function inc() { count++ }      // 引用 count
+const count = $ref(0)            // 声明 count
+```
+
+`inc` 里的 `count` 引用会先被遍历到，但真正的 `count` 声明在下面。单遍边走边改就漏了。两遍走的逻辑是：先把全文件扫一遍把 `count` 登记进表，再回头处理引用——这时候表是完整的，引用出现在哪都不怕。
+
+- **换来**：引用可以出现在任意位置（声明之前、嵌套深处、函数闭包里）都能被正确识别。
+- **代价**：两趟遍历（性能损耗薄到可以不展开）；以及必须**手工维护一个词法作用域栈**——函数体、块、catch 各开一层，标识符从内到外逐层查表。这个栈是正确性的根，也是代码里最容易绊倒读者的地方。
+
+> 化解的是「**正确性 vs. 实现简单**」这对矛盾：单遍最简单，但跨声明顺序就漏改；两遍复杂一点，但任意位置都准。
+
+### 临时变量加逐字段取值，换完整解构语法
+
+`const { x } = $(useFoo())` 这种**响应式解构**——`useFoo()` 返回一个 reactive 对象，希望解构出来的 `x` 还是个 ref（不然解构完响应性就丢了）。
+
+改写思路是：把整个解构模式**整体替换成一个临时变量**，再在后面**逐字段**取出值、包成 ref：
+
+```js
+// 改写前
+const { x } = $(useFoo())
+// 改写后
+const __$temp_1 = useFoo()
+const x = _toRef(__$temp_1, 'x')
+```
+
+为什么不让 `useFoo()` 返回值直接解构？因为那样 `x` 拿到的是裸值，响应性已经断在解构那一刻。要保住响应性，每个字段都必须**单独**包成一个 ref。
+
+- **换来**：响应式解构的**完整语法**——默认值 `x = 1`、嵌套 `{ a: { b } }`、重命名 `{ x: y }` 都能正确处理。
+- **代价**：要生成临时变量名；嵌套解构要靠一段「路径拼字符串」逻辑（递归 ObjectPattern / ArrayPattern，把 `a.b.c` 这种访问路径还原出来）才能在取值时找到正确的字段。rest 元素（`...rest`）干脆不支持，直接报错——保响应性的成本太高。
+
+> 化解的是「**语法便利 vs. 语义正确**」这对矛盾：直接解构最方便，但响应性丢了；要让每个字段都是 ref，就只能拆成逐字段包。
+
+### 正则粗筛，换跳过无关文件
+
+转换入口 `shouldTransform(src)` 是一条单行正则：
 
 ```ts
-const count = ref(0)
-function inc() { count.value++ }                 // 每次都得 .value
-const double = computed(() => count.value * 2)   // 这里也是
+const transformCheckRE =
+  /\W\$(?:\$|ref|computed|shallowRef|toRef|customRef)?\s*(?:[(<]|as)/
 ```
 
-声明成响应式之后，它反而比普通变量更难用——读要 `.value`、写要 `.value`、传进模板字符串还得 `.value`。你心里大概会嘀咕：**声明的时候已经告诉过你它是响应式的了，为什么用的时候还要我每次提醒？** 这章讲的这个宏，就是来替你把这句「提醒」省掉的：
+它干的活儿很轻——判断源码里**有没有** `$` / `$$` / `$ref` 这些糖的痕迹。没有，整个转换直接原样返回，连 babel 都不调。
 
-```ts
-const count = $ref(0)
-function inc() { count++ }                       // 当普通变量写
-const double = $computed(() => count * 2)        // 这里也不用 .value
-```
+- **换来**：绝大多数无糖文件零成本跳过——构建管线里挂着这个插件，但没糖的文件不付出任何解析开销。
+- **代价**：正则只是「是否进入转换」的**粗筛**，存在边界误判的可能（比如字符串里碰巧出现了 `$ref(`）；但最终是否真有可改写的糖，仍由 AST 判定保证，所以**正确性不受影响**，最多是多跑一次解析。
 
-## 它到底想解决什么
+> 化解的是「**入口开销 vs. 跳过效率**」这对矛盾：所有文件都走完整 AST 太贵，先用一条便宜的正则把无糖的挡在门外，错的至多多跑一次解析。
 
-先说结论：**运行时它什么新东西都没发明**。`count` 在运行时就是一个地地道道的 Vue `ref`，跟你自己手写 `ref(0)` 一模一样，传给任何要 ref 的 API 都行。宏做的事只有一件——**在编译期替你把 `.value` 填好**。
+## 5. 最小原理演示
 
-打个比方：编译期先抄一张「响应式花名册」，把所有用 `$ref` / `$()` / `$computed` 声明的名字记上去；然后拿着这张花名册，把你源码里对这些名字的每一处使用，就地改成 `.value` 访问。花名册上有的名字，出场就得带 `.value` 这个工牌；不在册上的，原样放过。
-
-> 这套「解析源码 → 按需解析 AST → 用增量字符串编辑器改写 → 自己算偏移」的底座，第 1 章已经讲透了，这里不重复。本章直接站在它上面，只关心一个新问题：**怎么用这套底座，做一次「针对标识符读写的定向重写」**——不新增任何解析或编辑设施，只是在它之上，把「这个变量是响应式的」这件事，翻译成源码里的一处处 `.value`。下文用到的 `appendLeft`（在某位置之后插入）、`overwrite`（覆盖一段）、`remove`（删一段），都是第 1 章那套增量编辑器的基本动作。
-
-## 自底向上：从一张花名册开始
-
-### 谁是响应式变量：识别「ref 创建调用」
-
-花名册不是凭空来的，得先能认出「哪些声明是在造响应式变量」。宏把合法的来源收敛成两类：
-
-- 转换符 `$()`：`const count = $(ref(0))`、`const { x } = $(useFoo())`——`$` 包住任意一个返回值，把结果登记成响应式。
-- 简写 `$ref` / `$computed` / `$shallowRef` / `$toRef` / `$customRef`：`const count = $ref(0)`——直接就是 ref 工厂。
-
-判断逻辑很直白：看到一个 `const x = 某调用()`，就看那个调用的名字是不是 `$`，或者是不是 `$` 开头且去掉 `$` 后落在简写白名单里。是的话，`x` 就上花名册。
-
-这里有个贴心的守卫：**如果当前作用域里已经有人把 `$` 这个名字拿去当普通变量用了（被遮蔽），就不再把 `$` 当转换符**。想象一下用户自己写了 `const $ = 1`，你要是还把后面的 `$(...)` 当糖去删，就把人家的合法代码毁了。所以识别之前先看一眼「这个作用域里 `$` 是不是已经被占了」。
-
-### 作用域：一摞套着的房间
-
-光有花名册还不够。真实代码里变量是有作用域的——外层声明一个 `count`，函数里又声明一个同名 `count`，这俩不是一回事。所以花名册不是一张大平表，而是一摞**从外到内套着的房间**：
-
-- 最外面是大厅（根作用域），顶层声明的 `count`、`double` 都登记在这里。
-- 进一个函数体、进一个 `{ }` 块、进一个 `catch`，就各自开一间新房，把这一层声明的名字登记进新房。
-- 查名字的时候，**站在最里屋开始喊，先在自己屋找，没有就去外屋，一直找到大厅**——最先找到的那层说了算。这样内层同名变量就能正确盖住外层。
-
-这里有个容易忽略的细节：普通变量也要登记，只不过标成「假」。为什么？因为如果内层有个普通变量 `let count = 1`，它把外层的响应式 `count` 盖住了，那么内层用到 `count` 时**不该**补 `.value`。把内层这个普通 `count` 记成「假」，查表查到它就直接停、不补 `.value`——这正是遮蔽该有的行为。说人话就是：花名册不仅要记「谁是响应式」，还得记「谁虽然同名但不是」，才能在该停的地方停下来。
-
-### 为什么必须两遍：先登记，再改写
-
-现在到了一个关键设计决定。你可能会想：能不能一边遍历一边干——遇到声明就记，遇到引用就改，一趟走完？不行。因为**引用可以出现在声明之前**：函数会被提升、回调里可能引用到后面才声明的 ref、嵌套闭包里的使用顺序千奇百怪。如果单遍走，等你改到某处引用时，可能还没走到它的声明，花名册上还没有这个名字，你就不知道该不该补 `.value`。
-
-所以宏老老实实分两趟：
-
-1. **第一遍·登记**：只扫声明，把所有名字（响应式的标 true、普通的标 false）登记进对应的作用域房间，把整摞花名册先建完整。
-2. **第二遍·改写**：再从头遍历每一处「引用」，拿完整的册子查表，命中响应式就补 `.value`。
-
-册子建完才动笔，这样不管引用在声明的上面、下面、还是某个埋得很深的回调里，查表都能查到。
-
-### 改写的三种长相
-
-第二遍查表命中之后，根据这个引用长什么样，改法不一样：
-
-- **普通引用** `count * 2` → 在标识符后面 `appendLeft('.value')`，变成 `count.value * 2`。
-- **对象简写** `{ foo }` → 不能只在后面加，要补成 `{ foo: foo.value }`，否则语法不对。
-- **`$$()` 转义** → 这是个反向开关：`$$(count)` 的意思是「在这里我要的是 ref 对象本身，别给我补 `.value`」。进入 `$$(...)` 就打开一个「转义区」，区域里对响应式变量的引用**跳过** `.value`，同时把 `$$` 两个字删掉。
-
-（还有一条保命规则：用 `const` 声明的响应式变量，要是被放到了赋值或自增的左边，编译器直接报错——const 的 ref 不能重新赋值。这条属于正确性护栏，不展开。）
-
-## 一条流水线
-
-把上面串起来，一份源码从进到出是这样走的：
-
-```
-源码字符串
-  │
-  ├─ 正则粗筛：源码里没有 $ref / $() / $computed 这类痕迹？
-  │     └─ 是 → 原样返回，后面全不干（绝大多数文件走这条捷径）
-  │
-  ├─ 解析成 AST
-  │
-  ├─ 第一遍 walkScope：扫所有声明 → 建作用域花名册
-  │     （$ref/$() 声明的记 true，普通变量记 false；函数体/块/catch 各开一层）
-  │
-  ├─ 第二遍 walkAST：遍历每个标识符引用
-  │     ├─ 从最内层作用域向外查表
-  │     ├─ 命中 true  → 补 .value（或修对象简写）
-  │     ├─ 命中 props → 改成 __props.xxx（SFC 场景，本章不展开）
-  │     └─ 处于 $$() → 跳过 .value，删掉 $$
-  │
-  ├─ 顶部注入 helper：import { ref as _ref, computed as _computed } from 'vue'
-  │
-  └─ 输出新字符串 + sourcemap
-```
-
-## 把原理跑起来：最小演示
-
-下面这段脚本只演核心三件事——**两遍遍历 + 作用域花名册 + 引用处补 `.value`**，外加 `$$()` 转义。它用 `@babel/parser` 解析、用 `magic-string` 改写，能直接跑：
+下面这段约 50 行的脚本，只演示「**两遍遍历 + 作用域绑定表 + 引用处补 `.value` + `$$()` 转义**」这四件事——也就是上面**前两条权衡**的实现骨架。解构拆解、props 解构 polyfill、helper 注入、TS 类型节点跳过等工程细节全部故意省略。
 
 ```ts
 import { parse } from '@babel/parser'
 import MagicString from 'magic-string'
 
-// 把 $ref / $() / $computed 声明的变量，在每一处引用自动补上 .value
+const SHORTHANDS = new Set(['ref', 'computed', 'shallowRef'])
+
 function transform(src: string): string {
-  const ast = parse(src, { sourceType: 'module', plugins: ['typescript'] })
+  // 绑定表：变量名 → 是否响应式。
+  // 第一遍扫描时填写，第二遍改写时查表。
+  const bindings = new Map<string, boolean>()
+
+  // 第一遍：扫所有顶层声明，把 $ref / $ / $computed 包出来的变量登记进表
+  function registerDeclarations(ast: any) {
+    for (const stmt of ast.body) {
+      if (stmt.type !== 'VariableDeclaration') continue
+      for (const decl of stmt.declarations) {
+        const init = decl.init
+        if (!init || init.type !== 'CallExpression') continue
+        const callee = init.callee.name ?? ''
+        const isSugar =
+          callee === '$' || (callee[0] === '$' && SHORTHANDS.has(callee.slice(1)))
+        if (!isSugar || decl.id.type !== 'Identifier') continue
+        bindings.set(decl.id.name, true)
+      }
+    }
+  }
+
+  const ast = parse(src, { sourceType: 'module' })
   const s = new MagicString(src)
 
-  // 花名册：true=响应式（引用处补 .value），false=普通变量（登记了，但别动它）
-  const scopes: Record<string, boolean>[] = [{}]   // 作用域栈，最底下是根作用域
-  let escape = false                                // 是否正处在 $$(...) 内
+  // 跑第一遍：先把绑定表建起来，后续引用查表才能命中
+  registerDeclarations(ast)
 
-  const top = () => scopes[scopes.length - 1]
-  const isSugar = (c: string) => c === '$' || /^\$(ref|computed|shallowRef)$/.test(c)
+  // 转义区深度：进入 $$() 时 +1、退出时 -1。
+  // 区内的响应式引用不加 .value，取原始 ref 对象
+  let escapeDepth = 0
 
-  // 从最内层向外查表，第一个命中的为准（内层同名变量遮蔽外层）
-  const lookup = (name: string) => {
-    for (let i = scopes.length - 1; i >= 0; i--)
-      if (name in scopes[i]) return scopes[i][name]
-  }
-
-  // —— 第一遍·登记：把每个声明的名字按「是不是响应式糖」记进当前作用域 ——
-  function declare(body: any[]) {
-    for (const stmt of body)
-      if (stmt.type === 'VariableDeclaration')
-        for (const d of stmt.declarations) {
-          const init = d.init
-          const ok = init?.type === 'CallExpression' &&
-            init.callee.type === 'Identifier' && isSugar(init.callee.name)
-          top()[d.id.name] = !!ok   // true=响应式，false=普通（登记防误改）
-        }
-  }
-
-  // —— 第二遍·改写：遍历引用，命中响应式就补 .value；遇 $$() 进转义 ——
-  function visit(node: any, parent: any) {
+  // 第二遍：遍历每个标识符引用、命中绑定就补 .value
+  function walk(node: any) {
     if (!node || typeof node.type !== 'string') return
-    if (node.type === 'BlockStatement') { scopes.push({}); declare(node.body) }  // 进块开新作用域
 
-    if (node.type === 'CallExpression' && node.callee?.name === '$$') {
-      escape = true                                              // 进 $$()：区域内不补 .value
-      s.remove(node.callee.start, node.callee.end)               // 删掉 $$ 符号
-      node.arguments.forEach((a: any) => visit(a, node))
-      escape = false
+    // 命中 $$() 调用：删掉 $$ 符号、标记进入转义区
+    if (node.type === 'CallExpression' && node.callee.name === '$$') {
+      s.remove(node.callee.start, node.callee.end)
+      escapeDepth++
+      for (const k in node) walk(node[k])
+      escapeDepth--
       return
     }
 
+    // 命中一个标识符引用：登记在表里、且不在转义区，就在后面补 .value
     if (node.type === 'Identifier' &&
-        parent?.type !== 'VariableDeclarator' &&                 // 排除声明位的名字
-        !escape && lookup(node.name) === true)
-      s.appendLeft(node.end, '.value')                           // x --> x.value
-
-    for (const k in node) {                                       // 递归子节点
-      const v = node[k]
-      if (Array.isArray(v)) v.forEach((c: any) => visit(c, node))
-      else if (v && typeof v.type === 'string') visit(v, node)
+        bindings.has(node.name) &&
+        escapeDepth === 0) {
+      s.appendLeft(node.end, '.value')
+      return
     }
 
-    if (node.type === 'BlockStatement') scopes.pop()             // 出块关作用域
+    // 否则继续往下找
+    for (const k in node) {
+      const v = node[k]
+      if (Array.isArray(v)) v.forEach(walk)
+      else walk(v)
+    }
   }
 
-  declare(ast.program.body)   // 先把所有顶层声明登记完
-  visit(ast.program, null)    // 再遍历引用改写
+  walk(ast)
   return s.toString()
 }
 ```
 
-喂进去这段：
+每个关键点对应一条原理：`bindings` 这张表 + `registerDeclarations` 演第一遍登记；`walk` + `bindings.has(...)` 演第二遍查表改写；`s.appendLeft(node.end, '.value')` 演核心动作「引用处补 `.value`」；`escapeDepth` 演转义区内的边界处理。
 
-```ts
+## 6. 执行轨迹
+
+输入（一段假想的 setup 代码）：
+
+```js
 const count = $ref(0)
 const double = $computed(() => count * 2)
 function inc() {
   count++
-  watch($$(count), cb)
+  log($$(count))
 }
 ```
 
-走一遍轨迹：
+**第一遍登记**：扫到 `const count = $ref(0)` → `count` 进响应式表（`isConst = true`）；扫到 `const double = $computed(...)` → `double` 进响应式表。函数声明 `inc` 不进。
 
-1. **登记**：`count`、`double` 在根作用域记成 `true`；`inc` 是函数声明（演示里简化，未单独登记）。
-2. **改写 `count * 2`**：`count` 查表命中 `true` → `count.value * 2`。
-3. **改写 `count++`**：`count` 命中 `true` → `count.value++`（`inc` 函数体开了新作用域，但内层没遮蔽，查到外层的 true）。
-4. **`$$(count)`**：打开转义区，删掉 `$$`，里面的 `count` 跳过 `.value`——所以传给 `watch` 的是 ref 对象本身。
+**第二遍改写**，逐处走读：
 
-得到：
+- 简写 `$ref` / `$computed` 的调用名 → 改写成 `_ref` / `_computed`（运行时 helper）。
+- 进入 `() => count * 2` 箭头函数体，扫到 `count` 这个 Identifier，查表命中（`escapeDepth === 0`）→ `s.appendLeft` 在它后面插入 `.value`，结果是 `count.value * 2`。
+- 进入 `inc` 函数体，扫到 `count++` 里的 `count`，查表命中 → `count.value++`。
+- 扫到 `log($$(count))`：识别出 `$$()` 调用，删掉 `$$` 符号、`escapeDepth` 从 0 变 1。
+- 继续递归到 `count` 这个 Identifier，虽然查表命中，但处于转义区 → 跳过 `.value` 改写，保持裸 `count`。
+- 退出 `$$()`，`escapeDepth` 回到 0。
 
-```ts
-const count = $ref(0)
-const double = $computed(() => count.value * 2)
+**输出**（顶部 helper import 注入 `ref as _ref, computed as _computed`）：
+
+```js
+const count = _ref(0)
+const double = _computed(() => count.value * 2)
 function inc() {
   count.value++
-  watch((count), cb)
+  log(count)
 }
 ```
 
-注意两点：`$ref` / `$computed` 本身没被改名（真源码会把它们改成注入的 `_ref` / `_computed` 并在顶部加 import，演示为了聚焦省略了）；`watch((count), cb)` 多出来的括号，是删掉 `$$` 后留下的、原本属于调用的那对括号，无害。
+`count.value++` 与 `log(count)` 的对比是这套机制最浓缩的演示：同一个 `count`，在转义区外被补上 `.value`，在 `$$()` 内则保留原始 ref。「登记 + 查表 + 转义」三件事，在这一行里同时演完。
 
-> 演示为求简明，只排除了 `VariableDeclarator` 处的声明名。真实实现更精确：用一个 WeakSet 把所有「声明位」的标识符（函数名、参数、解构出来的 key、`defineProps` 解构的变量）统一排除，还跳过 TS 类型节点、用 `isReferencedIdentifier` 判断「这到底是不是一处引用」。
+## 7. 教学简化说明
 
-## 关键权衡
+本章演示故意省略了：
 
-### 权衡一：静态文本改写，换取「无 .value」的书写体验
+- 解构拆解（`processRefObjectPattern` / `processRefArrayPattern` + `pathToString` 路径拼接）。
+- props 解构 polyfill（withDefaults / mergeDefaults / rest 代理走虚拟 helper 模块，同一机制已在第 3 章「编译期注入虚拟 helper 模块」讲过）。
+- TS 类型节点跳过、`const` 出现在赋值左侧时的报错。
+- 跨 `<script>` / `<script setup>` 块的作用域穿透（`knownRefs` 把 script 块的 ref 传给 setup）。
+- 顶部 helper import 注入的细节（`importedHelpers` 集合 + 顶部 `prepend`）。
+- 词法作用域栈的手工维护（演示里只用了 `escapeDepth` 这一个最简状态，真实实现是逐层作用域栈）。
 
-这是整章最核心的一个决定。
+这些都是工程完整度，不是原理本身。
 
-- **选择**：在编译期把源码文本里的 `x` 直接改成 `x.value`（`appendLeft` 插一段字符串），而不是在运行时搞一个 Proxy / 自动解包的包装器去「假装」它是个普通变量。
-- **换来**：**零额外运行时开销**——产出的代码就是你手写 `ref().value` 的样子，没有多出任何对象、任何拦截层；**与原生 ref 完全兼容**，拿到的就是 Vue 原生的 ref，传给 `watch`、`toRef` 等任何期望 ref 的 API 都没问题；**TS 类型推导不受影响**，因为运行时类型本来就是 `Ref<T>`，`.value` 自然推出 `T`。
-- **代价**：**失去语法透明性**。你翻开编译产物、或断点调试时看到的 `count.value` 是编译器塞进去的，不是你写的；更微妙的是，源码里 `count++` 看着像改一个数字，实际改的是一个 ref，读代码的人必须先知道「`count` 被宏接管了」才能正确理解。更实际地，为了**不误改**，得堆大量保守的静态判定：要分清一个 `count` 到底是「声明它」（声明位不能补 `.value`）还是「用它」；要跳过 TS 类型标注里的名字（类型位置的 `count` 不是引用）；要跳过对象简写的 key、解构出来的占位名；`const` ref 放到赋值左边要直接报错……这些判定漏一个，就会把不该加 `.value` 的地方加了、或该加的漏了。这部分判定占了真实代码相当大的篇幅——这正是「换无 `.value` 体验」要付的账单。
+## 8. 小结
 
-### 权衡二：两遍遍历（先登记、后改写），换取引用正确性
+响应式糖的本质就这么一句话：**把 `.value` 这件事，从书写时搬到了编译期**。它没有发明新运行时，只是替你填一份填得满文件都是的样板；它没有走 Proxy 路线，所以运行时拿到的还是原生 `ref().value`；为了让改写不误伤，它付出了「失去语法透明性 + 大量保守静态判定」的代价。
 
-- **选择**：先 `walkScope` 把全部声明一次性登记进花名册，再 `walkAST` 遍历引用查表改写，而不是单遍边走边改。
-- **换来**：**引用可以出现在任意位置**——声明之前（函数提升、回调引用后定义的 ref）、任意深的嵌套闭包里——都能被正确识别为响应式。因为登记是事先全做完的，改写时册子已经完整。
-- **代价**：**跑两趟遍历**；而且为了把作用域算对，得**自己手工维护一个词法作用域栈**——进函数体、进块、进 `catch` 各压一层，出来各弹一层，还要把函数参数、`catch` 参数登记到对应层。这套手写的作用域管理就是正确性的成本。还有一处更隐蔽的代价：为了判断「`$` 转换符有没有被局部变量遮蔽」，每次识别 ref 创建调用都要把整条作用域栈合并成一个新对象看一眼——在超大文件、极多作用域时这是实打实的开销，但正确性优先，认了。
-
-（顺带一提正则预筛这条小机制：进解析之前，先用一条正则看源码有没有 `$ref(`/`$()` 之类痕迹，没有就直接原样返回。换来绝大多数无糖文件零成本跳过——不解析、不建 AST；代价是正则有边界误判，比如注释里恰好写了 `$ref(`，但它只决定「要不要进入解析」，误判顶多多跑一次解析，最终改不改仍由 AST 说了算，不影响输出正确性。）
-
-至于解构（`const { x } = $(useFoo())`），真源码用「把整个解构模式替换成一个临时变量，再在后面逐个字段 `toRef` 取出来」的拆法，换来了响应式解构的完整语法（含默认值、嵌套、重命名），代价是生成临时变量和一段路径拼接逻辑——这属于工程完整度，不是原理重点，不展开。
-
-## 小结
-
-一句话收束：**编译期造一张响应式花名册，然后照着册子，在源码每一处引用上把 `.value` 补好**。运行时还是那个原生 ref，宏只是替你填了那个总忘加的 `.value`；为此付出的代价是失去语法透明性、以及一整套为「不误改」服务的保守静态判定和手写作用域栈。
-
-本章所有改写都发生在「已经解析好的一个 script / script setup 块内部」——这是第 1 章底座给我们的前提。下一章要动的，正是这个前提本身：**把「一个 SFC 只能有一个 script setup」这个框框打开**——让整文件即 setup、加独立的 setup 块、甚至把 setup 内联定义的子组件抽成虚拟模块再 import 回来。
+它演示了一种很 vue-macros 的解题姿势——**在编译期替读者做事，把运行时留得干干净净**。下一章会把这个姿势推得更远：当一个 `<script setup>` 不够用时，怎么把 SFC 的结构本身也打开。

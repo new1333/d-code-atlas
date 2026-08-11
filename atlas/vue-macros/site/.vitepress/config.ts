@@ -6,13 +6,13 @@ export default defineConfig({
   lang: "zh-CN",
   themeConfig: {
     // 启用 VitePress 内置本地搜索（基于 MiniSearch，零外部服务、零额外依赖，
-    // 符合 ADR-0006 自包含）。
+    // 符合 ADR-0006 自包含）。缺失则站点不出现搜索框——必须配。
     search: {
       provider: "local",
     },
     sidebar: [
       {
-        // 导读组：prologue 是全书级入口，固定为侧边栏首组。
+        // 导读组：prologue 是全书级入口，固定为侧边栏首组（仅当 work/prologue/draft.md 存在时出现）。
         text: "导读",
         items: [
           { text: "导读", link: "/guide/00-prologue" },

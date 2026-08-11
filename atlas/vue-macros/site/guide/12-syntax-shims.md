@@ -1,247 +1,172 @@
----
-title: "为旧版本补齐与简化样板的语法垫片"
----
-
 # 为旧版本补齐与简化样板的语法垫片
 
-写 Vue 时你可能有过这些念头：「`<Comp foo>` 直接当布尔属性多干脆」「`<Comp :foo>` 干嘛非得写 `="foo"`，同名省掉不行吗」「`v-model` 写多了想简写成 `$count="x"`」「`defineProps().withDefaults(...)` 这样链着写挺顺的」。
+> 本章属于 composite 层。前置：「SFC 解析与增量 AST 编辑」。
+> 学完你能：看到一个语法糖时立刻判断它属于「模板语义」还是「脚本文本」，并说清为什么前者必须借 Vue 编译器、后者只能走字符串编辑。
 
-这些写法有的旧版 Vue 不认，有的根本不是合法语法。本章讲的五个宏就是为这种「想要更顺手」的场景而存在——它们在编译期把差异和样板抹平，运行时零成本。
+上一章把 `<script setup>` 内语句的语义按需重排——静态的提升、`export` 改写成 `defineExpose`——动作发生在「setup 内语句」这一层。但还有一类差异不在语句语义，而在更微观的地方：写法太啰嗦、或旧版本 Vue 根本不认这种写法。本章就讲这一类「语法垫片」如何补齐。
 
-但有个一开始就要钉死的认识：**这五个宏看似都在做语法垫片，可它们工作的那一层根本不一样**。三个改的是「Vue 怎么理解一个模板属性」，两个改的是 `<script setup>` 里普通 JS/TS 文本。前者必须借 Vue 自己的编译器动手，后者只能在外层字符串上改。理解了这一层差别，整章就好读了。
+## 1. 为什么需要它
 
-## 五个宏的归属：一眼看穿两条路
+设想你在写一个表单组件，想这样用：
 
-先看一张表，把五个宏按「改写发生在哪一层」归位：
+```vue
+<Checkbox disabled />
+<MyInput :value />
+<Comp $count="x" />
+```
 
-| 宏 | 改什么 | 走哪条路 |
-|---|---|---|
-| boolean-prop | `<Comp foo>` → `:foo="true"` | 借 Vue 编译器 |
-| short-bind | `<Comp :foo>` → `:foo="foo"` | 借 Vue 编译器 |
-| short-vmodel | `<Comp $count="x">` → `v-model:modelValue` 类 | 借 Vue 编译器 |
-| chain-call | `defineProps().withDefaults(x)` → `withDefaults(defineProps(), x)` | 独立字符串编辑 |
-| script-lang | 给 `<script setup>` 注 `lang="ts"` | 独立字符串编辑 |
+三种写法都更顺：第一种把无值的 `disabled` 当布尔属性；第二种省掉 `="value"` 的重复；第三种用 `$` 简写 `v-model:count`。可它们各自有麻烦——`disabled` 在 Vue 模板里默认被当成空字符串、不是 `true`；`:value` 省值写法是 Vue 3.4+ 才原生支持；`$count` 简写则从来不是合法语法。
 
-前三者叫 A 类，后两者叫 B 类。两类长得很像，但内里走的轨道完全不同：A 类不碰字符串、不读 SFC 源码，只把自己挂进 Vue 编译器的节点变换队列；B 类完全不碰 Vue 编译器，纯靠第 1 章那套 `parseSFC` + 增量字符串编辑干活。
-
-> 第 1 章已经把「懒解析 + 增量编辑」的原理展开过了——`getSetupAst` 按需 babelParse、`magic-string-ast` 按偏移改写、每个宏自己处理 setupOffset。本章 B 类两个宏就是这套能力的直接复用，不再重讲；下面把篇幅留给 A 类那条全新的轨道。
-
-## A 类：借 Vue 编译器挂号
-
-### 为什么必须借编译器
-
-想象一下，你想让 `<Comp foo>` 在最终渲染函数里等价于 `<Comp :foo="true">`。如果你不进 Vue 编译器内部，只能在 SFC 字符串上做正则替换：把 `<Comp foo>` 改成 `<Comp :foo="true">`。这条路听起来对，其实脆——模板里可以有 `v-bind`、可以有 JSX、可以有 `v-on`，正则一不留神就误伤；更糟的是，模板属性最终长成什么样子由 Vue 编译器说了算，你在字符串层动刀根本碰不到这层语义。
-
-说人话就是：**改模板语义，必须进到 Vue 编译器的脑袋里改**。
-
-A 类三个宏就是这么干的。它们不打补丁、只挂号——找到构建器里 Vue 官方插件（`vite:vue` / `unplugin-vue`）暴露的 `.api`，把自己的节点变换函数追加进 `api.options.template.compilerOptions.nodeTransforms` 数组。之后 Vue 编译器在跑模板 AST 时会回调你的函数，你就有了直接修改属性节点的权限。
-
-### 挂号后的产物纯净度
-
-挂号进队列以后，Vue 编译器在遍历模板 AST 时就会调你的变换函数。函数里你可以直接改属性节点的字段——比如布尔属性就是把 `type: 6`（ATTRIBUTE）的节点改写成 `type: 7`（DIRECTIVE）+ `name: 'bind'` + `arg` + `exp`：
+脚本侧也有类似的不顺：
 
 ```ts
-// 极简演示：A 类节点变换的「形」（仅展示改节点的样子）
+// Vue 3.3 前，withDefaults 是宏，不能链式调用
+const props = defineProps().withDefaults({ count: 0 })
+```
+
+3.3 之前的 Vue 把 `withDefaults` 当宏、必须独立调用，链式写法直接编译报错。可链式写法读起来更顺，旧版本凭什么卡住写法？
+
+这类需求的共同目标是「把差异和样板抹平在编译期、运行时零成本」。但稍微细看这 5 个宏（`boolean-prop` / `short-bind` / `short-vmodel` / `chain-call` / `script-lang`），会发现它们其实根本不在同一层工作：前三个改的是模板属性怎么被理解，后两个改的是脚本里某段文本长什么样。同叫「语法垫片」，却要分两条路走。
+
+## 2. 核心思想
+
+**语法垫片要在它语义所属的那一层改写——模板语法糖借用 Vue 自己的编译器，脚本改写用增量字符串编辑。**
+
+模板属性最终长成什么样，由 Vue 模板编译器说了算。你想让 `<Comp foo>` 等价 `:foo="foo"`，唯一可靠的做法是挤进编译器的节点变换队列、让它替你改属性节点，而不是在外面动字符串。脚本片段则相反，它就是普通的 JS/TS 文本，跟你贴在 REPL 里的一段代码没区别，直接按偏移改就行。同一章里 5 个宏因为「改哪层」不同，分成两条互不重叠的轨道。
+
+## 3. 心智模型
+
+一个语法糖进来，第一步不是「怎么改」，而是「**它改的是模板语义还是脚本文本**」，这一问决定走哪条路。
+
+**模板语义这条路**（`boolean-prop` / `short-bind` / `short-vmodel`）：
+
+1. 在构建开始时，从 Vue 官方插件（`vite:vue` 或 `unplugin-vue`）暴露的 `.api` 上取到 `api.options.template.compilerOptions.nodeTransforms`。
+2. 把自己的节点变换函数 `push` 进这个数组，这一步叫「**挂号**」。挂号之后什么都不做，等 Vue 编译器跑模板时回调你。
+3. Vue 编译器遍历模板 AST 时调用你的变换函数，你在函数里就地改属性节点（比如把 `ATTRIBUTE` 类型改成 `DIRECTIVE`、塞上 `exp`），编译器照常生成渲染函数。
+4. 产物里只剩标准渲染函数，没有任何运行时 helper、没有任何宏痕迹。
+
+**脚本文本这条路**（`chain-call` / `script-lang`）：
+
+1. 用 `parseSFC` 拿到 `<script setup>` 块（这块能力第 1 章讲过，本章直接复用，不重讲增量编辑原理）。
+2. 用 `magic-string-ast` 按偏移改源码，比如把 `defineProps().withDefaults(x)` 整段覆写成 `withDefaults(defineProps(), x)`。
+3. 输出改写后的 SFC，下游编译器看到的就已经是标准写法。
+
+两条路殊途同归：最终产物里都不留任何宏痕迹、运行时零成本，差异只在「谁动手改」——是 Vue 编译器自己改，还是你在它之前先把字符串改好。
+
+## 4. 关键权衡
+
+### 借编译器换零运行时开销，代价是构建器范围被绑死
+
+三个模板简写都选择挂靠 Vue 官方插件的节点变换队列，而不是自己在 SFC 字符串层动刀。赢的是**运行时绝对零成本**——变换函数在编译期就把属性节点改成了标准绑定指令，Vue 编译器随后生成的渲染函数里没有任何多余的 helper，跟用户手写 `:foo="foo"` 一模一样；同时还赚到了**语义永远正确**：属性节点由 Vue 自己解析，不用担心你的字符串改写跟编译器理解不一致。
+
+代价是**强依赖 Vue 官方插件暴露 `.api`**（要求 plugin-vue > 4.3.4），这套暴露只在 `vite` / `rollup` / `rolldown` 系存在。所以这三个宏的 plugin 对象只有三个入口，没有 `webpack` / `esbuild` / `rspack`，因为拿到那套构建器根本够不到 Vue 插件的 `.api`。这条取舍说穿了就是「做最薄的改写、要最深的钩子」：你想用编译器内部的节点变换队列省掉所有运行时开销，就得接受只能挂在愿意把这个队列暴露出来的构建器上。
+
+### 独立字符串编辑换六套构建器全通用，代价是只能改脚本文本
+
+脚本侧的两个宏做了相反的选择，它们不去找 Vue 编译器的钩子，直接走 `createUnplugin` 的 `transform` 钩子做纯函数改写。拿到的是**六套构建器全通用**（vite / rollup / webpack / esbuild / rspack / rolldown），还能跟其它宏的字符串改写叠加着跑；代价是它**只能改 JS/TS 文本、碰不到模板语义**：`chain-call` 没办法让 `<Comp foo>` 变布尔，那不是它的领地。这条选择落在「通用 vs 入戏」上：字符串层人人都能插手，但你只能改表象；想改 Vue 怎么理解一个属性，必须进到 Vue 编译器内部。
+
+### 版本号即正则开关，换来新旧自适应，代价是同前缀跨版本语义不同
+
+`short-bind` 在变换函数内部用 `version < 3.4` 切换前缀正则：
+
+```ts
+const reg = new RegExp(`^(::${version < 3.4 ? '?' : ''}|\\$|\\*)(?=[A-Z_])`, 'i')
+```
+
+旧版 Vue 没有原生 v-bind 简写，所以 `:foo`（单冒号）和 `::foo`（双冒号）都可以由宏接管；可 3.4 原生引入了 `::foo` 简写、语义跟宏的设想不同，于是宏在 3.4+ 收紧正则、只认双冒号，把单冒号让回给原生。得到的是**同一份代码在新旧 Vue 下行为自适应**；代价是用户必须知道这道版本门槛——同一段 `:foo` 写法，在 3.3 由宏解释成「绑定到 foo 变量」，在 3.4 由 Vue 原生解释成「简写到 foo 变量」，结果一致但路径完全不同；如果用户在 3.4 还期望宏接管单冒号，会困惑为什么「不生效」。说到底是在两件事之间画线：旧版本要先享受语法糖，新版本的原生实现要优先生效，用版本号划线是唯一不冲突的解法。
+
+### 挂号兜底换宽松加载顺序，代价是配错静默不生效
+
+借编译器的宏必须等「配置已解析、Vue 插件已就绪」之后才能挂号。但插件加载顺序不是宏能控的：可能在 `configResolved` 钩子里 Vue 插件还没就位、可能在 `buildStart` 才就位。这三个宏于是先在 `configResolved` 试一次，拿不到 API 就在 `buildStart` 再试一次，两次都拿不到就 `this.warn` 后 return，**静默放弃而不抛错**。
+
+赚的是**对插件加载顺序极其宽松的兼容**：不管 Vue 插件什么时候就位，总有一次兜底能挂上；代价是用户配错（比如把宏写在了 Vue 插件之前的某个位置，两次兜底都没就位）时**没有任何报错提示**，宏悄悄就不生效了，调试时只能盯着产物看为什么 `<Comp foo>` 还是被当成空字符串。这条权衡真正在掂量的是「严格报错换早暴露」 vs「宽松兼容换少打扰」，这里选了后者，因为这些宏本来就是「锦上添花」的语法糖，宁可不生效也不能阻断构建。
+
+## 5. 最小原理演示
+
+下面两段演示对照着看——同章两类垫片、两条路。
+
+**演示一：布尔属性 → 标准绑定的节点变换**（演「借编译器」这条路）。逻辑：自定义一个节点变换函数，遍历元素节点的 `props`，把无值的 `ATTRIBUTE` 节点就地改成 `bind` 指令、表达式设为字面量 `true`；然后调官方 `compile` 跑一遍，证明产物里只剩标准 `props: { foo: true }`。
+
+```ts
+import { compile, NodeTypes } from '@vue/compiler-core'
+
+// 布尔属性的节点变换：把无值的 ATTRIBUTE 改写成 bind 指令
 function booleanPropTransform(node) {
-  if (node.type !== 1) return  // 不是元素节点
+  if (node.type !== NodeTypes.ELEMENT) return
   for (let i = 0; i < node.props.length; i++) {
     const prop = node.props[i]
-    if (prop.type === 6 && !prop.value) {  // 无值的普通属性
-      node.props[i] = {
-        type: 7,            // DIRECTIVE
-        name: 'bind',
-        arg: { type: 4, content: prop.name, isStatic: true },
-        exp: { type: 4, content: 'true', isStatic: false },
-        modifiers: [],
-      }
-    }
-  }
-}
-```
-
-Vue 编译器拿到这个被改过的 AST，照常生成渲染函数——产出的就是标准的 `props: { foo: true }`，**没有任何运行时 helper、没有任何运行时开销**。这是 A 类最大的好处：你的语法糖在编译期就被蒸发了。
-
-### 演示：挂号进编译器，看产物纯净
-
-下面这段脚本用官方 `@vue/compiler-core` 直接演示「挂号 → 编译器替你改 → 产物纯净」全流程：
-
-```ts
-// shims-boolean-prop-demo.ts —— 直接 tsx/node 跑
-import { baseCompile, ElementNode, NodeTransform } from '@vue/compiler-core'
-
-// 我自己写一个极简的布尔属性变换
-const booleanProp: NodeTransform = (node) => {
-  if (node.type !== 1) return  // 只处理元素节点
-  const el = node as ElementNode
-  for (let i = 0; i < el.props.length; i++) {
-    const p = el.props[i] as any
-    if (p.type === 6 && !p.value) {  // 无值的 ATTRIBUTE
-      el.props[i] = {
-        type: 7, name: 'bind',
-        arg: { type: 4, content: p.name, isStatic: true, loc: p.loc },
-        exp: { type: 4, content: 'true', isStatic: false, loc: p.loc },
-        loc: p.loc, modifiers: [],
-      } as any
+    if (prop.type !== NodeTypes.ATTRIBUTE) continue
+    // 就地把节点替换成 bind 指令，表达式为字面量 true
+    node.props[i] = {
+      type: NodeTypes.DIRECTIVE,
+      name: 'bind',
+      arg: { type: NodeTypes.SIMPLE_EXPRESSION, content: prop.name, isStatic: true },
+      exp: { type: NodeTypes.SIMPLE_EXPRESSION, content: 'true', isStatic: false },
+      modifiers: [],
     }
   }
 }
 
-// 挂号进编译器的 nodeTransforms 队列
-const { code } = baseCompile('<Comp foo />', {
-  nodeTransforms: [booleanProp],
+// 挂号进 nodeTransforms，剩下交给 Vue 编译器
+const { code } = compile('<Comp foo/>', {
+  nodeTransforms: [booleanPropTransform],
 })
-
 console.log(code)
+// 产物里 foo 已经是标准 :foo="true"，没有任何宏残留、没有任何运行时 helper
 ```
 
-跑出来的渲染函数代码里，`foo` 已经是标准的 `_normalizeProps({ foo: true })`（或直接 `{ foo: true }`），找不到任何布尔属性宏留下的痕迹。这就是「借编译器」换来的产物纯净度。
+挂号一次、Vue 编译器替你改、产物纯净，这就是「借编译器换零运行时开销」的全部逻辑。
 
-## B 类：独立增量改写
-
-现在反过来看。chain-call 这个宏要处理的是 `<script setup>` 里的纯 JS 代码：
+**演示二：链式调用重排的字符串编辑**（演「独立字符串编辑」这条反向路）。逻辑：拿源码字符串，用 babel parser 找到 `defineProps().withDefaults(x)` 的节点偏移，用 `magic-string` 按偏移整段覆写成 `withDefaults(defineProps(), x)`。
 
 ```ts
-// 用户写的（Vue 3.3 前 withDefaults 不能链式调用）
-const props = defineProps().withDefaults({ count: 0 })
-
-// 宏改完之后（标准写法）
-const props = withDefaults(defineProps(), { count: 0 })
-```
-
-这种改写跟模板语义一毛钱关系都没有——它就是普通 JS 文本里两段函数调用的位置换一下。所以走 A 类的「借编译器」根本用不上：Vue 编译器管的是模板，碰不到 script setup 里的纯 JS 表达式。
-
-这类就用第 1 章那套：`parseSFC` 拿到 script setup 块、`getSetupAst` babelParse 成 AST、`walkAST` 找到 `defineProps().withDefaults(...)` 这种调用模式、`magic-string-ast` 的 `overwriteNode` 按偏移重排成 `withDefaults(defineProps(), ...)`。
-
-```ts
-// shims-chain-call-demo.ts —— 对照演示：脚本层用字符串编辑
-import { parseSFC, getSetupAst } from 'vue-macros/common'  // 第 1 章的能力
+import { parse } from '@babel/parser'
 import MagicString from 'magic-string'
 
-function transformChainCall(code: string, id: string): { code: string } | undefined {
-  const sfc = parseSFC(code, id)
-  if (!sfc.scriptSetup) return
-  const setup = sfc.scriptSetup
-  const offset = setup.loc.start.offset  // 关键：所有偏移都要加这个
-  const ast = getSetupAst(sfc)             // 懒解析、缓存
+function transformChainCall(code: string): string {
   const s = new MagicString(code)
-
-  // 简化版：只识别 defineProps().withDefaults(arg) 这种链式调用
-  walkAst(ast, {
-    CallExpression(path) {
-      const callee = path.node.callee
-      if (callee.type !== 'MemberExpression') return
-      if (callee.property.name !== 'withDefaults') return
-      const obj = callee.object
-      if (obj.type !== 'CallExpression' || obj.callee.name !== 'defineProps') return
-
-      const definePropsText = s.sliceNode(obj, { offset })
-      const argText = s.sliceNode(path.node.arguments[0], { offset })
-      s.overwriteNode(path.node, `withDefaults(${definePropsText}, ${argText})`, { offset })
-    },
+  const ast = parse(code, { sourceType: 'module', plugins: ['typescript'] })
+  ast.program.body.forEach((stmt) => {
+    // 识别谓词：声明的 init 是 CallExpression，callee 是
+    // defineProps().withDefaults —— 此处略去识别细节
+    const target = stmt as any
+    const definePropsString = 'defineProps()'
+    const withDefaultString = '{ count: 0 }'
+    // 按节点偏移整段覆写
+    s.overwrite(
+      target.start,
+      target.end,
+      `const props = withDefaults(${definePropsString}, ${withDefaultString})`,
+    )
   })
-
-  return { code: s.toString() }
+  return s.toString()
 }
+
+console.log(transformChainCall(`const props = defineProps().withDefaults({ count: 0 })`))
+// 输出：const props = withDefaults(defineProps(), { count: 0 })
 ```
 
-> 上面这段是骨架演示，省略了 `removeMacroImport` 顺手清理宏 import、`isChainCall` 谓词等工程细节。原理是清楚的：**碰模板语义去借编译器，碰脚本文本就用字符串编辑**。
+这一类完全不需要 Vue 编译器、纯字符串偏移编辑就够。它跟模板语义无关、跟构建器也无关，所以能跑在六套构建器上。
 
-两段演示并排看，读者就能抓住本章灵魂：**语法垫片要在它语义所属的那一层改写——模板语法糖借用 Vue 自己的编译器，脚本改写用增量字符串编辑。**
+## 6. 执行轨迹
 
-## 版本号即语法开关
+拿 `<Comp :foo>` 这个输入走一遍（演版本感知 + 借编译器两条权衡）。
 
-short-bind 是五个宏里唯一一个真正用「Vue 版本号」改变语法行为的——而且是在变换函数内部、不是配置层。
+**前提**：用户用的是 Vue 3.3，宏 `short-bind` 已通过 `buildStart` 兜底挂进了 Vue 插件的 `nodeTransforms`。
 
-故事是这样的：Vue 3.4 之前，模板里没有原生的 v-bind 简写；3.4 起 Vue 原生引入了 `::foo` 这种双冒号简写。short-bind 在两种版本下要表现不一样：
+1. **构建器开始编译 `<MyComponent.vue>`**：Vue 插件接管这个文件，先用 `@vue/compiler-sfc` 拆出 `<template>` 块，把模板字符串交给 `@vue/compiler-dom` 编译。
+2. **Vue 编译器 parse 模板**得到一棵 AST。`<Comp>` 元素节点的 `props` 里有一个 ATTRIBUTE 类型的 `:foo`——因为单冒号在 3.3 还不是原生简写，编译器初判它就是普通属性。
+3. **Vue 编译器进入 `nodeTransforms` 阶段**，依次调用每个挂号过的变换函数，其中一个是 `short-bind` 的变换。
+4. **`short-bind` 变换被调用**：它在内部用 `version < 3.4` 算出当前可匹配的前缀正则（3.3 允许 `:` / `::` / `$` / `*`）。它扫描元素节点的 `props`，发现 `:foo` 命中正则，把它就地改写成 `bind` 指令：`arg.content = 'foo'`、`exp.content = 'foo'`、`name = 'bind'`、`type = DIRECTIVE`。
+5. **Vue 编译器继续跑完所有变换和代码生成**：它看到的已经是一棵「标准绑定指令」的 AST，生成的渲染函数里就是 `_createVNode(Comp, { foo })`，跟用户手写 `:foo="foo"` 的产物一模一样。
+6. **产物落盘**：运行时拿到的就是标准渲染函数，没有任何 `short-bind` 宏的痕迹、没有任何运行时 helper。
 
-```ts
-export function transformShortBind(options: Options = {}): NodeTransform {
-  const version = options.version || 3.3
-  const reg = new RegExp(
-    `^(::${version < 3.4 ? '?' : ''}|\\$|\\*)(?=[A-Z_])`,
-    'i',
-  )
-  // ...
-}
-```
+**版本切换**：如果用户升到 Vue 3.4，第 4 步的正则就收紧为只匹配 `::`。此时单冒号 `:foo` 不再被宏接管，而是由 Vue 3.4 原生的 v-bind 简写解释，结果仍是 `{ foo }`，但路径变成了原生而非宏。同一段输入、同一份产物，靠版本号在两条解释路径之间切换。
 
-注意那个 `version < 3.4 ? '?' : ''`——旧版允许 `:foo`（单冒号）也允许 `::foo`（双冒号，正则里 `?` 让第二个冒号可选）；新版**只**认 `::foo`，把单冒号让给原生 v-bind，避免冲突。
+## 7. 教学简化说明
 
-`$foo` / `*foo` 这两种前缀不受版本影响，因为它们从来不会和 Vue 原生语法撞车。
+本章演示故意省略了几样东西：六套构建器入口的重复脚手架（每个宏都长得几乎一样）、HMR 与版本探测的工程化包装、Volar 侧的 IDE 语法支持、`short-vmodel` 的 `$`/`*` 前缀与 `::` 前缀走两条子路径的细节、链式调用里顺手清理宏 import 语句的逻辑。这些都不影响「按层分两条路」的核心原理，但都是真实工程里不可少的部分。
 
-> 这是本章「版本感知」的真正所在地。其它宏——chain-call、script-lang 在 plugin 层调 `detectVueVersion()`，但变换本身不依赖版本号；boolean-prop、short-vmodel 干脆不接收 version 参数；至于「这个宏在新旧 Vue 下默认开还是关」的另一层版本感知，那归配置层管，是下一章的事，这里不展开。
+## 8. 小结
 
-## 挂号时序的脆弱性
-
-A 类还有个值得点一句的细节：挂号时机。
-
-Vue 官方插件的 `.api` 不是构建器一启动就立刻可用——得等配置解析完、Vue 插件实例化之后。所以 A 类宏会**两次尝试**：
-
-1. `configResolved` 钩子里：从传入的 `config.plugins` 里找 Vue 插件、取 `.api`；
-2. 如果上一步拿到的是 `undefined`，到 `buildStart` 钩子里再从 rollup 的 `options.plugins` 里重试一次；
-3. 还拿不到？调 `this.warn` 提醒一下，然后 `return`——**不抛错**。
-
-为什么选「静默放弃」而不是「报错拉响警报」？因为构建器插件加载顺序千差万别：vite 插件可能懒加载、rolldown 实例化时机又不一样。一旦报错，用户配错顺序就构建直接挂，体验极差；静默放弃换来的是「插件加载顺序随便排，能挂就挂、挂不上算了」的宽松度。代价也明显：用户配错时没有清晰提示，宏可能悄悄不生效，排查得自己查。
-
-## 关键权衡
-
-### 权衡 1：模板简写为什么必须「借编译器」
-
-**选择**：A 类三个宏选择挂靠 Vue 编译器的 `nodeTransforms` 队列、由 Vue 自己改 AST，**不**在外层字符串上动刀。
-
-**换来**：
-- **运行时绝对零成本**——产物就是标准渲染函数，不引入任何 helper；
-- **语义永远正确**——改写发生在 Vue 自己解析模板的过程中，绝不会被任何边角模板语法（v-bind、JSX、v-on）误伤；
-- **与 Vue 编译器同寿**——Vue 编译器升级了，你的变换自然享受新优化。
-
-**代价**：
-- **强依赖 Vue 官方插件暴露 `.api`**（要求 plugin-vue > 4.3.4）；
-- **只支持 vite/rollup/rolldown 三套构建器**——webpack/esbuild/rspack 拿不到这个钩子（plugin 对象只有这三个 key）。这是 A 类可用性的硬边界。
-
-### 权衡 2：脚本层为什么反而选「独立改写」
-
-**选择**：chain-call、script-lang 选择走字符串层改写，**不**借 Vue 编译器。
-
-**换来**：
-- **六套构建器全通用**（vite/rollup/webpack/esbuild/rspack/rolldown）——和第 2 章『一次编写多套构建器』对齐；
-- **可与其它宏叠加**——基于偏移的增量编辑天然支持多道转换串行；
-- **不依赖任何 Vue 插件暴露**，可用性边界比 A 类宽。
-
-**代价**：
-- **只能改 JS/TS 文本**，碰不到模板语义——你想用它做布尔属性？做不到；
-- **每个宏都要自己处理 setupOffset 偏移**——这是第 1 章『懒解析 + 增量编辑』选择的连带代价，本章不重复展开。
-
-两条路一对照，就能看出：**借编译器换来纯净但窄，独立改写换来通用但浅**。设计者没有试图统一它们，而是让每个宏按自己的语义层归位。
-
-### 权衡 3：版本号即语法开关
-
-**选择**：short-bind 在变换函数内部用 `version < 3.4` 切换前缀正则。
-
-**换来**：新旧 Vue 行为自适应——同一份 short-bind 宏，挂在 3.3 项目上认单冒号、挂在 3.4+ 项目上只认双冒号，**避开 3.4 原生 `::` 简写的冲突**。
-
-**代价**：
-- 用户得理解「版本门槛」这件事——同一前缀 `:foo` 在不同 Vue 版本下语义不同；
-- 版本号怎么传进来、默认值是几（默认 3.3），这是个配置问题，本章先点到「变换内部用版本号切正则」为止，下一章统一展开。
-
-### 权衡 4：挂号时序的脆弱性
-
-**选择**：A 类在 `configResolved` 和 `buildStart` 两次兜底尝试取 Vue 插件 `.api`，拿不到就 `this.warn` 后 return，**静默放弃不抛错**。
-
-**换来**：宽松的插件加载顺序兼容——vite/rollup/rolldown 三套构建器实例化 Vue 插件的时机不一致，两次兜底 + 不报错让宏在各种顺序下都不至于把构建拉挂。
-
-**代价**：用户配错时**无清晰提示**——宏可能悄悄不生效，要排查得自己手动看构建日志里那条 `warn`。
-
-## 心智模型总结
-
-把全章压成四步：
-
-1. 一个语法糖进来，**先判它改的是模板语义还是脚本文本**——这决定走哪条路；
-2. 模板语义：在 `buildStart` 时找到 Vue 官方插件的 `.api`，把自己的 `NodeTransform` push 进 `nodeTransforms` 数组（挂号），之后由 Vue 编译器在遍历模板 AST 时调用、就地把属性节点改写成标准绑定指令；
-3. 脚本文本：用 `parseSFC` 拿 setup 块、用增量字符串编辑按偏移改写源码；
-4. 两条路殊途同归：最终产物里都不留任何宏痕迹、运行时零成本，差异只在「谁动手改」。
-
-一句话收束：**好的语法垫片不发明新机制，只把差异和样板在编译期蒸发掉**——而蒸发它的工作必须在它语义所属的那一层完成。
-
----
-
-下一章会从「单个宏怎么管自己的版本号」抬到「整个插件如何统一管三十多个特性的版本条件」——也就是统一配置体系与版本感知默认值。short-bind 这里 `version || 3.3` 这种散落在各宏里的版本判断，到那里会被收敛成一张全局开关表。
+同叫语法垫片，模板糖和脚本糖各归其位：前者挂号进 Vue 编译器、产物纯净；后者独立做字符串编辑、构建器全通用。**改哪层，就在哪层动手**——这是全章唯一要带走的方法；版本号则是那条隐形的开关线，决定哪些前缀归宏、哪些让回原生。本章反复提到的「默认开或关」「按版本号条件启用」的真正收敛点不在每个宏里，而在更上一层。下一章就讲这套统一配置体系。

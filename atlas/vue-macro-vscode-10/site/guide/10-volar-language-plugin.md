@@ -1,150 +1,147 @@
-# Vue Language Plugin 接口：把「怎么翻译 .vue」做成可挂载的钩子
+# Vue Language Plugin 接口与 SFC 解析扩展点
 
 > 本章属于 composite 层。前置：Volar 的虚拟代码生成与位置回映。
-> 学完你能用一句话讲清：官方为什么要把虚拟代码生成的规则开放成一组钩子接口，这套开放换来了什么样的扩展能力，又背上什么样的耦合代价。
+> 学完你能：用一句话讲清「为什么 Volar 把 SFC→虚拟代码的映射规则做成可插拔接口、这换来了什么、代价是什么」。
 
 ## 1. 为什么需要它
 
-上一章把 Volar 那套「把 `.vue` 翻译成虚拟 `.ts`，再把 TS 的诊断位置翻译回原文件」的机制讲通了，虚拟代码加位置映射这条流水线已经跑起来了。但它留了一个口子：那套翻译的**规则是谁定的**？答案是官方编译器自己写死的。`defineProps` 能被编辑器理解，是因为官方的虚拟代码生成器里硬编码了它的处理逻辑，骨架里早就留好了对应的类型占位。
+上一章讲了 Volar 用「虚拟代码 + 双向位置映射」把 `.vue` 翻译成下游 TS 服务能消化的虚拟 `.ts`，再把诊断坐标映射回原文件。映射这件事办成了，但映射的**规则**是写死的。
 
-口子就在这里：如果你写了一个官方不认识的宏，比如 `defineProp`，或者干脆拿一个 `.setup.tsx` 当组件用，编辑器立刻抓瞎。宏下面爆红线「找不到该函数」，宏推断出来的 props 类型也喂不进模板。你的感觉是「Vite 能编译、能跑，VS Code 却一路报错」。这个缺口不是 TS 不够聪明，而是**没人告诉语言工具这套新语法的虚拟代码该怎么生成**。
+`defineProps` 能被理解，是因为官方虚拟代码生成器把它的语义硬编码进了生成逻辑——看到 `defineProps<{count: number}>()`，就编译成等价的 props 类型注入到组件定义里。但当你写了一个官方没预置的宏（比如 Vue Macros 的 `defineProp`、`definePropsRefs`，或者干脆把 `.setup.tsx` 当组件用），编辑器立刻抓瞎：宏下方爆红线「找不到该函数」，宏推断出的 props 类型也喂不进模板。
 
-能不能直接改官方编译器源码？能，但每加一个第三方宏都得提 PR、等发版，这条路显然走不通。于是问题被翻过来：既然生成虚拟代码这条管线已经在跑了，能不能把「翻译规则」从官方编译器的私货里抽出来，做成一组任何人都能挂的钩子？这就是 VueLanguagePlugin 接口要解决的事。
+用户的直观感受是「明明 vite 能编译、能跑，VS Code 却一路报错」。这个缺口不是 TS 不够聪明，而是**没人告诉语言工具这套新语法的虚拟代码该怎么生成**。每个新宏都得各自另起炉灶、复制一遍整套位置回映与 TS 桥接——显然不现实。
+
+把生成规则做成可插拔接口，第三方就能以「插件」身份接入同一条管线，复用全部已有能力，只在需要变换的那一步注入自己的逻辑。
 
 ## 2. 核心思想
 
-把「SFC 怎么被解析、虚拟代码怎么生成」这件事，从官方编译器的内部逻辑里抽成一组可插拔的钩子接口。第三方不改官方源码，就能往翻译管线的每个阶段挂自己的变换。
+把「SFC→虚拟代码」这条管线**按阶段切片、每段留一个钩子**。插件只在它关心的那一段注入变换，其余阶段继续由官方实现兜底——这就是 `VueLanguagePlugin` 的本质形状。
 
 ## 3. 心智模型
 
-一个插件长什么样？就是一个函数：接收一个上下文 `ctx`，返回一个带若干**可选**钩子的对象。`ctx` 给你三样东西：`modules`（注入和宿主**同版本**的 TS、`@vue/compiler-dom` 等实例，免得插件自己再装一份把版本搞错）、`compilerOptions`（tsconfig）、`vueCompilerOptions`（含 `plugins` 自身）。你想实现哪个阶段就写哪个钩子，不写的直接跳过。
+一个语言插件就是一个函数。它接收一个上下文 `ctx`（里头有 `typescript` 实例、`@vue/compiler-dom` 实例、tsconfig 的 `vueCompilerOptions`，保证插件与宿主用的是同一份 TS），返回一个带若干可选钩子的对象。
 
-钩子按管线阶段分成四组，正好对应上一章那条流水线的四个工位：
+钩子按管线阶段分四组：
 
-```
-① 发现   → 认领文件（这个文件归不归我管？）
-② 解析   → 产出 SFC 描述符（把源码切成 script/template/style 块）
-③ IR    → 把各块编译成结构化中间表示（脚本→AST、模板→渲染函数）
-④ 嵌入代码 → 声明有哪些虚拟文件，再逐个填充内容
-```
+- **发现**：`getLanguageId`、`isValidFile`——决定文件该不该被这条管线认领。
+- **解析**：`parseSFC` / `parseSFC2`——把原始内容解析成 SFC 描述符（script/template/style 各块的元信息）。
+- **IR 编译**：`compileSFCScript`、`compileSFCTemplate`、`compileSFCStyle`——把每块编译成结构化中间表示。
+- **嵌入式代码**：`getEmbeddedCodes`（声明有哪些虚拟文件）+ `resolveEmbeddedCode`（逐个填充内容）。
 
-这里最关键的设计，是同一套接口里**藏了两种完全不同的调度语义**：
+装配规则：内置插件先列、用户插件排在后；先 `flatMap` 展平（一个插件可以返回多个实例），再按 `order`（数字，默认 0）升序排序，最后用 `version` 做兼容门禁过滤掉不兼容者。
 
-- **首胜**：发现和解析阶段的钩子，管线顺着插件链挨个问，第一个返回非空的就用，后面的不再问。一个文件只能被一种方式认领、一种方式解析。
-- **累积**：嵌入代码阶段的钩子，每个插件的贡献都叠加到同一份虚拟代码上，全部保留。
+调度有两种语义并存：
 
-为什么要两套？因为扩展性其实有两种诉求在打架：认领文件只能有一个答案（互斥），往虚拟代码里加内容却可以多人合作（叠加）。一套接口硬要同时容纳这两种语义，就只能让调度规则按阶段不同。
-
-最后是插件链怎么排。启动时内置插件（十几个）排在前，用户在 `tsconfig` 的 `vueCompilerOptions.plugins` 里登记的插件排在后；每个插件函数的返回值先 `flatMap` 展平（一个插件可以返回多个实例），再按 `order` 数字升序排，最后用 `version` 过滤掉不兼容的。排完就是一条长链，处理每个文件时按阶段从头问到尾。
+- 解析/发现类用「**首个返回非空者胜出**」（first-wins）：管线顺序询问，第一个返回非 `undefined` 的结果被采用。
+- 代码生成类用「**全部累积**」（accumulate）：每个插件的贡献依次叠加到同一份虚拟代码上。
 
 ## 4. 关键权衡
 
-### 4.1 寄生注入：站在官方骨架上贴便签，而不是自己重排
+### 在官方骨架上寄生注入，换实现极简，代价是锚点耦合
 
-一个自定义宏要让 TS 认识，最朴素的做法是插件自己从头生成一份完整的虚拟代码。但官方生成的那份虚拟代码结构很复杂——组件定义、props/emits 类型、模板的类型上下文都在里面——自己重做一遍等于把官方生成器抄一遍，每个宏都得背一整套官方内部结构。
+脚本层最常见的变换手法不是「自己生成虚拟代码」，而是「在官方生成的骨架上动手脚」。官方 `vue-tsx` 插件会先产出一份带固定内部标识符锚点的虚拟代码骨架——公共 props 类型名、组件定义处的 props/emits 字段位置。宏插件只要在 `resolveEmbeddedCode` 钩子里拿到这份骨架，往锚点处 splice 几行、再 push 一条 `declare function defineProp<T>(...)` 的全局声明，就能让 TS 把自定义宏当合法符号。
 
-实际的做法是「寄生」。官方插件先跑，产出一份带固定内部标识符（**锚点**）的虚拟代码骨架，里面已经留好了公共 props 类型、组件定义的 props/emits 字段这些位置。用户插件拿到这份骨架，在锚点处 `splice`/`replace`，把自己宏推断出的类型塞进去，再往末尾 `push` 一条 `declare function` 让宏变成合法全局符号。
+换来的是实现极简：一个宏插件常常只要几十行、改一两个位置。比起另起炉灶生成一份完整虚拟代码，工作量被压到了最小。
 
-- **选择**：在官方骨架的锚点上 splice 注入，而不是重新生成虚拟代码。
-- **换来**：实现极简。一个宏常常几十行、改一两个锚点就完事。
-- **代价**：和官方虚拟代码生成器的内部实现强耦合。锚点标识符一旦改名，或者 Vue 大版本换了锚点形态（比如 3.5 前后 props 锚点不一样），所有寄生宏会同时失效，版本兼容成本全压在插件作者身上。
-- **化解的本质矛盾**：第三方想无限扩展新语法，但这些新语法得寄生在官方生成的虚拟代码上，而那份虚拟代码的内部结构从来不是公开 API。扩展的开放性和锚点的私有性，是一对长期紧张关系。
+代价是这条路线与官方虚拟代码生成器的**内部实现强耦合**。锚点标识符是私有约定，不是公开 API。一旦 Vue 大版本切换锚点形态（比如 3.5 前后 props 虚拟代码从 `props` 字段改成 `__typeProps`），所有寄生宏会同时失效。版本兼容成本全部压在插件作者身上，得在每个插件里按 `target` 版本分支处理。
 
-打个比方：像在官方打印好的一份表格上**贴便签**改字，而不是重新排版整张表。贴便签快，但表格一改版，所有便签的位置都得重新对。
+化解的本质矛盾是「**留出扩展点**」与「**保持骨架演进自由**」之间的张力——这是「开放-封闭」原则的固有代价：留口子就意味着承诺一个稳定形状，否则骨架就成了封闭的私有实现。
 
-### 4.2 解析层伪装：把 `.setup.tsx` 塞进一个 `<script setup>` 壳里
+### 解析层伪装换任意文件格式接入，代价是偏移修正责任下放
 
-有些场景根本不是 `.vue` 文件。Vue Macros 的 setupSFC 让你写一个纯 `.setup.tsx` 当组件用，官方解析器只认 `.vue`，怎么让这种文件也进管线？
+把 `.setup.tsx` 当 SFC 用看起来不可能——它根本不是 `.vue`。但 `parseSFC2` 钩子让你可以把它的内容包进一段 `<script setup lang="tsx">…</script>` 前缀/后缀，再喂给官方解析器，让它产出一份合法的 SFC 描述符。
 
-做法是在解析钩子 `parseSFC2` 里动手脚：把 `.setup.tsx` 的内容人为包进 `<script setup lang="tsx">…</script>`，再喂给官方解析器，并用 `order: -1` 抢在官方的 `.vue` 认领逻辑之前。
+换来的是任意文件格式都能伪装成 SFC 接入同一条管线，复用全套位置回映与 TS 桥接能力。`setup-sfc`、`script-sfc` 这类 Vue Macros 特性都是这么挂上来的。
 
-- **选择**：在解析钩子里把任意格式的内容包进 SFC 壳子，伪装成 `.vue` 再喂官方解析器。
-- **换来**：任意文件格式都能接进同一条管线，复用全部的位置回映和 TS 桥接，不用重写解析器。
-- **代价**：你加的那段前缀（`<script setup lang="tsx">\n`）会污染所有位置信息。官方解析器算出来的坐标都比真实文件多出几十个字符，**必须插件自己把这段前缀长度从每个位置上减回去**。一旦漏算，诊断和补全的坐标整体错位。这正是上一章讲的「保真风险」在插件层的直接兑现，offset 的责任被下放给了插件。
-- **化解的本质矛盾**：你想复用官方解析器（不肯重写），但官方解析器只认固定格式，你只能伪装输入；伪装加的前缀必然污染位置映射，而修正这件事没法自动化，只能甩给最了解这段前缀的人，也就是插件自己。
+代价是包装引入的前缀长度必须由插件**手动从所有位置信息里减回去**。官方解析器算出来的所有 offset 都基于「包装后」的内容，如果不减回去，诊断坐标和补全位置就会整体前移几十字节——光标在 `count` 上、报错却点在 `count` 前面。这正是上一章「保真风险」在插件层的直接兑现：位置映射的保真责任被下放给了每个解析类插件。
 
-### 4.3 类型层虚拟代码：让 TS 把宏当成真函数
+本质矛盾是「**管线只懂一种输入格式**」与「**支持任意用户自定义文件后缀**」之间的张力。伪装没有消解这个矛盾，只是把它转嫁给了插件——管线保持纯粹，插件替管线承担格式适配的复杂度。
 
-这条是本章的重头，也是下一章的引子。
+### 同时产出类型层虚拟代码，换编辑器智能，代价是双轨必须对齐
 
-光识别宏调用还不够。假设你写 `const count = defineProp<number>('count', true)`，TS 会先抱怨「`defineProp` 找不到」这个符号，根本走不到推断 props 类型那一步。所以插件得同时做两件事：往虚拟代码里 `push` 一条 `declare function defineProp<T>(...)`，让 `defineProp` 变成合法全局函数；同时把推断出的 props 类型 `splice` 进骨架的 props 锚点，让模板能消费。
+一个宏插件如果只识别宏调用、不生成类型信息，TS 会看到 `defineProp(...)` 但不知道它返回什么类型，也不知道该往组件 props 上塞什么字段。所以插件必须做两件事：往 props/emits 锚点注入推断出的类型（让模板能消费），同时 push 一段 `declare function` 全局声明（让宏调用本身不报「找不到符号」）。
 
-- **选择**：插件不只识别宏调用，还要往虚拟代码注入等价的全局类型声明和 props/emits 类型。
-- **换来**：TS 把自定义宏当成合法全局符号，悬停、补全、类型检查全绿。
-- **代价**：这套「类型层」虚拟代码的语义，必须和构建期真实变换后的产物**严格对齐**。构建期那条线（unplugin）是真的把宏去糖改了代码，IDE 这边是「假装改了」生成虚拟代码，两条线各自独立实现。任何一侧先行或滞后，就会出现「IDE 能提示但 CLI 报错」或者「能跑但满屏红线」的割裂。
-- **化解的本质矛盾**：编辑器要「假装宏已经被编译」才能给提示，而真正的编译发生在构建期、和 IDE 是两条独立的代码路径。两份独立实现要保持语义一致，这是一条没有尽头的人肉同步线。
+换来的是 TS 把自定义宏当成合法全局符号，给出悬停、补全、检查，也就是用户体感上的「编辑器懂我的宏」。
 
-这条权衡直接通向下一章：构建期真改代码、IDE 期假装改代码，这两条线为什么必须并存，又为什么这么容易对不齐。
+代价是这套「类型层」虚拟代码的语义**必须与构建期真实变换后的产物严格对齐**。构建期 unplugin 真的把宏调用改写成 `setup() { return { count } }`，IDE 期插件假装改写了，两侧推出的类型必须一致。任何一侧先行或滞后，都会出现「IDE 能提示但 CLI 报错」或「能跑但满屏红线」的割裂。
 
-### 4.4 两种调度语义共存：一套接口装两种合作方式
+本质矛盾是「**IDE 假装变换已发生**」与「**构建期真做变换**」是两套独立实现，二者必须在语义上对齐。这正是下一章『双轨制』的直接动因：这两个实现不可能合并，因为它们服务的场景根本不同（一个要求实时响应、一个要求确定性输出）。
 
-- **选择**：解析/发现类钩子用「首胜」，代码生成类钩子用「累积」，再用 `order` 控先后、`version` 做兼容门禁。
-- **换来**：多插件可以组合、互不阻塞。一个插件声明「这个文件我认领成 SFC」，另一个插件再往它的虚拟代码里塞内容，各干各的。
-- **代价**：解析类冲突只能靠隐式的 `order` 数字裁决，没有显式报错。两个插件都觉得自己该认领某个文件时，谁赢取决于 `order` 谁小，排错时很难一眼看出哪个插件覆盖了哪个。
-- **化解的本质矛盾**：扩展性同时有两种完全相反的诉求（认领互斥 vs 加内容叠加），一套钩子接口没法用同一种语义同时满足，只能让调度规则分阶段不同，把冲突裁决留给隐式约定。
+### 双调度语义换可组合性，代价是解析冲突不透明
+
+为什么 `parseSFC` 是首胜、`resolveEmbeddedCode` 却是累积？因为这两类钩子回答的问题根本不同。解析回答的是「这个文件该被怎么解析」，这是一个互斥决策，只能有一个答案。代码生成回答的是「虚拟代码里该有什么」，这是一个开放贡献，每个插件都可以塞自己的内容。
+
+换来的是多插件可组合、互不阻塞：一个插件声明「这里有一个虚拟文件」、另一个插件再往里塞类型声明、第三个插件再往末尾追加全局声明，三者并存于同一条管线。
+
+代价是解析类冲突**只能靠隐式 `order` 裁决，没有显式报错**。如果两个插件都试图认领 `.setup.tsx`，先执行的赢，后执行的贡献被静默丢弃。排错时难以一眼看出哪个插件覆盖了哪个——你看到的是「我的 `parseSFC2` 没生效」，而不是「插件 A 用 `order: -2` 抢在了你前面」。
+
+本质矛盾是「**同一管线既要支持互斥决策，又要支持累积贡献**」之间的张力。两种调度语义共存才能同时容纳这两类需求，但代价是互斥那一侧的冲突失去了显式的错误反馈通道。
 
 ## 5. 最小原理演示
 
-把上面这套缩到最小，一个演示两类扩展点的插件大约就这么长。每一行都对应上面某个原理点。
+下面是一个最小语言插件，演示「解析层伪装」与「脚本层寄生注入」两类扩展点。每一行都对应上面某个原理点，不演示原理的工程细节一律省略。
 
 ```ts
-// 一个插件 = 一个返回钩子对象的函数；ctx 注入和宿主同版本的 TS 等模块
-type VueLanguagePlugin = (ctx: {
-  modules: { typescript: typeof import('typescript') }
-}) => {
-  order?: number
+import type { VueLanguagePlugin } from '@vue/language-core'
 
-  // ① 解析层钩子：把 .setup.tsx 伪装成 SFC（首胜语义）
-  parseSFC2?(fileName: string, _lang: string, content: string) {
-    if (!fileName.endsWith('.setup.tsx')) return      // 不认领 → 让下一个插件试
-    const PREFIX = '<script setup lang="tsx">\n'      // 伪装前缀
-    const wrapped = PREFIX + content + '\n</script>'
-    const sfc = officialParse(wrapped)                // 假设：喂官方解析器
-    return patchOffsets(sfc, PREFIX.length)           // ★ 必须减去前缀，否则坐标错位
-  }
+// 一个语言插件就是一个函数：接收 ctx，返回一组可选钩子
+const miniPlugin: VueLanguagePlugin = (ctx) => ({
+  // 解析类钩子是「首个非空胜出」，order:-1 抢在官方认领逻辑之前
+  order: -1,
 
-  // ② 代码生成层钩子：在官方骨架上寄生注入（累积语义）
-  resolveEmbeddedCode?(_file: string, sfc: Sfc, embedded: { content: string[] }) {
-    if (!callsMacro(sfc.script, 'defineProp')) return // 没命中就不贡献
-    // 往虚拟代码末尾 push 全局声明，让 TS 把 defineProp 当合法符号
-    embedded.content.push(
-      'declare function defineProp<T = unknown>(' +
-      'name: string, options?: { required?: boolean }): T\n'
+  // 解析层伪装：让 .setup.tsx 也能接入 SFC 管线
+  parseSFC2(fileName, _languageId, content) {
+    if (!fileName.endsWith('.setup.tsx')) return  // 不认领就返回 undefined，让下一个插件有机会
+    const prefix = '<script setup lang="tsx">\n'
+    // 人为把内容包进 <script setup>，让官方解析器把它当 SFC 处理
+    const wrapped = prefix + content + '\n</script>'
+    const sfc = ctx.modules.vue.parse(wrapped)
+    // 偏移修正：官方解析器算出的 offset 都基于包装后内容
+    // 必须把前缀长度从每块的位置信息里减回去，否则诊断坐标整体前移
+    for (const block of [sfc.script, sfc.scriptSetup].filter(Boolean)) {
+      block.loc.start.offset -= prefix.length
+      block.loc.end.offset -= prefix.length
+    }
+    return sfc
+  },
+
+  // 脚本层寄生注入：在官方骨架末尾塞一条全局类型声明
+  // 代码生成类钩子是「全部累积」：所有插件的贡献依次 push 到同一份虚拟代码
+  resolveEmbeddedCode(_fileName, _sfc, embeddedFile) {
+    // 让 TS 把 myMacro 当合法全局符号，这就是「假装宏已被编译」的实现手段
+    embeddedFile.content.push(
+      'declare function myMacro<T>(name: string, opts: { required: true }): T\n'
     )
-    // 同理，还可以在官方 props 锚点处 splice 进推断出的 props 类型（略）
-  }
-}
+  },
+})
 
-// 插件链装配：内置在前、用户在后，展平 → order 排序 → version 门禁
-function createPlugins(ctx: any) {
-  return [...builtinPlugins, ...ctx.vueCompilerOptions.plugins]
-    .flatMap(p => (typeof p === 'string' ? require(p)(ctx) : p(ctx))) // 一个插件可展平成多个实例
-    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0))                  // order 升序
-    .filter(p => validVersions.has(p.version))                        // 版本不兼容则丢弃
-}
+export default miniPlugin
 ```
 
-原理点的对应关系：插件函数签名 + `ctx` 注入同版本模块（§3 接口形状）；`parseSFC2` 里 `return`（不认领）实现首胜、`PREFIX` + `patchOffsets` 实现伪装与 offset 修正（§4.2）；`resolveEmbeddedCode` 里 `push` 一条 `declare function` 实现寄生注入与累积（§4.1、§4.3）；`flatMap`/`order`/`version` 三步装配插件链（§3 装配规则）。`officialParse`、`patchOffsets`、`callsMacro` 是为聚焦而假设的外部助手，实际由官方编译器与 `@vue-macros` 的工具函数提供。
+短短 30 行就覆盖了两类扩展点：`parseSFC2` 演示「解析层伪装 + 偏移修正」，`resolveEmbeddedCode` 演示「脚本层寄生注入」。锚点 splice、AST 遍历、`Code[]` 元组这些工程细节都不重要，重要的是看出扩展点长什么样、挂在管线哪一步。
 
 ## 6. 执行轨迹
 
-拿一个具体输入走一遍，看官方骨架和寄生注入是怎么配合的。
+拿一个具体输入走一遍：用户在 `.vue` 的 `<script setup>` 里写 `const count = defineProp<number>('count', true)`（`defineProp` 是 Vue Macros 的自定义宏，官方不认识）。
 
-**输入**：`.vue` 的 `<script setup>` 里写 `const count = defineProp<number>('count', true)`（`defineProp` 是 Vue Macros 的自定义宏，官方不认识）。
+**① 官方骨架生成**：官方 `vue-tsx` 插件先产出虚拟代码骨架，里头有一个空的公共 props 类型 `__VLS_TypeProps = {}`、一个 `defineComponent({...})` 占位（暂时没有 props 字段）。
 
-① 官方脚本插件先跑，产出虚拟代码骨架：一份空的公共 props 类型，加一个 `defineComponent({...})` 占位，里面 props 字段还没填。
-② `vue-macros-define-prop` 插件的 `resolveEmbeddedCode` 被调用，遍历脚本 AST 识别出 `defineProp` 调用，提取出「名字=count、类型=number、required=true」。
-③ 插件在骨架的 props 锚点处 `splice` 进 `count: number`，在组件定义处补上 props 字段，并在虚拟代码末尾 `push` 一条 `declare function defineProp<T>(name: string, options: {required: true}): ComputedRef<T>`。
-④ 下游 TS 看到的最终虚拟代码里：`count` 是 `number` 类型、`defineProp` 是合法全局函数。于是悬停能看到类型、补全能弹出、类型检查全绿，和构建期真实编译产物的语义一致。
+**② 钩子触发，AST 识别**：`vue-macros-define-prop` 插件的 `resolveEmbeddedCode` 钩子被调用。它遍历脚本 AST，命中 `defineProp` 调用节点，提取出三元组「名字=count、类型参数=number、required=true」。
 
-整条链路的关键在于：官方骨架先就位，用户插件在它上面寄生注入，TS 只看最终的虚拟代码，**根本不知道 `defineProp` 是个宏**。
+**③ 寄生注入三处**：
+
+- 在公共 props 锚点 `__VLS_TypeProps = {}` 处 splice，把 `{}` 改成 `{ count: number }`。
+- 在组件定义处的 props 字段补上 `count: { type: Number, required: true }`。
+- 在虚拟代码末尾 push 一条 `declare function defineProp<T>(name: string, options: { required: true }): ComputedRef<T>` 全局声明。
+
+**④ 下游消费**：TS 服务拿到最终虚拟代码，看到 `count` 是 `number`、`defineProp` 是合法全局函数。于是悬停显示签名、补全能展开、类型检查全绿。坐标经 sourceMap 回映到原 `.vue`，用户体感就是「编辑器懂我的宏」。
+
+整条轨迹的妙处在于：官方插件完全不知道 `defineProp` 存在，它只产出了一个稳定的骨架；`vue-macros-define-prop` 只做了「往骨架上 splice 三处」这一件事，就让官方语言服务理解了一个全新的语法。
 
 ## 7. 教学简化说明
 
-本章演示故意省略了：多宏的批量展平调度、`order`/`version` 的完整校验逻辑、sourceMap 段（`Code[]` 元组）的拼接细节、Vue 大版本之间的锚点分支、`ts-macro` 的 `replace`/`replaceAll`、增量重解析（`updateSFC`）。这些都是工程完整性的一部分，不是「扩展点长什么样、挂在管线哪一步」这个核心思想。
+本章演示故意省略了：多宏批量展平调度（`flatMap` 链）、`order` / `version` 的完整校验逻辑、`Code[]` 元组的 sourceMap 段细节、Vue 3.5 前后锚点形态的分支、`ts-macro` 的 `replace` / `replaceAll` 实现、嵌入式代码的多层嵌套遍历、`updateSFC` 增量重解析的失效粒度。这些都不影响理解扩展点的形状。
 
 ## 8. 小结
 
-Vue Language Plugin 干的事一句话：把「怎么翻译 `.vue`」从官方编译器的私货，开放成一条流水线上几个可挂载的工位。第三方带着自己的工具站到工位上，就能让自定义宏、非 `.vue` 文件、新 DSL 都接进同一条虚拟代码管线，复用上一章那套位置回映和 TS 桥接，而不是各自另起炉灶。
-
-代价也跟着来了：寄生在官方骨架上，等于绑死官方内部锚点；伪装输入，等于自己背位置偏移的修正；给 TS「假装宏存在」，等于这条类型层虚拟代码得和构建期真改出来的产物严格对齐。最后这一条最要紧，它正是下一章要展开的话题：构建期真改代码、IDE 期假装改代码，这两条线为什么必须并存，又为什么这么难对齐。
+插件接口把「SFC 怎么被解析、虚拟代码怎么生成」从官方私有逻辑变成了公共扩展点，这是 Vue Macros 的自定义宏能被 TS 理解的前提。但插件注入的「类型层虚拟代码」是一份**假装变换已发生**的产物，它必须与构建期 unplugin 真改的代码语义对齐，否则 IDE 与 CLI 就会撕裂。下一章就讲这个『双轨制』。

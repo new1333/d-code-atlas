@@ -1,219 +1,300 @@
+---
+title: 导航失败的语义化分类
+---
+
 # 导航失败的语义化分类
 
-想象你在写一个后台系统的路由。用户从 `/orders` 点进 `/settings`，但你不想让没权限的人进去，于是挂了个 `beforeEach` 守卫，权限不够就 `return false`。导航确实没成功——可这是你**故意**拦下的，不是程序出 bug。要是你用 `throw` 来表达"没导航成功"，控制台立刻弹出一串红色的 `Unhandled promise rejection`，用户吓一跳，以为页面崩了。
+> 本章属于 primitive 层。前置：无（全书的底层章节之一）。
+> 学完你能：用一句话讲清「为什么把导航失败建成可恢复值而不是异常、为什么用位掩码给失败分类、为什么用隐藏标记而非子类做识别」。
 
-这一章讲的就是 vue-router 怎么解决"没走到底"的表达问题。核心就一句话：**把导航失败当成一个带着种类标签的普通返回值，而不是一个异常**。
+## 1. 为什么需要它（设计动机）
 
-## 一、为什么不能用"抛异常"了事
+上一章解决了「拿到一条 path，该匹配到哪一条用户配置」——靠评分从所有候选里选出唯一赢家。但「选出赢家」只是导航的一步。从用户点了一个链接，到 URL 真的换过去、页面真的渲染出来，中间还有大量「没走到底」的情况：
 
-很多人第一反应是：导航没成功，那就 `reject` 嘛，Promise 不就是干这个的？听起来很自然，放到导航场景里却会出大问题。
+- `beforeEach` 守卫看了看目标，回了句 `false`，把这次导航拦下
+- 用户手快连点两次，第二次挤掉了第一次，第一次没机会跑完
+- 目标 URL 跟当前完全一样，再导航一次没意义
+- 守卫返回了一个新的位置，意思是「别去原来那、去这儿」
 
-导航"没走到底"的情况其实有很多种，而且大部分根本不算出错：
+这些都不算「出错」，更像是「这次导航的合理结局」。可如果它们都用 `throw` 或 `Promise.reject` 来表达，会立刻撞上三件麻烦事：
 
-- 守卫主动拦下（`return false`）——这是业务逻辑，正常
-- 用户手快连点了两下，后一次把前一次挤掉了——正常
-- 目标地址就是当前页，重复了——正常，本来就不用动
-- 守卫说"别去那儿，去这儿"，要重定向——正常
+第一，控制台会被 `Unhandled promise rejection` 刷屏。用户连点两次本是个无害的交互，控制台却看起来像程序崩了一样。
 
-这些都走 `reject`，有两个直接的坏处。第一，控制台会被未捕获的 rejection 刷屏，把真异常淹没。第二，上层的 `afterEach` 钩子拿到的就是一个模糊的 Error，它根本分不清"这次是被守卫拦了，还是被新导航取消了，还是单纯重复了"——而这恰恰是它想知道的。
+第二，上层拿不到语义。`afterEach` 钩子、监控埋点、错误日志，所有这些想对导航结果做点什么的代码，都只拿到一个 `Error` 对象。它们没法回答「这次到底是用户取消了，还是真出 bug 了」——而这恰恰是它们最需要知道的。
 
-所以 vue-router 的选择是：**这些预期内的"没成功"，走 return 通道，安安静静地把一个失败值传回去；只有真异常（守卫里 `throw`、代码真坏了）才走 reject 通道**。
+第三，重定向这种「换目标继续」的语义没法用「终止信号」表达。它不是结束，是改方向。
 
-打个比方，失败值像一封挂号信，信封上写清楚"这次为什么没成"，可以层层传递、被安安静静地拆开分类；异常则像拉火警，一响全楼都得看。导航里大部分"没成"都是日常挂号信，不该动不动拉火警。
+矛盾的核心在这里：导航「没成功」本是上层关心的正常语义，但异常通道天然只表达「出错了」。把正常语义塞进异常通道，就会被错误监测机制误报、被全局 errorHandler 误吞、被未捕获告警污染日志。
 
-## 二、给失败值贴上种类标签
+本章做的事，是给这些「没走到底」的结局一个不带故障含义的表达方式。
 
-既然要走 return 通道，那返回的东西就得**自带种类**。一个光秃秃的 `false` 或者 `null` 是不够的——`afterEach` 拿到 `null`，它怎么知道是成功了，还是被取消了？
+## 2. 核心思想
 
-于是失败值长这样：它本质上是一个 Error 对象当底座，额外挂了三样东西——
+导航「没走到底」其实有两种：作为故障的没成功（`throw`），和作为结局的没成功（`return`）。整套机制的本质，是把失败从前者搬到后者。失败于是成了一种**带标签的数据**，不再是一种信号。
 
-- `type`：失败种类，一个数字
-- `from` / `to`：从哪去哪
-- 一个隐藏标记（下一节细讲）
+## 3. 心智模型
 
-说人话就是，失败值是一个**有身份、有上下文的值**。它知道自己是什么种类的失败，也知道发生在哪条路径上。`afterEach(to, from, failure)` 的第三个参数拿到的就是这个东西，想分类处理随手就能查。
+### 3.1 五种「没走到底」的形态
 
-## 三、用位掩码，让"种类"可以组合着问
+先把这些场景一一对应到一种失败种类：
 
-光有种类还不够。很多时候上层关心的是"一类"，不是"一种"。
+| 场景 | 失败种类 | 备注 |
+|---|---|---|
+| 守卫拒绝（返回 `false` 或抛错） | aborted | 已中止 |
+| 被更新的导航取代 | cancelled | 已取消 |
+| 目标与当前位置同位 | duplicated | 重复 |
+| 守卫返回了一个新位置 | redirect | 重定向，**携带新目标** |
+| 路径在路由表里找不到匹配 | matcher-not-found | 仅内部 |
 
-比如你想在 `afterEach` 里做埋点："只要是被守卫中止、或者被新导航取消的，都算'用户没到达目标'，统一记一条日志"。要分别写的话是：
+前三种是用户能感知的「正常结局」，对外公开。后两种是框架内部用来驱动控制流——重定向要触发再导航，匹配不到要直接报错。这个「公开 vs 内部」的边界后续会再展开。
 
-```ts
-if (failure.type === ABORTED || failure.type === CANCELLED) { /* ... */ }
+### 3.2 失败值长什么样
+
+一个失败值就是一个**普通 `Error` 对象**，往上面贴三样东西：
+
+- `type`：一个数字，标记它是上面五种里的哪一种
+- 一个**隐藏标记**（用模块级 `Symbol` 当键）：声明「这是本库造的失败值」
+- 业务字段（`from`、`to`）：方便上层拿来打日志、做埋点
+
+注意——它**不是** `class NavigationFailure extends Error`。就是一个 `Object.assign(new Error(msg), { type, [MARK]: true, from, to })`。这个反直觉的选择后面权衡小节会解释。
+
+### 3.3 识别一个失败值
+
+要回答两个问题：「这玩意儿是不是本库造的失败值」和「它属于我关心的某种失败吗」。一个三段式谓词搞定：
+
+```
+instanceof Error           // 是个内置 Error（跨 realm 稳定）
+&& MARK in error           // 带本库的隐藏标记
+&& (mask == null || !!(error.type & mask))  // 是我关心的种类
 ```
 
-每多关心一种，就得再串一个 `||`，种类一多又啰嗦又容易漏。
+第三个条件是「按位查」，下面位掩码小节展开。
 
-vue-router 的做法是把每种失败分配一个 2 的幂：1、2、4、8、16。这样每种失败在自己的二进制位上是唯一的，组合查询就压成了一条按位与：
+### 3.4 失败值在 promise 链里怎么流动
 
-```ts
-if (failure.type & (ABORTED | CANCELLED)) { /* ... */ }
+关键规则：失败值走 resolve 通道回传，不走 reject。
+
+具体说，守卫拒绝时，那个失败值**先在守卫链内部**以 reject 形式短路（避免继续跑后续守卫）。上游的 `.catch` 接到它，做个二分判断：
+
+- 是已知失败 → 把它**转成 resolve 返回值**交给下一个 `.then`（继续收尾：决定要不要回滚历史、要不要把 failure 透给 `afterEach`）
+- 不是已知失败（即真异常）→ `triggerError`：调 `onError` 监听、`console.error` + 诊断码、最后 `Promise.reject`
+
+链尾永远挂一个 `.catch(noop)`，明确为「吞掉残留」，确保控制台不会再有未捕获告警。已知失败已经在前面被转成返回值了，这个 noop 接住的是「链中又被某段 `.then` 漏掉的真异常」。
+
+## 4. 关键权衡
+
+### 用「值」而非「异常」传递预期失败
+
+这是整套设计的总闸。
+
+**选择**：守卫拒绝、被取消、重复，这些预期内的「没走到底」，全部以**值**的形式（resolve 返回）在 promise 链里流动；只有无法识别的真异常才走 reject。
+
+**换来**：
+
+- `afterEach` 拿到的是结构化的 failure 对象，可以按种类分支处理
+- 控制台不会被「正常中止」误报成未捕获 rejection
+- 全局 errorHandler 不会被无害的取消事件刷屏
+
+**代价**：整条导航 promise 链必须在每个 `.catch` 里刻意做「已知失败 vs 真异常」的二分分流。心智负担并没有消失，只是从用户身上转到了框架内部。写框架的人必须时刻警惕：拿到一个 error 别直接 `triggerError`，先 `isNavigationFailure` 谓词一遍。漏判一处就会把「正常中止」升级成「程序异常」。
+
+**化解的本质矛盾**：「正常结局」和「程序出错」都表现为「没成功」，但前者是数据、后者是故障——必须用不同通道承载，否则错误监测机制会把它们当成同一件事。
+
+### 用位掩码（2 的幂）编码失败种类
+
+失败种类这个数字不是 1/2/3/4/5 顺序排，而是 1/2/4/8/16——每个种类独占一位。
+
+**换来**：上层可以用**一次按位与**问「多种失败」：
+
+```
+// 「被中止或被取消」都算正常，不用细分
+if (failure.type & (ErrorTypes.NAVIGATION_ABORTED | ErrorTypes.NAVIGATION_CANCELLED)) {
+  // 不报错、不回滚
+}
 ```
 
-`ABORTED | CANCELLED` 是 `4 | 8 = 12`，任何 `type` 只要在这两位上有任意一位亮着，按位与就非零，判定成立。换成开关板来理解最直观：每种失败是一个独立开关，"中止或取消"等于"这两个开关只要任意一个亮，就算命中"。
+判定压成一条 `type & mask` 表达式，无需写一堆 `||`。如果种类是顺序整数，就得 `type === aborted || type === cancelled`，加一种就得改判定。
 
-> 顺带一提，内部这个枚举用的是 `const enum`，注释特别强调成员值**必须写字面量**（写 `= 4`，不能写 `1 << 2`），否则它没法在编译期被内联掉。这是 TS 的硬约束，知道有这回事就行，不影响原理。
+**代价**：`type` 字段对人是个「魔数」——看到 `4` 没人知道那是「已中止」。可读性全靠枚举别名 `NavigationFailureType.aborted` 补。框架还得维护两套同值映射：内部 `const enum`（编译期内联、零运行时开销）+ 公开 `enum`（真实运行时对象，让用户能 `Router.NavigationFailureType.aborted` 引用）。
 
-这里还有个**双层枚举**的小心思：内部用 `const enum`（编译期内联成数字，运行时根本不存在这个对象，图快）；对外公开一个普通的 `enum`，让你能写 `NavigationFailureType.aborted` 这样好认的名字（图对人友好）。两套枚举的值是一一对应的，等于维护了一份同值的映射。
+> 顺便提一句源码里一个挺刁钻的约束：内部用 `const enum` 时，成员值必须是**字面量**（写 `= 4`），不能写成位移表达式 `1 << 2`——否则它在「被当值用」的场合无法被编译期内联。这是 TS `const enum` 的硬约束，不是设计偏好。
 
-## 四、靠一个隐藏标记，认出"自家人"
+**化解的本质矛盾**：「我想知道精确种类」和「我想一次问多种」对立——顺序整数让单种查询自然但组合查询啰嗦，位掩码让组合查询变成一条算式但单种查询要靠别名补可读性。
 
-失败值要在 Promise 链里和真异常混着流动，所以框架得有办法在任意一个 `.catch` 里快速判断："手里这个 error，到底是我们自己造的失败值，还是真异常？"
+### 用「内置 Error + 隐藏标记」而非自定义子类
 
-最容易想到的办法是写个子类：`class NavigationFailure extends Error`，然后到处 `error instanceof NavigationFailure`。vue-router 没这么做。它用的是**普通 Error 当底座 + 一个隐藏标记属性**：
+按习惯，给错误分类的标准做法是写一堆子类：`class NavigationAborted extends Error`、`class NavigationCancelled extends Error`……然后用 `instanceof NavigationAborted` 来判。这里**偏偏不这么干**。
+
+**选择**：所有失败值都是**内置 `Error`** + 一个模块级 `Symbol` 标记属性，靠 `MARK in error` 做鸭子判定。
+
+**换来**：「这是不是一个失败值」的最外层判定（`instanceof Error`）是**跨 realm 稳定**的——内置 `Error` 的 `instanceof` 不会因为代码压缩、多 bundle 拼装、或者页面上同时存在两个 vue-router 副本而失效。子类构造器就脆弱得多：压缩会改它的名字，多副本会让两个 `NavigationAborted` 类互不相认。
+
+**代价**：放弃了 `instanceof NavigationFailure` 带来的 TS 自动 narrowing。只能靠一个谓词函数 + TS 函数重载模拟类型守卫：
 
 ```ts
-const MARK = Symbol('navigation failure')
-
-const failure = Object.assign(new Error(msg), {
-  type,
-  [MARK]: true,
-  from,
-  to,
-})
+function isNavigationFailure(
+  error: unknown,
+  type?: ...
+): error is NavigationFailure { ... }
 ```
 
-判定一个东西是不是失败值，是三段式：
+写起来比 `instanceof` 啰嗦，IDE 的 auto-narrowing 也没那么顺。
+
+> **一个容易被过度宣称的点**：源码用的是 `Symbol()`（每次调用唯一，per-copy），不是 `Symbol.for()`（全局共享）。所以「是否本库造的失败」这一层判定，在两个独立的 vue-router 副本之间**并不**比子类 instanceof 更强：两个副本各有各的 Symbol，互不相认。准确的说法是「跨 realm 稳定的内置 Error 判定 + 标记式扩展」——前者保最外层可靠，后者保「在本副本内」能区分失败值和普通 Error。别讲成「Symbol 本身跨 realm」。
+
+**化解的本质矛盾**：「我想给错误一个具体类型」和「这个类型识别手段必须抗压缩、抗多副本」对立——子类 narrowing 优雅但脆弱，标记式鸭子判定不优雅但稳。
+
+### 把「重定向」也建模成「携带新目标的失败」
+
+最反直觉的一条。
+
+守卫返回了一个新位置，按理说这跟「拒绝」不一样，它是要「换目标继续」。可本章偏偏把它也做成一种失败值，只是 `type` 是 redirect 位、`to` 字段放的是新目标。
+
+**换来**：重定向**复用整套失败传递通道**。守卫产出一个带目标的失败 → 上游 `.catch` 捕获 → 判定种类是 redirect → 取出 `to` 字段，**递归再调一次 `pushWithRedirect(to)`**。整套收尾、分流、链尾吞残留的逻辑一行都不用改。
+
+如果不这么建模，重定向就得是独立机制——守卫的「拒绝」和「改方向」要分两条 promise 链处理，再各自有一套收尾。代码量翻倍，bug 也翻倍。
+
+**代价**：失败种类被强行分成「对用户可见的 3 种」和「仅内部的 2 种（redirect / matcher-not-found）」。API 表面、文档、类型导出边界都得刻意区分这两层——公开枚举只暴露 aborted/cancelled/duplicated，redirect 和 matcher-not-found 留 internal。用户初次碰到时常困惑「为什么我的 `afterEach` 看不到重定向」。
+
+**化解的本质矛盾**：「重定向语义上不是失败」（它是改方向继续）和「重定向机制上必须短路当前导航」（否则会和后续守卫冲突）对立——把它建模成「携带新目标的失败」同时满足了两者：当前导航确实终止了，但新目标也带出来了。
+
+## 5. 最小原理演示
+
+下面这段几十行的 TS 把上面四条权衡都演一遍：位掩码编码、隐藏标记识别、值/异常二分、重定向即带目标的失败。每一行都对应一个原理点，不演示原理的工程细节（DEV 文案、TS 重载、回滚历史、afterEach 调度）一律省略。
 
 ```ts
-error instanceof Error      // 最外层：到底是不是个 Error
-  && MARK in error          // 中间层：是不是本模块盖过章的
-  && (mask == null || !!(error.type & mask)) // 内层：是不是要的那种
-```
+// 失败种类用 2 的幂编码：每个种类独占一位，组合查询靠按位与
+const FAILURE = {
+  aborted:    1,
+  redirect:   2,
+  cancelled:  4,
+  duplicated: 8,
+} as const
 
-为什么不用子类？两个考虑。第一，`instanceof` 依赖那个子类构造器，一旦代码被压缩、或者页面上同时存在两份库的副本，构造器对不上，`instanceof` 就悄悄失效了——这种 bug 极其难查。第二，最外层那道 `error instanceof Error` 用的是内置的 `Error`，它在跨 iframe、跨 realm 时是稳的，能先把"根本不是 Error 的乱七八糟值"挡在外面。
+// 模块级 Symbol 当隐藏标记键，本模块内唯一，外部伪造不出来
+const MARK = Symbol('navigation-failure')
 
-这里有个容易吹过头的地方，得说清楚：那个标记用的是 `Symbol()`，每次调用都唯一、跟着模块实例走；它**不是** `Symbol.for()`（那种全局共享的）。所以这个标记保证的是"同一个模块实例能认出自己造的失败值"，并不是说两份各自独立加载的库副本能互相认。准确的描述是"跨 realm 稳定的内置 Error 判定 + 标记式扩展"，别简化成"Symbol 能跨 realm"。
-
-## 五、重定向也是"失败"，只不过带着新目标
-
-最有意思的一招，是把**重定向也当成一种失败值**。
-
-守卫有时候不是简单地放行或拒绝，而是说"别去 `/settings`，去 `/login`"。你完全可以为重定向单独发明一套控制流，但 vue-router 选择让它复用整条失败通道：重定向就是一个 `type` 是重定向位、但 `to` 字段填的是新目标的失败值。
-
-```ts
-const redirect = makeFailure(REDIRECT, { from: '/settings', to: '/login' })
-```
-
-这样做的好处是，产出失败值、传递失败值、上层捕获失败值这套机器，重定向一行额外代码都不用写就能蹭上。上层捕获到一个重定向失败值，看看它带的目标，再朝那个目标发起一次新导航就行了——整条逻辑是一个递归，复用得很彻底。
-
-代价当然也有：失败种类从此被劈成两半。对用户可见的有三种（中止、取消、重复），重定向和"没匹配到路由"这两种被刻意留成了内部使用，不暴露在公开的 `NavigationFailureType` 里。所以 API 表面和文档得分清"用户能见到的失败"和"库内部用的失败"，别混着讲。
-
-## 六、把整条管子拼起来：一个玩具导航器
-
-下面是从零写的最小演示，把上面四件事（return-vs-throw、位掩码、隐藏标记、重定向复用）一次性演透，没有任何 vue-router 运行时依赖。存成 `nav.ts`，配一个最小的 `package.json`（`{ "type": "module" }`），用 `bun run nav.ts` 或 `npx tsx nav.ts` 就能跑。
-
-先是值模型本身——位标志、隐藏标记、造失败值、三段式判定：
-
-```ts
-// 位标志：每种失败占独立的一位
-export const ABORTED = 4
-export const CANCELLED = 8
-export const DUPLICATED = 16
-export const REDIRECT = 2
-
-// 模块私有的隐藏标记，外人伪造不了
-const MARK = Symbol('nav-failure')
-
-// 造失败值：普通 Error 当底座，贴上种类 + 标记 + 上下文
-export function makeFailure(type: number, info: { from: string; to: string }) {
-  return Object.assign(new Error(`nav: ${info.from} -> ${info.to}`), {
-    type,
-    [MARK]: true,
-    ...info,
-  })
+// 失败值 = 普通 Error + 贴 type + 贴标记 + 贴业务字段
+// 不写 class extends Error，靠内置 Error + 标记做识别
+function makeFailure(type: number, msg: string, extra: Record<string, unknown> = {}) {
+  return Object.assign(new Error(msg), { type, [MARK]: true }, extra)
 }
 
-// 三段式判定：是不是失败值？是不是某种（或某几种）失败？
-export function isFailure(err: unknown, mask?: number) {
+// 三段式识别：内置 Error（跨 realm 稳）+ 本库标记 + 按位查种类
+function isFailure(err: unknown, mask?: number): err is Error & { type: number } {
   return (
     err instanceof Error &&
-    MARK in err &&
+    (MARK in err) &&
     (mask == null || !!((err as any).type & mask))
   )
 }
-```
 
-有了值的模型，再写一个会"产出失败值"的 `navigate`。关键看它**什么时候 return、什么时候 throw**：
+// 一个最小导航器：登记 pending 当作取消基准
+let pending: string | null = null
 
-```ts
-let pending = '' // 当前正要去的目标，作为"是否被取代"的基准
+async function navigate(from: string, to: string, guard: () => unknown): Promise<Error | null> {
+  pending = to
+  const g = guard()
 
-export async function navigate(
-  to: string,
-  guard: (to: string) => boolean | string
-) {
-  const from = pending
-  pending = to // 一开始就登记"我现在要去哪"
+  // 守卫返回 false：产出 aborted 失败值，走 return 通道
+  if (g === false) return makeFailure(FAILURE.aborted, `aborted: ${from}→${to}`, { from, to })
 
-  const verdict = guard(to)
+  // 守卫返回一个新位置：产出 redirect 失败值（携带新目标）
+  if (typeof g === 'string') {
+    return makeFailure(FAILURE.redirect, `redirect: ${from}→${g}`, { from, to: g })
+  }
 
-  if (verdict === false) return makeFailure(ABORTED, { from, to })        // 守卫拒绝 → 中止
-  if (typeof verdict === 'string') return makeFailure(REDIRECT, { from, to: verdict }) // 重定向
-  if (to === from) return makeFailure(DUPLICATED, { from, to })           // 本来就在这 → 重复
-  if (pending !== to) return makeFailure(CANCELLED, { from, to })         // 中途被更新的导航抢了 → 取消
+  // 被更新的导航取代：产出 cancelled 失败值
+  if (pending !== to) {
+    return makeFailure(FAILURE.cancelled, `cancelled: ${from}→${to}`, { from, to })
+  }
 
-  pending = to // 落定
-  return undefined // 真正成功
+  // 真异常：throw 走 reject 通道（演示用，不真跑业务）
+  if (g instanceof Error) throw g
+
+  return null // 成功
 }
-```
 
-注意上面**没有一处 `throw`**。四种"没走到底"全都是 `return` 一个失败值。现在跑几个场景，看上层怎么消费：
-
-```ts
-async function main() {
-  // 1) 守卫拒绝：拿到一个"中止"失败值
-  const r1 = await navigate('/b', () => false)
-  console.log(isFailure(r1, ABORTED)) // true
-
-  // 2) 组合查询：中止或取消，都算"没到达目标"
-  const r2 = await navigate('/c', () => false)
-  console.log(isFailure(r2, ABORTED | CANCELLED)) // true，一条按位与搞定
-
-  // 3) 真异常：不 return，直接 throw，根本不进失败值的逻辑
+// 收尾逻辑：按位查种类，决定怎么处理
+async function pushWithRedirect(from: string, to: string, guard: () => unknown) {
   try {
-    await navigate('/d', () => { throw new Error('真坏了') })
+    const failure = await navigate(from, to, guard)
+
+    if (failure) {
+      // 重定向：取出新目标，递归再导航一次（复用整套收尾通道）
+      if (isFailure(failure, FAILURE.redirect)) {
+        const next = (failure as any).to as string
+        return pushWithRedirect(to, next, guard)
+      }
+      // 其它已知失败：作为「值」返回给上层（afterEach 会拿到）
+      return failure
+    }
+    return null // 成功
   } catch (e) {
-    console.log(isFailure(e)) // false —— 真异常不归失败值管
+    // 真异常通道：到这里说明不是已知失败，报错 + 上抛
+    console.error('[router] unexpected error:', e)
+    throw e
   }
 }
-main()
 ```
 
-一次完整的执行轨迹长这样（用户从 `/a` 去 `/b`，守卫返回 `false`）：
+执行轨迹在下一节展开。
+
+## 6. 执行轨迹
+
+输入：用户从 `/a` 点链接去 `/b`，某个 `beforeEach` 返回 `false`。
 
 ```
-开始导航，登记 pending='/b'
-  → 跑守卫，得到 false
-  → return 失败值 { type: ABORTED(4), from:'/a', to:'/b', [MARK]:true }
-  → 上层拿到非空 failure：URL 不动（停在 /a），按种类不回滚
-  → afterEach('/b', '/a', failure) 把分类好的失败交给业务
-  → 链尾 .catch(noop) 吞掉残留，控制台干干净净
+1. navigate('/a', '/b', () => false) 被调用
+   pending = '/b'
 
-对照：守卫里直接 throw new Error('boom')
-  → 同一个 catch 判定 isFailure 为 false
-  → 走 onError 监听 / console.error / reject 这条"真异常"通道
+2. guard() 返回 false
+   → makeFailure(FAILURE.aborted, 'aborted: /a→/b', { from:'/a', to:'/b' })
+   → 一个普通 Error，type=1, MARK=true, from='/a', to='/b'
+   → return 这个失败值（注意：return，不是 throw）
+
+3. pushWithRedirect 的 await navigate(...) 拿到这个 failure
+   → isFailure(failure, FAILURE.redirect) 为 false（type=1 & 2 = 0）
+   → 不递归再导航，直接 return failure 给上层
+
+4. 上层（用户的 afterEach 钩子）拿到这个 failure：
+   afterEach((to, from, failure) => {
+     if (failure && isFailure(failure, FAILURE.aborted | FAILURE.cancelled)) {
+       // 用户连点或被守卫拦下，都算正常
+       return
+     }
+     // 真异常会走另一条路，根本到不了这里
+   })
+
+5. 链尾 .catch(noop) 兜底，本例没真异常，noop 不触发
+   控制台干净：没有 Unhandled rejection
 ```
 
-这就是"值/异常二分"的全部样子：**预期内的没成功走 return，真坏了才走 throw**，两条通道泾渭分明。
+**对照场景**：如果守卫里写 `throw new Error('boom')`——
 
-## 七、关键权衡
+```
+1. navigate('/a', '/b', () => { throw new Error('boom') })
+   guard() 抛出 Error('boom')
 
-把上面散落的几个设计选择收一下，每条都讲清"选了什么、换来什么、付出什么"。
+2. navigate 内部 try/catch 没接住，直接冒泡
+   → pushWithRedirect 的 try 接到这个 e
+   → e 是 Error，但 MARK in e 为 false → 不是已知失败
+   → console.error + throw e（走 reject 通道）
 
-**1. 用返回值（resolve）而非异常（reject）传递预期失败。** 换来的好处很实在：`afterEach` 能拿到一个结构化的、带种类的失败值去做分类处理，而且因为走的是正常 resolve 通道，绝不会触发"未捕获的 rejection"告警，控制台干净。代价是：整条导航 Promise 链里，每一个 `.catch` 都得刻意做一遍"这是已知失败，还是真异常"的二分判断，这块心智负担从用户那边挪到了框架内部。
+3. 上层接到 reject：这就是真异常路径
+   afterEach 拿不到，触发 onError 监听
+```
 
-**2. 用位掩码（2 的幂）编码失败种类。** 换来的是"一次按位与就能问多种失败"（`aborted | cancelled`），判定压成一条 `type & mask` 表达式，比一串 `||` 干净得多，也方便组合扩展。代价是：`type` 字段对人来说就是个魔数（4、8、16），离开枚举别名根本读不懂；而且得维护"内部 `const enum`（编译期内联）/ 公开 runtime enum"两份同值映射。
+两条路径用同一个 `try { ... } catch (e)` 区分——失败值走 return、真异常走 throw。这就是「值/异常二分」的全部含义。
 
-**3. 用"内置 Error + 隐藏标记"而非自定义子类。** 换来的是"这到底是不是个失败值"的判定，不依赖那个容易被压缩、被多副本冲掉的子类构造器——最外层靠跨 realm 稳定的内置 `Error` 兜底，内层靠私有标记确认身份。代价是：放弃了 `instanceof NavigationFailure` 带来的类型收窄，只能靠谓词函数加一组 TS 重载来模拟类型守卫，写起来绕一点。
+## 7. 教学简化说明
 
-**4. 把重定向也建模成"带新目标的失败值"。** 换来的是重定向整套蹭用了失败传递通道——产出失败值、上层捕获、再发起新导航，递归一圈，零额外机制。代价是：失败种类被劈成"用户可见 3 种"和"仅内部 2 种（重定向、未匹配）"，API 表面和文档必须刻意区分这两类，不然用户会对着公开枚举找重定向而找不到。
+本章故意省略了：
 
-这四条权衡其实是一条主线上的四个面：**让"导航没成功"成为一种可分类、可查询、不污染错误通道的正常结果**——为此，失败值得带种类（权衡 2）、得能自我识别（权衡 3）、得走 return 不走 throw（权衡 1），连重定向都得借这套壳（权衡 4）。
+- 完整的守卫管线（leave → beforeEach → update → beforeEnter → enter → beforeResolve 的串行 promise 链），留给「导航守卫管线」一章
+- history 回滚（aborted/cancelled 要不要 `go(-1)`）的具体规则，留给「Router 核心与导航主循环」一章
+- DEV 文案表、TS 函数重载签名、内部诊断码、MatcherError 的 `currentLocation` 字段等工程化细节
+- 公开枚举刻意只暴露 3 种、把 redirect/matcher-not-found 留 internal 的导出边界（已一句话提及，不展开）
 
-## 小结
+## 8. 小结
 
-这一章只搭了"失败值"这根管子的形状：它是个带种类位掩码、带隐藏标记、能被三段式认出的普通 Error 值，走 return 通道安静流动。至于这些值在守卫链里怎么被产出、在导航主循环里怎么被按位分流去决定回滚和 `afterEach`，那要等到后面讲导航守卫和 Router 核心时再展开——本章的任务是把"值"本身建对。
-
-下一章，我们先去拆另一块地基：把浏览器的 URL 模型抽象成一个"可导航 + 可监听"的窄接口，让 html5、hash、memory 三种实现能互换。那是另一个独立的基础件，和失败值模型一样，都是后面组装 Router 要用到的零件。
+失败本身被分了类、压成了位、用标记藏好了身份，但真正改写的是它的**通道**：从「程序崩了」的 throw，搬到「这次结局如此」的 return。整套机制不是给错误加细节，而是给「没成功」扩词。下一章离开失败话题，去看路由库如何把浏览器 URL 模型抽象成一层可导航、可监听的窄接口——那是导航能跑起来的另一块地基。

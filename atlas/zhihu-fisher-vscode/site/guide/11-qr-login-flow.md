@@ -4,196 +4,175 @@ title: 扫码登录全流程
 
 # 扫码登录全流程
 
-想象一下你正打算用某个知乎辅助扩展，结果弹出来一句「请先登录」。如果是网页，你大概会下意识地掏出手机扫个码，三秒搞定。但这个扩展背后没有知乎的账号密码接口、也写不出知乎那种一天变三次的登录加密签名——它凭什么能让你「扫一下就登录好」？
+> 本章属于 system 层。前置：防反爬浏览器引擎、Cookie 凭证的清洗与校验、侧边栏内容列表。
+> 学完你能用一句话讲清：为什么登录这件事必须「借力」知乎自己的前端 JS、不去逆向，以及这么做换来了什么、代价是什么。
 
-这一章要回答的就是这个问题：**在算不出登录加密的前提下，怎么拿到一份完整可用的登录凭据**。
+## 1. 为什么需要它
 
-## 一、核心思想：借力，而不是逆向
+上一章把「伪装」做到了极致，标签条、内容叠层都安排了双层策略。可伪装救不了一个根本问题：扩展里看到的知乎内容，前提是用户已经是登录态。Cookie 用着用着就过期，到期了就得重登，前面所有花活都依赖这个隐含前提。
 
-知乎登录用的接口是加密的，签名算法变过好几次，逆向成本极高，而且逆向出来的版本可能下周就失效。硬刚这条路不划算。
+可是登录这件事，比爬内容更难。
 
-换个角度想：知乎自己的前端 JS 一定能算出正确的登录态——否则它自己的网页都没法登录。那只要我们把这台「能跑通知乎前端」的真实浏览器当成一台**替我们算加密的算力**，让它老老实实跑完整个登录页，等它跑完之后，**把结果（Cookie）偷出来**就行。
+知乎登录走的是加密接口。每发一个登录请求，都要带一个动态签名，签名算法在它自家前端 JS 里被混淆得乱七八糟，而且随时在变。逆向？今天花了三天抠出来，下周它一升级就作废。让用户自己去浏览器 DevTools 里复制 Cookie？粘贴时漏一个关键项、多一个统计项，第 2 章那套清洗校验就得反复兜底——更别说 Cookie 还会过期。
 
-说人话就是：**登录加密算不动，就让知乎自己的 JS 替我们跑；扩展只管四件事——渲染登录页、截二维码、等页面跳转、收割域名 Cookie**。
+这个机制要解决的，就是**在算不出登录加密的前提下，怎么拿到一份完整可用的登录凭据**。
 
-跟前置章的关系先理一下，免得重复：
+## 2. 核心思想
 
-- 第 3 章已经造好了一台真实 Chrome 单例（带 UA 伪造、抹 `navigator.webdriver` 等防反爬伪装），本章**复用这台单例**，不另开第二台；
-- 第 2 章已经写好了 Cookie 的清洗（去第三方统计项）和校验（必须含 `__zse_ck` 签名 + `z_c0` 登录凭证）流程，本章**只在最后调用它**当「登录产物验收闸门」；
-- 第 5 章已经写好了侧边栏列表刷新能力，本章**登录成功后调一下它的 `refresh()`**。
+把「破解登录加密」降级成「让知乎自己的前端 JS 替我们算一遍」。扩展一行加密代码都不写，只把结果偷出来。
 
-本章真正新增的，是**怎么把扫码这件事在浏览器里走通、并把凭据干净地收回来**。
+落到操作上，扩展只做四件事：渲染登录页、截二维码、等页面跳转、收割域名 Cookie。整个流程里没有一处是「我们计算出来的」，加密、签名、Cookie 写入，全部由知乎自己的前端 JS 在真实浏览器里跑完后交到我们手上。
 
-## 二、心智模型：七步走完整条链
+## 3. 心智模型
 
-把流程拆开来看，每一步都对应着上面某个权衡：
+整个流程挂在第 3 章造好的那台浏览器单例上，复用它的「能否创建浏览器」前置校验（造不出就连登录页都打不开），但**登录特意在单例上新开一个隔离上下文**——这是与主爬虫流程的关键分野：主爬虫在主上下文开页并注入已有 Cookie；登录则要保证判定那一刻看到的状态是干净的。
 
-1. **先确认造得出浏览器**——造不出就直接弹错误、引导去配置，连登录页都不打开。
-2. **在共享那台浏览器上另开一个隔离上下文**（类似无痕模式），保证登录判定不被已有 Cookie 干扰。
-3. **隔离页导航到登录页**，重新伪造 UA、抹掉自动化痕迹，等二维码画布出现。
-4. **截取二维码画布的像素矩形**、转成 base64 推给 webview 展示给用户扫。
-5. **每 2 秒读一次页面 URL**，一旦离开登录页就认定扫码成功。
-6. **立刻再导航到内容页（热榜）**，让知乎前端 JS 把签名 Cookie 写进上下文。
-7. **只收割知乎域的 Cookie**、校验签名 + 登录凭证齐全才落库，最后关掉隔离上下文并刷新列表。
+七步走完一个登录：
 
-这条链上每一步都不是随便写的。下面四节就一个一个讲清楚——为什么是这样做、换来什么、又付了什么代价。
+1. **前置校验**：先问一次那台浏览器的可执行文件在不在，不在就弹错误引导去配置。这一步只查文件、不真启动。
+2. **新开隔离上下文**：在共享单例上 `createBrowserContext()`，类似无痕模式，确保没有已有 Cookie 干扰登录判定。
+3. **导航登录页 + 重新伪装**：隔离上下文里开页，伪造 UA、抹掉 `navigator.webdriver`。**这套伪装在本流程里重写一遍**，没有复用主流程的造页函数（后者要求已有 Cookie 且开在主上下文，与登录的隔离诉求冲突）。
+4. **截二维码**：等二维码 canvas 出现，**截图像素矩形**（不读 canvas）、转 base64 推给 webview 展示。
+5. **轮询 URL**：每 2 秒读一次 `page.url()`，一旦 URL 不再含 `signin` / `signup` 就认定扫码成功。
+6. **触发签名 Cookie**：立刻再导航到内容页（热榜），让知乎前端 JS 在访问内容页时把签名 Cookie 写进上下文。签名是程序自己算不出的，必须靠这一步。
+7. **域名收割 + 验收**：从隔离上下文里取所有 Cookie，只留知乎域的，校验 `__zse_ck`（请求签名）与 `z_c0`（登录凭证）都齐全才落库；最后关掉隔离上下文、刷新侧边栏。
 
-## 三、权衡一：借力而非逆向（全章总纲）
+不变量很朴素：**登录成功与否只看 URL 离开登录页；签名 Cookie 必须靠内容页 JS 写入**。整个流程里没有一处依赖自己算加密。
 
-**选择**：让知乎前端 JS 替我们算登录态与签名 Cookie，而不是自己去逆向签名算法。
+至于异步多出口（成功、超时、用户关面板、重试）的协调，放在一组布尔标志 + 一个幂等清理函数里——这部分属于工程脚手架，正文不展开。
 
-**换来**：登录加密怎么变都不用追——只要知乎自己的网页还能登录，我们的扩展就还能登录。扫码即得完整凭据，不用写一行加密代码。
+## 4. 关键权衡
 
-**代价**：必须真跑一台浏览器去渲染登录页，**重资源、慢**（启动一台 Chrome 比一次 HTTP 请求重得多），且**强依赖知乎前端页面的结构稳定**——比如 `.Qrcode-qrcode` 这个画布的 class 名一旦改了，二维码就截不到了。
+### 借力而非逆向——一行加密代码都不写
 
-这条权衡还有个**二次落地**：登录刚成功那一刻，凭据其实还没齐。签名 Cookie（`__zse_ck`）是知乎前端 JS 在**访问内容页时**才算出来写进 Cookie 的，光在登录页拿不到。所以扫码成功后，扩展**故意再导航一次到 `https://www.zhihu.com/hot`**，逼知乎 JS 把签名 Cookie 自己写进去，然后才进入下一步。这一步看起来多余，其实是「借力」思路的延续：签名算不出，那就让知乎自己访问内容页时算。
+选择「**让知乎前端 JS 替我们算登录态与签名 Cookie，扩展只渲染页面、截屏、读 URL、收 Cookie**」→ 换来「登录加密怎么变都不用追、扫码即得完整凭据」→ 代价是「**必须真跑一台浏览器去渲染登录页**——纯 HTTP 拼请求头在这里完全失效，慢、重，且**强依赖知乎前端页面结构稳定**：`.Qrcode-qrcode` 这个 class 名一旦被改名、登录页 URL 一旦换路径，整个流程都得跟着改」。
 
-> 顺带一提：第 2 章加载 Cookie 时若发现缺 `__zse_ck` / `z_c0`，会提示「之前扫码登录流程有 bug，导致部分 Cookie 缺失，现已修复」——说的就是历史上曾经漏掉过这一步导航。
+这条权衡还有一个**二次落地**：登录成功后，扩展会**主动再导航一次到内容页**，逼知乎前端 JS 在访问内容页的瞬间把签名 Cookie 写进上下文。为什么需要这一步？因为扫码那一刻只拿到登录态主凭证，知乎的请求签名项是前端 JS 在你访问内容时**临时算、临时写**的，程序自己算不出——所以必须借这次二次导航「蹭」到签名 Cookie。这一步是从「扫码登录拿到的 Cookie 缺签名项」那个历史 bug 倒推回来的，如今作为「借力」总纲的延续环节存在。
 
-## 四、权衡二：复用单例，但新开一个隔离上下文
+化解的本质矛盾是 **登录加密的对抗性** 与 **扩展维护成本** 之间的对立——你越想自己解加密，就越是把整个扩展绑死在知乎某一个版本的算法上；你越把算加密这件事交还给知乎自己的 JS，扩展就越轻、越耐久。
 
-**选择**：登录不另 launch 第二台浏览器，而是在第 3 章那台共享单例上，**新开一个隔离的 BrowserContext**（类似无痕模式）。
+### 复用单例 + 新开隔离上下文
 
-**换来**：
+选择「**登录不另 launch 第二台浏览器，而是在共享单例上新开一个无痕上下文**」→ 换来「登录态判定干净：隔离上下文里没有主爬虫已注入的 Cookie，扫码前后看到的状态变化是可信的；同时也省下第二台浏览器的启动开销与内存」→ 代价是「**这个上下文必须由本流程单独关闭**（不关就一直占着），**而且其内的防反爬伪装（伪造 UA、抹 webdriver）无法继承主流程的造页函数**——因为后者默认开在主上下文、且要求页面已注入登录 Cookie，恰好与登录这两条诉求冲突，所以伪装代码在本流程里**重写了一遍**」。
 
-- **登录态判定干净**——隔离上下文里一开始没有任何 Cookie，导航到登录页时不会因为主流程已注入的旧 Cookie 而被「自动登录」或被旧登录态干扰判定；
-- **不污染主爬虫流程**——登录写在隔离上下文里的 Cookie，不会泄漏到主上下文里影响后续爬取；
-- **不付第二台浏览器的资源代价**——浏览器进程还是只有一个。
+化解的本质矛盾是 **资源复用的效率** 与 **登录态判定的纯洁性** 之间的对立——共享一台浏览器省资源，但共享主上下文就会污染判定，于是把隔离粒度从「浏览器级」下沉到「上下文级」：复用浏览器、隔离上下文，两边都要。
 
-**代价**：
+### 截图像素而非读 canvas
 
-- 这个隔离上下文要**单独关闭**，不然会泄漏成孤儿；
-- 隔离上下文里的页面**没法继承主流程的造页函数**——主流程的造页函数是「先注入已有 Cookie 再开页」的，跟登录的隔离诉求直接冲突。所以**防反爬伪装（伪造 UA、抹 `navigator.webdriver`）得在本流程里重新实现一遍**，不能直接复用第 3 章那套。
+选择「**用 `page.screenshot({ clip })` 截二维码画布的像素矩形**，而非调 `canvas.toDataURL()`」→ 换来「**绕开跨域图片污染 canvas 导致的 SecurityError**：知乎二维码 canvas 里如果含有跨域图片资源（图标、Logo 等），调 `toDataURL` 会抛 Tainted Canvas 异常，截图像素则完全无感」→ 代价是「**拿到的是裸像素位图、不是结构化数据**，要展示还得转 base64 塞进 webview；**而且依赖元素的布局坐标**——必须先在页面上下文里读 `getBoundingClientRect()` 拿到像素矩形，元素被布局推走或被 transform 缩放都会让截图错位」。
 
-这个分野很关键：**主爬虫流程是「带着已有 Cookie 在主上下文里开页」，登录流程是「在隔离上下文里从零开页」**。两者刻意不同，是本章与第 3 章最大的区别。
+化解的本质矛盾是 **通用像素采集** 与 **结构化数据采集** 之间的对立——读 canvas API 是「结构化优先」的做法，但跨域安全策略把它堵死了；截图是「像素优先」的做法，永远可用但丢失了「这就是个二维码」的语义。这里是被环境逼着选了后者。
 
-## 五、权衡三：截图像素，而不是读 canvas
+### 轮询 URL 而非调登录接口
 
-二维码在登录页上是个 `<canvas>` 元素。第一反应是直接调 canvas 的 `toDataURL()` 把图导出来——简单、直接、结构化。
+选择「**每 2 秒读一次 `page.url()`，看是否离开了登录页**来判定登录成功」→ 换来「**对登录加密完全免疫**：不需要懂任何登录接口的入参出参，只要观察『页面被知乎自己跳转走了』这个可见副作用即可」→ 代价是「**2 秒粒度的感知延迟**、最长约 10 分钟的轮询窗口，并且**异步多出口（成功 / 超时 / 用户关面板 / 重试）必须靠一组布尔状态标志 + 一个幂等清理函数来协调**——`isCleanedUp` / `isDisposed` / `isLoginSuccess` / `isProcessingRetry` 这套标志就是为了在多出口下保证『清理只发生一次、登录成功只处理一次』」。
 
-**选择**：用 `page.screenshot({ clip })` 截二维码画布那一块的**像素矩形**，而不是调 canvas 的导出接口。
+化解的本质矛盾是 **登录成功的判定精度** 与 **加密协议的不可知性** 之间的对立——你想精确知道「登录态在毫秒级被写入」，就必须解码加密响应；你越退到外层观察副作用（URL 跳没跳），精度越低，但越不依赖加密协议。
 
-**换来**：绕开「**tainted canvas（污染画布）**」导致的安全异常。
+> 这条权衡其实是上一条「借力而非逆向」在「判定成功」环节的再次落地：既然算不出加密，就既不自己发登录请求、也不读登录响应，只看知乎自己跳没跳走。读者认出这个共同骨架即可，不必当成两条独立的原理。
 
-什么是污染画布？浏览器有个安全规则：如果一个 canvas 里画过**跨域图片**（比如知乎的二维码画布里混入了来自 CDN 的跨域 logo 或背景），这个 canvas 就被「污染」了。之后任何尝试读它内容的行为——包括 `toDataURL()`、`getImageData()`——都会直接抛 `SecurityError`。这是浏览器同源策略的硬性规定，扩展绕不过去。
+### 验收闸门复用第 2 章的清洗校验
 
-**代价**：
+读到这里读者可能会问：拿到的 Cookie 直接保存不就行？为什么还要校验？因为扫码成功只意味着「登录态主凭证拿到了」，签名项要靠二次导航写入，写入是否成功、有没有漏，不能假设。所以扩展在落库前设了一道**验收闸门**：必须同时含 `__zse_ck` 与 `z_c0` 才保存，缺一即报错。这是第 2 章那套「清洗 + 校验」原理在登录流程里的**新角色**——之前它管「用户粘进来的脏 Cookie」，现在它管「登录产物是否合格」，是同一套工具在不同环节的复用，原理不再展开。
 
-- 拿到的是**像素位图（PNG Buffer）**，不是结构化数据；
-- **依赖元素的布局坐标**——要先在页面上下文里读 `canvas.getBoundingClientRect()` 拿到像素矩形的位置和尺寸，再把这块矩形作为 `clip` 传给 `screenshot`；
-- 截出来的二进制**还得转 base64**（前面可能加个 `data:image/png;base64,` 前缀）才能塞进 webview 的 `<img src>` 展示。
+至于双层清洗（浏览器上下文层按域名过滤、字符串层再按第三方黑名单过滤），同样复用第 2 章的成果——本章只补一句：登录流程在「域名过滤」这一层多走了一步，从浏览器拿到全量 Cookie 后**先按 `.zhihu.com` / `www.zhihu.com` 域名摘出来**，再交给第 2 章的清洗函数做字符串层处理。
 
-具体做法分两步走：
+## 5. 最小原理演示
 
-```
-在页面里 evaluate: canvas.getBoundingClientRect() → {x, y, width, height}
-                                              ↓
-page.screenshot({ clip: 上面那个矩形, type: "png" })  → PNG Buffer / base64 string
-                                              ↓
-                              统一拼成 data URL → 塞进 webview
-```
-
-> 顺带一提：`page.screenshot` 的返回值在不同 puppeteer 版本里**既可能是 Buffer 也可能是 base64 string**，所以拿到后要用 `typeof` 判一下，统一成 data URL。这是版本兼容的小细节，不是原理重点。
-
-## 六、权衡四：轮询 URL，而不是调登录接口
-
-判定「用户扫完码登录成功了」这件事，最直接的做法似乎是去调知乎的「检查登录态」接口。但那又回到了逆向加密的老路。
-
-**选择**：每 2 秒读一次 `page.url()`，**只要 URL 离开了登录页就认定扫码成功**。
-
-具体判定是：URL 既不含 `signin`、又不含 `zhihu.com/signup`——因为登录成功后知乎会自动跳到首页，URL 就从 `/signin` 变成了 `/`。
-
-**换来**：**对登录加密完全免疫**——不管知乎的登录态校验接口怎么加密，URL 跳不跳是浏览器公开行为，永远 observable。
-
-**代价**：
-
-- **2 秒粒度的感知延迟**——扫码到感知之间最多差 2 秒；
-- **最长有约 10 分钟的轮询窗口**（超时保护），期间一直占着一个 setInterval；
-- **异步多出口必须靠一组布尔状态标志 + 幂等清理函数来协调**。这些出口包括：用户扫成功了、用户超时没扫、用户中途关了 webview 面板、用户点了重试——任何一种情况发生，都得把轮询停掉、把上下文关掉、把标志置位，**而且得保证不管哪个出口先触发，清理动作都只执行一次**。
-
-> 这个协调的具体细节（`isCleanedUp` / `isDisposed` / `isLoginSuccess` / `isProcessingRetry` 四个标志怎么互相配合）属于工程脚手架，不展开。原理上要记住的只有一句：**异步多出口场景下，幂等清理比业务逻辑还重要**。
-
-## 七、最小演示：把上面四条权衡演一遍
-
-下面的脚本独立可跑，演透「借真实浏览器渲染登录页 → 截二维码（绕污染 canvas）→ 轮询 URL → 收割域名 Cookie」这条主链。**真实扩展里复用第 3 章那台 Chrome 单例**，这里为了能独立运行，自己 `launch` 一台；其它四步的逻辑跟扩展里完全一致。
+下面这段独立 Node 脚本演透三件事：① 借力——一行加密都不写、让浏览器自己跑；② 截图绕污染——直接用 `page.screenshot({ clip })`；③ 域名收割——只摘知乎域 Cookie。所有工程脚手架（webview 多态 HTML、四个布尔标志的协调、重试 / 超时 / Esc 关闭、命令注册）都故意省略。
 
 ```ts
-import puppeteer from "puppeteer";
+import puppeteer from 'puppeteer'
 
-// ① 起浏览器（真实实现复用第 3 章单例；此处为可独立运行而 launch 一台）
-const browser = await puppeteer.launch({ headless: false });
+// 演示：借真实浏览器渲染登录页 → 截二维码 → 轮询 URL → 收割域名 Cookie
+// 扩展一行登录加密都不写，知乎前端 JS 替我们跑完整套登录态计算
 
-// ② 在单例上新开一个隔离上下文（类似无痕模式），保证登录判定不被已有 Cookie 干扰
-const context = await browser.createBrowserContext();
-const page = await context.newPage();
+async function loginViaQRCode() {
+  const browser = await puppeteer.launch({ headless: false })
 
-// ③ 隔离上下文没法继承第 3 章造页函数里的伪装，本流程自己重做一遍
-await page.setUserAgent("Mozilla/5.0 ... 知乎能认出来的正常 UA ...");
-await page.evaluateOnNewDocument(() => {
-  Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-});
+  // 在共享单例上新开一个无痕上下文：登录判定不被已有 Cookie 干扰
+  const ctx = await browser.createBrowserContext()
+  const page = await ctx.newPage()
 
-// ④ 借力：导航到登录页，让知乎自己的 JS 把二维码画到 canvas 上
-await page.goto("https://www.zhihu.com/signin", { waitUntil: "networkidle2" });
-await page.waitForSelector(".Qrcode-qrcode");
+  // 抹掉自动化痕迹：本流程内独立实现一遍，不调主流程的造页函数
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => false })
+  })
+  await page.setUserAgent('Mozilla/5.0 ... 真实 Chrome UA')
 
-// ⑤ 截图像素，而不是读 canvas —— 绕开 tainted canvas 的 SecurityError
-//    （直接调 canvas.toDataURL() 在跨域图片污染时会抛异常）
-const clip = await page.evaluate(() => {
-  const rect = document.querySelector(".Qrcode-qrcode")!.getBoundingClientRect();
-  return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
-});
-const qrPng = await page.screenshot({ clip, type: "png" });
-const qrDataUrl = `data:image/png;base64,${Buffer.from(qrPng).toString("base64")}`;
-// 推给 webview 展示，等用户掏出手机扫
-console.log("二维码已就绪，长度:", qrDataUrl.length);
+  // 借力：登录加密由知乎前端 JS 自己跑，扩展只负责导航
+  await page.goto('https://www.zhihu.com/signin')
+  await page.waitForSelector('.Qrcode-qrcode')
 
-// ⑥ 轮询 URL，而不是调登录接口 —— 对加密完全免疫
-await new Promise<void>((resolve) => {
-  const timer = setInterval(async () => {
-    const url = page.url();
-    if (!url.includes("signin") && !url.includes("zhihu.com/signup")) {
-      clearInterval(timer);
-      resolve();
-    }
-  }, 2000);
-});
+  // 截图像素而非读 canvas：跨域图片会污染 canvas，调 toDataURL 会抛 SecurityError
+  const clip = await page.evaluate(() => {
+    const rect = document.querySelector('.Qrcode-qrcode')!.getBoundingClientRect()
+    return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }
+  })
+  const png: Buffer = await page.screenshot({ clip, type: 'png' })
+  const qrCodeDataUrl = `data:image/png;base64,${png.toString('base64')}`
+  // 这个 dataUrl 塞进 webview <img src> 即展示，用户拿知乎 App 扫
 
-// ⑦ 借力的二次落地：再导航到内容页，让知乎 JS 自己把签名 Cookie (__zse_ck) 写进去
-await page.goto("https://www.zhihu.com/hot", { waitUntil: "networkidle2", timeout: 30000 });
+  // 轮询 URL 而非调登录接口：对加密完全免疫，只看知乎自己跳没跳走
+  while (true) {
+    await new Promise(r => setTimeout(r, 2000))
+    const url = page.url()
+    if (!url.includes('signin') && !url.includes('signup')) break
+  }
 
-// ⑧ 按域名过滤收割 Cookie（双层清洗的第一层：浏览器上下文层按域）
-const allCookies = await context.cookies();
-const zhihuCookies = allCookies.filter(
-  (c) => c.domain === ".zhihu.com" || c.domain === "www.zhihu.com"
-);
-const keys = zhihuCookies.map((c) => c.name);
+  // 二次借力：导航到内容页，逼知乎前端 JS 把 __zse_ck 签名 Cookie 写进上下文
+  await page.goto('https://www.zhihu.com/hot', { waitUntil: 'networkidle2' })
 
-// ⑨ 验收闸门：签名 + 登录凭证缺一不可
-if (!keys.includes("__zse_ck") || !keys.includes("z_c0")) {
-  throw new Error("登录凭据不完整，拒绝落库");
+  // 域名收割：只摘知乎域 Cookie（字符串层清洗属于第 2 章，此处不演示）
+  const all = await ctx.cookies()
+  const zhihuCookies = all.filter(c => c.domain === '.zhihu.com' || c.domain === 'www.zhihu.com')
+  const keys = new Set(zhihuCookies.map(c => c.name))
+  // 验收闸门：签名 + 登录凭证齐全才落库
+  if (!keys.has('__zse_ck') || !keys.has('z_c0')) throw new Error('登录态不完整')
+
+  await ctx.close()   // 隔离上下文必须由本流程单独关闭
+  return zhihuCookies
 }
-// 后面交给第 2 章的 saveCookieString 做第二层清洗（按 key 前缀去第三方统计项）后落库
-
-// ⑩ 收尾：关掉隔离上下文，刷新侧边栏列表（第 5 章能力）
-await context.close();
-await browser.close();
 ```
 
-把上面十步对照前面的四条权衡看一遍：
+跑一遍的体感是：扩展全程没碰任何加密，登录态却完整地落到了自己的 Cookie 仓库里。这就是「借力」四个字在代码里的样子。
 
-| 步骤 | 体现的权衡 |
-|------|------------|
-| ④ ⑦ | **借力而非逆向**——让知乎 JS 替我们画二维码、写签名 Cookie |
-| ② | **复用单例 + 新开隔离上下文**——登录判定干净、不污染主流程 |
-| ⑤ | **截图像素而非读 canvas**——绕开 tainted canvas |
-| ⑥ | **轮询 URL 而非调接口**——对登录加密完全免疫 |
-| ⑧⑨ | 借力之后的**收割与验收**——按域名过滤 + 关键项校验 |
+## 6. 执行轨迹
 
-## 八、收尾
+拿一个具体输入走一遍：用户首次点「扫码登录」命令。
 
-本章在「**算不出登录加密**」这个硬约束下，给出了一个不硬刚、转而借力的解法：把真实浏览器当成替我们算加密的算力，让它跑知乎自己的登录页 JS，扩展只做渲染、截图、等跳转、收割这几件事。
+```
+1.  前置校验 canCreateBrowser() → 通过
+2.  getBrowserInstance() 取共享单例 → createBrowserContext() 拿到隔离 ctx
+3.  ctx.newPage() → 导航 https://www.zhihu.com/signin → waitForSelector('.Qrcode-qrcode')
+    页面状态：登录页画好，二维码 canvas 已渲染
+4.  page.evaluate(getBoundingClientRect) → { x: 612, y: 240, width: 180, height: 180 }
+5.  page.screenshot({ clip }) → 拿到 180×180 的 PNG Buffer
+6.  Buffer.toString('base64') → 拼成 data:image/png;base64,iVBORw0...
+7.  panel.webview.html = 二维码展示页（含上面这个 dataUrl）
+    用户视角：看到二维码
+8.  用户打开知乎 App → 扫码 → 点确认
+9.  知乎前端 JS 自己完成登录、自己把页面跳到 https://www.zhihu.com/
+    扩展此时仍在 setInterval(2s) 轮询 page.url()
+10. 第 N 次轮询：url = 'https://www.zhihu.com/' —— 不含 signin / signup → 判定登录成功
+11. 立刻 page.goto('https://www.zhihu.com/hot', { waitUntil: 'networkidle2' })
+    这一刻知乎前端 JS 在访问内容页时把 __zse_ck 签名 Cookie 写进 ctx
+12. ctx.cookies() → 拿到约 30 条全量 Cookie
+13. 按 domain 过滤 → 只剩约 12 条知乎域 Cookie
+14. Set.has('__zse_ck') && Set.has('z_c0') → 验收通过
+15. CookieManager.saveCookieString()（第 2 章的清洗 + 落库）
+16. 再问一次 canCreateBrowser() —— 与手动设置 Cookie 的逻辑对齐：
+    登录虽拿到了 Cookie，但若浏览器的执行文件此刻不可用，列表刷出来也点不开
+    （第 5 章「点不开详情的列表毫无意义」的延伸）
+17. cleanupPage() 关掉隔离上下文；各 sidebar.refresh() 刷新侧边栏（第 5 章）
+```
 
-四条权衡里，**借力而非逆向是总纲**，另外三条（隔离上下文、截图绕污染、轮询 URL）都是这条总纲在不同环节的具体落地。把它们记成一组，比单独背其中任何一条都更接近这一章的设计本质。
+中间态的关键点：第 8–10 步是「**等知乎自己跳走**」，扩展没有发任何请求，只是每 2 秒瞄一眼 URL；第 11 步是「**逼知乎 JS 把签名 Cookie 写进来**」，这一步发生得非常隐蔽，却是登录流程能不能用的真正分水岭——少了它，第 14 步的验收闸门会直接报「缺 `__zse_ck`」。
 
-到这里，扩展已经能拿到一份完整可用的登录凭据，下一步要解决的是另一件让人头疼的事：**侧边栏默认长成「知乎热榜」一眼假的样子**，怎么把它伪装成 VS Code 自己的文件树、降低被一眼发现的概率。这就是紧邻下一章「侧边栏伪装成假文件树」要讲的事。
+## 7. 教学简化说明
+
+本章演示故意省略了：webview 多态 HTML 的拼接（加载中 / 等待 / 二维码展示 / 成功 / 超时 / 错误六态）、四个布尔标志（`isCleanedUp` / `isDisposed` / `isLoginSuccess` / `isProcessingRetry`）的具体协调、重试（关面板重开命令）、超时（约 10 分钟）、Esc 关闭等交互分支、HTML 实体转义细节、命令注册与依赖注入。这些是工程脚手架，不是原理。
+
+## 8. 小结
+
+整套登录流程的灵魂就四个字：**借力，不逆向**。把加密、签名、Cookie 写入全部交还给知乎自己的前端 JS，扩展只做最简单的四件事——渲染、截图、轮询、收割。这一章把前面所有章节首次串到一条端到端的用户操作上：前置章造的浏览器单例、Cookie 清洗校验、侧边栏刷新，在这里第一次合在一起跑通。可登录办成之后，侧边栏开始承载真实知乎内容，知乎一旦在 VSCode 里露脸，失焦那一刻还是会被瞄见——下一章就把侧边栏这层也伪装起来。

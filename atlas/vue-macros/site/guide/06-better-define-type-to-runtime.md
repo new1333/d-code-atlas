@@ -1,208 +1,184 @@
----
-title: "better-define：把 TS 类型降级为运行时校验"
----
-
 # better-define：把 TS 类型降级为运行时校验
 
-你在 Vue 里大概写过这样的代码：
+> 本章属于 composite 层。前置：props/emit 宏的编译期重写与类型转换。
+> 学完你能：讲清为什么 vue-macros 要在编译期自实现一个迷你类型求值器、把 TS 类型翻译成 Vue 运行时校验对象，以及它为此付出的几笔代价。
 
-```ts
-const props = defineProps<{ foo: string; bar?: number }>()
-```
+## 1. 为什么需要它
 
-某天，父组件手滑传了个 `:foo="123"`——一个数字。你满心以为 Vue 会在控制台甩你一脸红色警告，结果什么都没发生：组件照常渲染，`props.foo` 老老实实接住了 `123`，那个 `string` 类型就像没写过一样。
+上一章讲 `defineModels`，让一个泛型字段同时落到 props 与 emits，把双向绑定收成一行 `defineModels<{...}>()` 写完。可无论是 `defineModels` 还是更基础的 `defineProps<T>()`，落到 Vue 编译器手里都有一个共同动作：**T 被擦掉**。
 
-为什么会这样？因为原生 `defineProps` 的类型参数 `<T>` 是一份**纯编译期产物**。TypeScript 编译完，它就被擦掉了，运行时根本看不到。Vue 自己能从这份类型里抽出来的，只有「有哪些字段名」「哪个是可选的」这点信息，拼成一个最小化的 props 选项——注意，里面**没有 `type` 字段**。没有 `type`，运行时就失去了校验依据，传错类型只能装没看见。
+具体说，`defineProps<{ foo: string; bar?: number }>()` 在 Vue 编译期只剩两件事可做——抽出字段名 `foo`/`bar`、判断 `bar` 是不是可选；至于 `string` / `number` 这两个类型本身，编译完就没了。运行时拿到的 props 选项里压根没有 `type` 字段。
 
-better-define 要补的就是这道缺口：在编译期把整份类型**完整求值一遍**，翻成 Vue 运行时认识的 `{ type, required, default }` 对象，再覆盖回去。一句话——**让类型成为运行时校验的唯一真相来源**。
+于是会出现这种尴尬：父组件传 `:foo="42"`，类型上当然报错；可如果你绕过去（动态拼 props、第三方组件包了一层、写测试时图省事），运行时**静默通过**，没有任何提醒。类型只活在编辑器里，运行时一无所知。
 
-> 顺带交代一句来路：到本章这一步，各种顺手的写法（比如 `$defineProps`、`ShortEmits` 那一族）已经在前一章被统一改写成标准的 `defineProps<T>()` 了。那是「写法 → 原生宏」的重写，已经讲过。本章不碰写法重写，只做写法重写之后的下一个动作：**把 `<T>` 本身降级成运行时对象**。
+你想要的是反过来的承诺：**我写了一份类型，它就真的在运行时校验我**——改一处类型、运行时校验自动跟着变，不会两边漂移。`better-define` 就是来填这道鸿沟的。
 
-## 最末端的一步：TS 关键字到 Vue 构造器的翻译表
+> 跨章去重：第 4 章『props/emit 宏的编译期重写与类型转换』讲的是「把各种写法重写成原生宏」——`$defineProps` 改名、`ShortEmits` 展开，方向是「写法 → 原生宏」；本章讲的是「类型 → 运行时对象」，方向不同，别混。
 
-先从最小的一块讲起。不管类型有多复杂，求值到最后，每个字段都会落在一个具体的「类型节点」上。比如 `foo: string` 里的 `string`，在 TS 的语法树里是一个 `TSStringKeyword` 节点。better-define 做的最末端的事，就是拿着一张**翻译表**，把这种 TS 关键字翻译成 Vue 运行时认得的构造器名：
+## 2. 核心思想
 
-```
-TSStringKeyword   → 'String'
-TSNumberKeyword   → 'Number'
-TSBooleanKeyword  → 'Boolean'
-字面量类型        → 按字面量种类映
-Array/Function/Date/Promise 等命名引用 → 映自身名字
-对象/接口         → 'Object'（若是可调用对象再叠一个 'Function'）
-……实在认不出来   → 'Unknown'
-```
+把类型表达式**在编译期完整求值一遍**，把它「编译」成 Vue 运行时认识的 `{ type, required, default }` 对象，再整个塞回 `defineProps(...)` 的参数位置。类型由此成为运行时校验的**唯一真相来源**，而不是和运行时选项并列、要靠人手维护的第二份资料。
 
-这张表是整个机制的「出口」。前面所有复杂的求值，都是为了把字段推到能查这张表的程度。`optional`（`bar?: number` 里那个问号）则单独翻译成 `required: false`。拿到了 `{ type, required }`，一个字段的运行时定义就齐了。
+## 3. 心智模型
 
-## 把类型当成「表达式」来求值
+把 `defineProps<{ ... }>()` 的类型参数 T，从「要被擦除的标注」当成「要被求值的表达式」：
 
-但真实的类型很少乖乖躺在原地等你翻译。你写的往往是这些：
+1. 在编译期拦下**带类型参数**的 `defineProps<T>()`（没有 T 的不处理，留给 Vue 自己）。
+2. 把 T 当成一个需要展开的类型表达式，开始求值。
+3. 遇到类型名字 → 先查当前文件的导入/声明表；名字来自别的文件 → 读盘解析那个文件、递归求值；带一张调用栈做环检测，防止 `A=B; B=A` 死循环。
+4. 展开后的「字段集合」逐字段映射成 Vue 运行时构造器名（`String`/`Number`/`Boolean`/`Object`…），`optional` 翻成 `required: false`。
+5. 拼成 `{ 字段: { type, required, default } }` 整体，覆盖回 `defineProps(...)`。
+6. 任何一步失败 → 短路抛错 → 插件层降级为 warn，原 `defineProps` 一字不改。
 
-```ts
-type Props = { foo: string; bar?: number }
-const props = defineProps<Props>()
+step 3 的「读盘」是这件事最难的地方——一个看起来人畜无害的 `import type { User } from './user'` 就触发了一次磁盘读、一次递归 parse、一次对 `User` 的求值；如果 `User` 又 import 了别的，递归还会继续下去。
 
-// 或者跨文件
-import type { SharedProps } from './types'
-const props = defineProps<SharedProps & { extra: boolean }>()
-```
+## 4. 关键权衡
 
-`Props`、`SharedProps` 都只是名字，光看名字你翻译不出任何东西。所以求值器不能把类型当成「标注」扫一眼就过，得把它当成一个**需要被求值的表达式**：看到名字就去查它的定义，查到的如果是另一个名字，就继续追下去，直到追到能上翻译表的具体关键字为止。
+### 类型当唯一真相来源，换来永不漂移的代价是自实现类型求值器
 
-这个「顺着名字一路追」的过程，分几种情况：
+最大的取舍是**不让用户双写「类型 + 运行时选项」**。原生 Vue 里你只能要么写运行时选项 `defineProps({ foo: { type: String, required: true } })`、要么写纯类型 `defineProps<{ foo: string }>()`——前者运行时校验齐全但类型不漂亮，后者类型漂亮但运行时失忆。`better-define` 选第三条路：你只写类型，运行时选项由它**自动派生**。
 
-- **类型别名 / 括号类型**：`type A = B`、`type A = (B)`——直接剥掉外壳，对内层重新求值。像拆套娃，拆到最里面那层为止。
-- **`A extends B`、`Partial<>` 等组合**：要把父类型、被修饰的类型先求值出来，再做合并或翻转（`Partial` 干的事就是把所有字段翻成可选）。
-- **跨文件的 `import type`**：看到名字来自别的文件，就得去磁盘上把那个文件找出来、解析它、在它的导出里找到这个名字的定义，再带回来继续求值。
+换来的是「改类型即改校验」，两侧永远不可能漂移；代价是它必须在编译期**自己实现一个迷你的、能跨文件的类型求值器**——递归展开类型别名、interface 继承、`Partial<>` 等组合，复杂度极高、且必须异步。
 
-类比一下：这套机制就像一个会顺藤摸瓜的侦探。看到一个不在本地的名字，就跑去别的文件档案柜里翻；翻到的资料里如果又指向另一个名字，就接着追。一直追到「现场实物」（能上翻译表的关键字）为止。
+本质矛盾是「**单一真相 vs 实现成本**」：要消灭双写，就得有东西替你把类型翻译成运行时；这个翻译器不可能依赖 tsc 暴露的 API（tsc 不提供这种半截求值），只能自己写一份。这是同一类问题的通解骨架——所有「让声明成为唯一真相」的设计（GraphQL schema → 类型、SQL schema → ORM 实体）都要跨过同一道坎。
 
-### 绕圈怎么办：栈式环检测
+### 失败即降级，换来「不挡路」的代价是可能静默退化
 
-侦探最怕遇到死循环：`type A = B; type B = A`，追着追着又回到原点，永远停不下来。better-define 的做法很朴素——**走迷宫时沿路撒面包屑**：维护一个调用栈，每追一层就把「当前作用域 + 当前类型」记下来；一旦发现自己又要处理一个已经记过的组合，就立刻返回、不再往下追。互递归的类型就在这里被掐断，不会把构建卡死。
+第二条取舍是当类型求值遇到任何一步失败——遇到不支持的语法、解析不到的 import、互相递归的类型——它**整体短路**返回错误，插件层把错误吞成一条 `warn`，**原 `defineProps` 原封不动保留**。
 
-跨文件追类型还有个现实难题：每次都要读盘 + 重新 parse 一个文件，开销不小。所以这套求值叠了三层缓存——「文件解析过的就不再 parse」「import 路径解析过的就不再算」「调用栈本身就兼任环检测」——还额外维护一张「被引用的文件 → 哪些 SFC 引用了它」的反向表，专门给 HMR 用：你改了一个被到处 `import type` 的 `.d.ts`，构建器要顺着这张表把所有受牵连的组件都标成「需要重新转换」。
+换来的是「绝不挡路」：你工程里塞了个 weird 的边缘类型，better-define 不会让你的构建挂掉，只是这一处 props 退化为无运行时校验；代价是用户**无法保证「我的 props 一定被运行时校验了」**——它可能静默退化为无校验，warn 是否被看到全靠自觉。本质矛盾是「**严格性 vs 可用性**」，所有「尽力而为」型静态分析工具（ESLint autofix、Prettier 容错）都站在同一侧。
 
-## 拼装运行时对象，覆盖回去
+### 跨文件递归求值换类型系统的真覆盖，代价是三层缓存外加反向表
 
-字段都求值完了，接下来就是拼装。把每个字段拼成 `{ type: String, required: true }` 这样的片段，整体包成一个大对象，再用字符串 `defineProps({...})` 裹起来。最后一步，是用增量编辑工具把这个新串覆盖掉源码里原来的 `defineProps<T>()` 那一段——原文长什么样不重要，重要的是偏移位置准、sourcemap 不丢。
+第三条取舍是支持**跨文件**递归求值——`import type` 拉到的类型也要展开、命名空间要下钻、`A extends B` 要追到 B、`Partial/Required/Readonly` 要按可选位翻转。
 
-整个转换在流程上是这样走的：
+换来的是真正覆盖 TS 类型系统的常见组合，而不只是「同一个文件里的对象字面量」；代价是磁盘读 + 递归 parse 的开销巨大，**必须叠三层缓存**（已解析文件缓存、import 路径解析缓存、调用栈环检测），外加一张「被引用文件 → 引用者」反向表来支撑 HMR——改一个 `.d.ts`，要能顺着反向表找出所有传递引用它的 SFC 全部失效，否则增量成本不可接受。
 
-```
-defineProps<{ foo: string; bar?: number }>()
-   │
-   ├─ 识别「带类型参数」的 defineProps（没类型参数的不管，留给 Vue 自己）
-   ├─ 把类型参数当表达式求值（递归展开别名/extends/跨文件 import + 环检测）
-   │     → 得到字段集合 { foo:{字符串,必填}, bar:{数字,可选} }
-   ├─ 逐字段查翻译表 → { type:'String', required:true } / { type:'Number', required:false }
-   ├─ 拼成 defineProps({ foo:{...}, bar:{...} })
-   └─ 覆盖原文
-```
+本质矛盾是「**类型系统的覆盖度 vs 工程成本**」：覆盖越真，越要在编译期重做 TS 编译器的一部分工作，越要担心缓存失效与 HMR 一致性。这也是为什么 `better-define` 的实现大量被抽到独立的 `@vue-macros/api` 包——这些缓存、求值、反向表都是可被多个宏复用的基础设施。
 
-有个小细节值得注意：`required` 字段**只在非生产环境输出**。生产包里它会被省掉。道理很简单——`required: false` 主要是为了让 Vue 在开发期对你喊一句「这个必填 prop 你忘传了」，线上没人看这警告，留着纯属多余体积。
+### 生产环境几乎擦除运行时校验，换来零开销代价是它主要只服务开发期
 
-## 失败即降级：求值任何一步崩了，就当没这回事
+第四条取舍有点反直觉：尽管 `better-define` 辛辛苦苦把类型降级成了运行时校验，**到了生产环境它几乎把 `type` 字段全擦掉了**——只保留 `Boolean`（影响 v-model 与未传参默认值）和 `Function`（影响事件绑定），其余 `String/Number/Object` 一律不留。
 
-到这里你可能已经咂摸出问题来了：上面这套求值，又是跨文件读盘、又是递归展开、又要处理各种 TS 怪语法——哪一步出了岔子怎么办？比如用户类型里塞了个 `Partial<Omit<X, 'a'>>`，而 `Omit` 这套工具类型还**没实现**，求值器追到这里就只能干瞪眼。
+换来的是生产包零校验开销——`String` 校验对业务无实质保护（你不会真靠它 catch bug，那是测试的工作），徒增体积；代价是这个机制的运行时校验**主要只服务开发期**，生产环境基本退化。本质矛盾是「**校验的真正价值在哪里**」——它不在生产（生产要快、要小），而在开发期的「早点看到错误」。这条与上一条权衡站在同一侧：better-define 是开发期的护栏，不是生产的防线。
 
-better-define 的选择非常明确：**整体包在一个「可短路」的异步链里**。任何一步 `yield` 出错，立刻向外抛，整条求值链瞬间作废。外层插件接到这个错误，不抛异常、不停构建，而是把它收敛成一条 `warn` 打到控制台，然后——**原来的 `defineProps<T>()` 一个字都不改地保留**。
+## 5. 最小原理演示
 
-类比一下，这就像电路里的保险丝：任何一处短路，整条链立刻断电，绝不让一个坏掉的部分把整栋楼（整个构建）拖垮。求值失败 = 类型降级失败 = 这一行的宏原样留着 = 退回「Vue 原生的、不校验类型的」行为。
-
-## 关键权衡
-
-这一节是本章真正想交付的东西。better-define 看似只是「把类型翻成对象」，背后却有四条很实的设计取舍。
-
-**一、让类型成为运行时校验的唯一真相来源。** 旧办法是双写：写一遍类型、再写一遍运行时选项（`defineProps({ foo: { type: String, required: true } })`），靠人去对齐。better-define 选了另一条路——**只认类型这一处**，运行时校验完全从类型派生出来。
-
-- **换来**：改一处类型，编译期自动重新派生出对应的运行时校验，两侧永不漂移。就像一份菜谱既是备料清单、又是成品验收单，改了菜谱两边自动跟着变，省掉了一份对账表。
-- **代价**：你必须在编译期自己实现一个**迷你的类型求值器**——能递归展开别名、处理 interface 继承、`Partial/Required/Readonly` 这些组合、还能跨文件追 `import type`。这是相当高的一坨复杂度，而且因为要读盘，**整个过程必须是异步的**。代价全砸在了「编译期要重造半个类型系统」上。
-
-**二、尽力而为、失败即降级。** 求值器遇到任何不支持的语法、解析不到的 import、互相递归的类型，就整体短路、原 `defineProps` 一字不动，插件层把错误吞成一条 `warn`。
-
-- **换来**：插件的健壮性。用户的类型里混了再怪的写法，构建也绝不会因此炸掉，最坏不过「这行宏没生效」。
-- **代价**：用户**没法保证**「我写的 props 一定被运行时校验了」。可能某天你引入了一个它解析不了的类型组合，校验就悄悄退化成「无校验」，而那条 warn 你不主动看控制台就根本不知道。安全网有，但不是兜底的——它默认你是会看 warn 的人。
-
-**三、跨文件递归求值 + 栈式环检测。** 选择支持 `import type` 跨文件取类型、命名空间下钻（`A.B.C`）、`extends`、`Partial/Required/Readonly` 的任意嵌套组合。
-
-- **换来**：类型可以像正常写 TS 一样拆到别的文件、按命名空间组织，better-define 照样追得到，不逼你把所有类型堆进单文件。
-- **代价**：磁盘读 + 递归 parse 的开销巨大，必须**叠三层缓存**（已解析文件缓存、import 路径解析缓存、调用栈环检测），再外加一张「被引用文件 → 引用者」的反向表来支撑 HMR。少任何一层，增量构建的成本都会不可接受——改一个类型文件就要全量重算。复杂度的大头都花在了「让跨文件这件事在工程上可用」。
-
-**四、生产环境几乎擦除运行时类型校验。** 到了生产包，除了 `Boolean`（及它常伴随的 `String`）和 `Function` 之外，其余 `type` 字段几乎全被删掉。
-
-- **换来**：生产包零校验开销。`String`/`Number` 这类校验对线上业务没有实质保护——真能传错类型的 bug 在开发期早该被它揪出来了，到生产还留着只会徒增体积和一点点 CPU。
-- **代价**：这套机制的运行时校验**主要只服务开发期**，生产环境基本退化成「只保留和语义强相关的最小集合」。`Boolean` 之所以必留，是因为它直接影响 `v-model` 和「未传参时的默认值」行为；`Function` 必留是因为它影响事件绑定的判定。剩下的，生产环境一律不信任。
-
-## 原理演示
-
-下面这段脚本从零演示主干：输入一段含 `defineProps<T>()` 的 setup 字符串，把内联类型字面量求值成运行时对象并覆盖原文；遇到认不出的类型，求值短路、外层降级为 warn 并保留原文。它只演「类型 AST → 运行时对象」这条主干 + 失败降级，刻意省略了跨文件 import、环检测、`Partial<>`、生产期擦除这些工程化部分——载体服务于演透原理，不服务于工程完整。
+下面这段几十行的脚本，演两件事：**把类型字面量翻译成运行时对象**、**求值失败时短路返回错误让调用方降级**。每一行都对应上面某个原理点；不演示原理的实现细节（跨文件 import、环检测、生产期 type 擦除）一律略去。
 
 ```ts
 import { parse } from '@babel/parser'
 
-// 翻译表：TS 关键字节点 → Vue 运行时构造器名
-const TYPE_MAP: Record<string, string> = {
+// 极简映射表：TS 类型关键字 → Vue 运行时构造器名
+const KEYWORD_TO_CTOR: Record<string, string> = {
   TSStringKeyword: 'String',
   TSNumberKeyword: 'Number',
   TSBooleanKeyword: 'Boolean',
 }
 
-// 求值一个「类型字面量」节点，返回字段集合；遇到不认识的类型直接抛错（短路点）
-function evalTypeLiteral(node: any) {
-  const fields: Array<{ name: string; ctor: string; optional: boolean }> = []
+// 把一个 TSTypeLiteral 拆成字段集合；遇到不支持的节点就抛错，
+// 让上层调用方决定怎么降级
+function resolveTypeLiteral(node: any) {
+  if (node.type !== 'TSTypeLiteral') {
+    throw new Error(`unsupported type node: ${node.type}`)
+  }
+  const fields: Record<string, { type: string; required: boolean }> = {}
   for (const member of node.members) {
-    const keyNode = member.key
-    const name = keyNode.type === 'Identifier' ? keyNode.name : keyNode.value
-    const kind = member.typeAnnotation.typeAnnotation.type
-    const ctor = TYPE_MAP[kind]
-    if (!ctor) throw new Error(`unsupported type node: ${kind}`) // ★ 短路
-    fields.push({ name, ctor, optional: !!member.optional })
+    // optional 标记挂在成员上（对应 foo? 的 questionToken）
+    const required = !member.optional
+    const keyword = member.typeAnnotation.typeAnnotation.type
+    const ctor = KEYWORD_TO_CTOR[keyword]
+    if (!ctor) {
+      throw new Error(`unsupported keyword: ${keyword}`)
+    }
+    fields[member.key.name] = { type: ctor, required }
   }
   return fields
 }
 
-// 字段集合 → 运行时对象字符串
-function genRuntimeProps(fields: any[]) {
-  const body = fields
-    .map(f => `  ${f.name}: { type: ${f.ctor}, required: ${!f.optional} }`)
+function genRuntimeObject(fields: Record<string, any>) {
+  const inner = Object.entries(fields)
+    .map(([k, v]) => `  ${k}: { type: ${v.type}, required: ${v.required} }`)
     .join(',\n')
-  return `defineProps({\n${body}\n})`
+  return `{\n${inner}\n}`
 }
 
-// 转换器：拦下「带类型参数」的 defineProps，求值→覆盖；失败则降级为 warn + 保留原文
-function transformBetterDefine(code: string): string {
-  const ast = parse(code, { plugins: ['typescript'], sourceType: 'module' })
+// 主入口：求值成功返回改写后的代码；失败返回 null，由调用方决定降级
+function tryCompileBetterDefine(code: string): string | null {
+  const ast = parse(code, { plugins: ['typescript'] })
   for (const stmt of ast.program.body) {
+    // 只识别 `const xxx = defineProps<{...}>()` 这一种形态
     if (stmt.type !== 'VariableDeclaration') continue
-    for (const decl of stmt.declarations) {
-      const init = decl.init
-      if (
-        init?.type === 'CallExpression' &&
-        init.callee.type === 'Identifier' &&
-        init.callee.name === 'defineProps' &&
-        init.typeParameters?.params[0] &&
-        init.typeParameters.params[0].type === 'TSTypeLiteral'
-      ) {
-        try {
-          const fields = evalTypeLiteral(init.typeParameters.params[0])
-          const runtime = genRuntimeProps(fields)
-          return code.slice(0, init.start!) + runtime + code.slice(init.end!)
-        } catch (e) {
-          console.warn(`[better-define] ${(e as Error).message}, 保留原文`)
-          return code
-        }
-      }
+    const decl = stmt.declarations[0]
+    if (!decl || decl.init?.type !== 'CallExpression') continue
+    const call = decl.init
+    if (call.callee.type !== 'Identifier' || call.callee.name !== 'defineProps') continue
+    const typeParam = call.typeParameters?.params[0]
+    if (!typeParam) continue  // 无类型参数的不处理，留给 Vue 自己
+
+    try {
+      // 把类型参数当成「要被求值的表达式」，而不是要被擦除的标注
+      const fields = resolveTypeLiteral(typeParam)
+      const runtimeObj = genRuntimeObject(fields)
+      const propsName = decl.id.name
+      return `const ${propsName} = defineProps(${runtimeObj})`
+    } catch (e) {
+      // 失败即降级：调用方拿到 null，决定 warn + 原样保留
+      console.warn(`[better-define] ${(e as Error).message}, fallback to original`)
+      return null
     }
   }
-  return code
+  return null
 }
 
-// —— 演示 1：正常降级 ——
-console.log(transformBetterDefine(
+// 成功路径：类型字面量被完整求值成运行时对象
+console.log(tryCompileBetterDefine(
   `const props = defineProps<{ foo: string; bar?: number }>()`
 ))
-// 输出：
 // const props = defineProps({
 //   foo: { type: String, required: true },
 //   bar: { type: Number, required: false }
 // })
 
-// —— 演示 2：遇到认不出的类型（一个外部引用），失败降级 ——
-console.log(transformBetterDefine(
-  `const props = defineProps<{ foo: SomeImportedThing }>()`
-))
-// 输出：
-// [better-define] unsupported type node: TSTypeReference, 保留原文
-// const props = defineProps<{ foo: SomeImportedThing }>()
+// 失败降级路径：含未识别的 TSTypeReference（SomeThing），求值短路
+const r = tryCompileBetterDefine(
+  `const props = defineProps<{ foo: SomeThing }>()`
+)
+console.log(r)  // null，并打印一条 warn
 ```
 
-第一段演示对应权衡一：类型被完整翻译成了运行时对象，`optional` 变成了 `required: false`，原文被覆盖。第二段演示对应权衡二：`SomeImportedThing` 是一个 `TSTypeReference`，不在翻译表里，求值在 `evalTypeLiteral` 里抛错短路，外层 `catch` 把它降级成 warn，原代码原封不动地留了下来。真仓库里这一步短路是异步链里的 `yield`，外层插件把它收敛成 warn——结构完全一致，只是真仓库还要处理异步和跨文件。
+这段脚本和真实 `better-define` 的距离在于：真实版本会用 `safeTry + ResultAsync` 把「失败即降级」做成异步短路链、用 `@vue-macros/api` 的 `resolveTSReferencedType` 做跨文件递归求值、用三层缓存支撑增量构建、在生产环境还会进一步擦除 `type` 字段。上面这段只演透主干——「**类型 AST → 运行时对象 + 失败降级**」。
 
-## 小结
+## 6. 执行轨迹
 
-better-define 解决的是「类型活在编辑器里、运行时失忆」这道鸿沟。它的全部工作可以压缩成一句：**在编译期把类型表达式求值一遍，翻成 Vue 运行时认得的对象，覆盖回去**。围绕这一句，它做了四条取舍——用「类型作为唯一真相来源」换永不漂移、用「尽力而为 + 失败降级」换构建健壮性、用「跨文件递归 + 三层缓存 + 环检测」换类型可以正常拆文件、用「生产期擦除校验」换零体积开销。每一条都是「选了 A、换来 B、付出 C」。
+输入字符串：`const props = defineProps<{ foo: string; bar?: number }>()`
 
-记住它的边界：这套运行时校验**主要服务开发期**，而且**不是兜底的**——类型一旦复杂到求值器追不动，它会悄悄退回无校验，只在控制台留一条 warn。用它的前提，是你愿意偶尔看一眼那条 warn。
+走读一遍：
 
-讲到这里，我们一直在解决「声明出来的东西，怎么落到运行时」。下一章《响应式语法糖：赋值即 `.value`》会换个方向——它要解决的是「声明出来的响应式变量，怎么写起来不像响应式」：让你对 `$ref` 声明的变量直接赋值，编译期悄悄把这个赋值改写成 `.value` 访问，从而丢掉那满屏的 `.value`。
+1. **拦截**：parser 把字符串切成 AST，遍历顶层语句命中一条 `VariableDeclaration`，其 init 是 `CallExpression`、callee 是 `defineProps`、`typeParameters.params[0]` 存在——这是个「带类型参数的 defineProps」，进入处理。
+2. **求值类型**：`typeParameters.params[0]` 是个 `TSTypeLiteral`，遍历它的 `members`：
+   - `foo: string` → `optional: false`、关键字 `TSStringKeyword` 映射到 `'String'`、`required: true`
+   - `bar?: number` → `optional: true`、关键字 `TSNumberKeyword` 映射到 `'Number'`、`required: false`
+3. **拼装**：字段集合 `{ foo: { type: 'String', required: true }, bar: { type: 'Number', required: false } }` 被序列化成运行时对象字面量。
+4. **覆盖**：原 `defineProps<{...}>()` 被改写为 `defineProps({ foo: {...}, bar: {...} })`，用 magic-string 的 `overwriteNode` 整段盖回去。
+
+输出字符串：
+
+```ts
+const props = defineProps({
+  foo: { type: String, required: true },
+  bar: { type: Number, required: false },
+})
+```
+
+如果输入里混进解析不了的符号（比如 `foo: SomeThing`），step 2 求值到 `TSTypeReference` 时分支不匹配，立即抛 `unsupported type node: TSTypeReference`；上层 catch 后打印 warn 并返回 `null`，最终输出 = 输入原样保留。
+
+## 7. 教学简化说明
+
+本章演示故意省略了：跨文件 import 解析（`@vue-macros/api` 的 `resolveTSNamespace` + `resolveDts`）、栈式环检测、union/intersection/interface extends、`Partial<>` 等内建工具类型的 handler、`withDefaults` 静态/动态默认值的分支、生产环境 `type` 字段擦除（只留 `Boolean/Function`）、emits 降级（有损、只取事件名）、HMR 反向依赖表的递归失效——这些是把原理撑大的工程化部分，主干只演「类型 AST → 运行时对象 + 失败降级」。
+
+## 8. 小结
+
+`better-define` 把「类型只活在编辑器里」这件事翻过来了：编译期替你把类型表达式求值一遍、降级成 Vue 运行时认识的 `{ type, required, default }` 对象，让类型成为运行时校验的唯一真相来源。这套机制的本质是**自实现一个迷你类型求值器**——失败即降级、跨文件递归、生产期擦除 type，都是为了在「单一真相」的承诺下控制成本与开销。
+
+但有些场景你要的不仅是「类型校验在运行时也生效」，还想要「写赋值语句时不用每次都 `.value`」——下一章就接着讲怎么把 `.value` 在编译期偷偷塞回去。

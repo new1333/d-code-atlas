@@ -1,217 +1,210 @@
 # 状态变更模型：$patch 双形态与暂停监听批处理
 
-你在写一个购物车 store 的结账动作，里面要一口气改好几样：商品数量 +1、勾选状态置 true、优惠券塞进列表、总价重算……动作还没写完，你发现旁边那个负责把状态存进 localStorage 的订阅者，已经被触发了七八次——它根本不在乎中间过程，只想在「这批改动全做完」之后拿一次最终快照存盘。
+> 本章属于 composite 层。前置：Store 装配、订阅原语。
+> 学完你能用一句话讲清：为什么 Pinia 把"改状态"统一收口到 `$patch`，以及它为了"一批改动只通知一次"做了哪几个不对称的取舍。
 
-更糟的是，深度监听是异步生效的（Vue 把它排到下一个微任务里再通知），而订阅者期望的「一次快照」和这个时序根本对不齐：要么收到的还是半成品，要么收一堆半成品。
+## 1. 为什么需要它
 
-这一章要解决的就是一件事：**怎么把一批改动收拢成「一条订阅事件」**。
+上一章把 store 装配出来的产物，是一棵镜像在 `pinia.state.value[id]` 里的根状态树。树长出来了，紧接着的问题就是：**怎么改它、改完怎么通知订阅者**。
 
-## 一句话点透，外加一个类比
-
-做法是：改之前先把监听「按住」，让这期间的改动一个都别通知出去；改完之后，由我们自己手动派发一次订阅通知。
-
-打个比方：订阅者像是门卫，每次有人搬东西进出都要登记一次。`$patch` 就是给门卫塞个耳塞、蒙上眼，让你一次性把这车货全搬进去，搬完再主动给门卫报一次「这车一共这些」——门卫只登记一条，干净利落。
-
-（先把承前的两块点一下，后面就不重复了：要改的「这车货」就是第 4 章那棵单一根状态树里的一个节点；手动派发用的「门卫名单」就是第 2 章那个订阅回调集合——本章只把它当成「手动通知」的执行件复用，不再重讲集合本身怎么增删、怎么随作用域自动回收。）
-
-## 两个入口：函数式与对象式
-
-`$patch` 有两种写法，对应两种改法：
+设想你在 action 里这样写：
 
 ```ts
-// 函数式：把整棵状态直接塞给你，你想怎么命令式改就怎么改
-store.$patch(state => {
-  state.count++
-  state.profile.age++
-})
-
-// 对象式：给一个「补丁对象」，框架帮你深合并进去
-store.$patch({ count: 1, profile: { age: 2 } })
+function increment() {
+  store.count++
+  store.lastUpdated = Date.now()
+  store.history.push(store.count)
+}
 ```
 
-**这条设计换来的是什么**：函数式把状态彻底交给你，适合「我要在这里写一段逻辑、顺手改好几处」；对象式适合「我已经有一个算好的补丁对象（比如从接口、从 localStorage 拿来的），直接糊上去」。两条入口共用同一个 `$patch` 函数体，进函数后按参数是不是 function 分叉。
+三个字段被改了。如果每个字段变动都顺着响应式系统直接流到订阅者（写 localStorage、上报 devtools、打日志），这一次"逻辑上是一次自增"会被记成三次事件，写盘三次、上报三次。订阅者根本分不清"这三次改动其实是一回事"。
 
-**代价**：对象式那条路得自己处理「怎么把补丁合并进现有状态」，边界一多就容易踩坑——两边都是普通对象才递归往下合，否则整值覆盖；遇到 ref/reactive 这种响应式包装值也要整值覆盖（不能拆开合，否则破坏响应性）；Symbol 键直接跳过（反正序列化不了）。这些规则压在一个叫 `mergeReactiveObjects` 的递归函数里，是对象式入口复杂度的全部来源。
+更糟的是，Vue 的深度 watcher 默认是异步 flush 的——它在下一个 tick 才跑。可订阅者通常希望"这次自增给我一个快照就行"，时机和粒度都对不齐。
 
-## 暂停 → 改 → 手动触发一次 → 恢复
+需要的不是更多 API，而是一个统一入口：进这个入口期间，订阅者的通知被按住，等改动全部完成后，统一发一次。
 
-不管走哪条入口，`$patch` 内部都是同一套六步：
+## 2. 核心思想
 
-1. **关掉监听**：把两个监听开关同时置 false。这之后哪怕状态在改，深度监听的回调也被门控跳过、不通知。
-2. **施加改动**：函数式就把状态交给你的回调改；对象式就递归深合并。
-3. **打包事件**：按入口生成一条订阅事件——函数式是 `patchFunction`，对象式是 `patchObject`（顺便把原始补丁对象塞进 `payload`，方便订阅者追溯）。
-4. **排定恢复**：同步开关立即恢复；异步开关排进下一个微任务再恢复，并且只让「最近一次补丁」的恢复生效。
-5. **手动派发一次**：遍历订阅回调集合，把这一条事件 + 最新状态一次性发出去——刚才被吞掉的那批监听，全靠这一次手动派发补回来。
-6. **收尾**：微任务里异步开关恢复，下次直接改状态又能被深度监听正常抓到。
+**把一批状态改动收拢成一个补丁——补丁期间关掉深度监听、改完手动派发一次订阅通知。**
 
-（「这两个开关平时怎么挂到 watcher 上、`$subscribe` 又怎么靠它们和 `$patch` 协调」是紧邻下一章的主题，这里只用它们「被暂停」这一面，不展开协调机制。）
+这句话的灵魂不在"补丁"这个词，而在把"改状态"和"通知订阅者"在时间上脱钩：你拿到一段独占的时间窗，里面改多少次都没人看见；时间窗一关，订阅者只看到最终结果。
 
-## 原理演示
+## 3. 心智模型
 
-下面这段是从零写的最小骨架，能 `node`/`bun` 直接跑。它把 Vue 的深度响应式换成了一个极简 Proxy，把 Vue 的调度队列换成了一个手动队列——目的是让你看清「暂停、改、手动触发、恢复」这条主线，而不是陷进 Vue 本身的调度细节。场景代码用了顶层 `await`，存成 `.mjs` 或直接用 bun 跑即可。
+补丁入口内部维护两份东西：
+
+- 一份根状态对象（上一章镜像进来的那棵树）。
+- 两个监听开关：`isListening`（异步深度监听）、`isSyncListening`（同步深度监听）。
+
+平时订阅有两条触发路径：
+
+- 路径 A：绕过 `$patch` 直接改 `store.x = ...`。深度 watcher 看到变动，开关为 true 时直接通知订阅者。
+- 路径 B：走 `$patch(...)`。开关被关掉，watcher 看见但被门控跳过；改动结束后，由补丁入口手动遍历订阅者集合，发一条通知。
+
+补丁的生命周期长这样：
+
+```
+进入：isListening=false, isSyncListening=false
+  → 施加改动（函数式 or 对象式）
+  → 打包一条 mutation 事件
+  → 异步开关排进微任务才恢复（带 Symbol 去重）
+  → 同步开关立即恢复
+  → 手动遍历订阅者集合，把事件 + 最新状态派发一次
+微任务到达：异步开关恢复 true
+```
+
+两个形态各擅长一件事：
+
+- **函数式入口**：`$patch(s => { s.count++; s.list.push(1) })`——拿到根状态对象，命令式改写。适合"我不知道哪些字段会变、按业务逻辑跑一遍再说"。
+- **对象式入口**：`$patch({ count: 1, profile: { name: 'A' } })`——给一个 patch 对象，框架做递归深合并。适合"我有完整的新状态片段、声明式叠上去"。
+
+订阅者集合本身（addSubscription / triggerSubscriptions 的最小化身）第 2 章已经讲透了，本章只把它当成"派发执行件"复用，不重演回调集合的设计。
+
+## 4. 关键权衡
+
+### 关监听换"一批改动 = 一条订阅"
+
+补丁入口第一件事是把两个监听开关都置 false。Vue 的深度 watcher 没法被关掉、它仍然会察觉状态变动，但它的回调会先看开关，开关为 false 就直接 return——中途的每一次字段改动都被闷在锅里。
+
+换来的是真正的原子批处理：你在补丁里改三个字段，订阅者只收到一条通知，事件类型是 `patch function` 或 `patch object`，事件里附带"这次补丁干了什么"。
+
+代价不是零：既然 watcher 被跳过，框架就必须自己**补一次**——在补丁末尾手动遍历订阅者集合、发一条事件。这一步漏掉，订阅者会彻底错过这次补丁。这等于把"通知订阅者"的责任从响应式系统手里接过来，变成补丁入口自己得扛的事。
+
+这条权衡化解的本质矛盾是：**响应式系统的天然语义是"每次字段变动都通知一次"，但业务语义是"一次逻辑操作可能改多个字段、订阅者只关心这次操作"**——这两个粒度对不齐。任何"批处理"机制都会撞上这个矛盾，解法也都长得像：开个口子让外面说"我现在开始批、先别喊"，结束后再统一喊一次。
+
+### 双形态入口换表达力，代价是合并逻辑复杂
+
+函数式擅长业务流程式地改、对象式擅长声明式地叠。两种形态都必要——只给函数式，没有"我手上有一份完整新片段"的便利；只给对象式，写不出"按当前 list 长度决定怎么改"的逻辑。
+
+代价集中在对象式的合并规则上。一条"深合并"听起来简单，写下来要逐类型分叉：Map 用 `set`、Set 用 `add`（整键覆盖、不递归进元素）；普通对象两边都是才递归；patch 值若是 ref/reactive 包装就整值覆盖（不能拆开，否则破坏响应性）；Symbol 键直接跳过（不可序列化）。每一种集合类型都得专门懂、每一种响应式包装都得专门躲。
+
+这条权衡的本质矛盾是：**声明式合并必须懂每个集合类型的合并语义、又必须保留响应式包装不被拆穿**——一边是"我只想给个对象"，一边是"对象里可能藏着任何东西"。"声明式描述差量"这个需求在所有状态管理库里都会遇到，Redux 的 reducer、Immer 的 recipe 都是这条谱系上的不同取舍。
+
+### 两个开关不对称恢复，换"吞异步 job + 不伤同步监听"
+
+补丁结束后，同步开关立即恢复 true，异步开关却排进 `nextTick` 微任务才恢复。为什么要错开？
+
+Vue 的深度 watcher 默认异步 flush：状态一变，watcher 不立刻跑，而是排进调度队列、下个 tick 统一 flush。补丁期间状态被改了，watcher 的 job 已经排在队列里；如果异步开关在补丁结束时立即恢复 true，这个被排进来的 job flush 时就会发现开关开着、真的通知订阅者一次——和补丁末尾的手动派发**重复**了。
+
+所以异步开关的恢复被推迟到下一个微任务：本 tick 排队的 watcher job flush 时撞上 false 被吞、然后微任务再把开关恢复 true。同步开关不需要这步——同步 watcher 当场跑、补丁内的变动当场就被门控跳过，结束就立刻恢复不会引发重复。
+
+代价是两个开关恢复时机不对称——读代码的人很难一眼看出"为什么要分两步"。补丁入口还用一个模块级的 `activeListener`（Symbol）保证**连续多次补丁只有最后一次的微任务恢复生效**：每次补丁用一个新的 Symbol 给自己编号，微任务回调里检查"我是不是最近一次补丁"，是才恢复。否则连续补丁会排进来好几个恢复回调，中间一个提前把开关打开了，前述的"吞 job"机制就破功。
+
+本质矛盾：**异步调度让"通知"和"改动"在时间上分离，但批处理需要"通知"紧跟"改动"的语义边界**——你只能在调度器的时间窗里做手脚，用"晚一拍恢复"换取"该吞的吞掉"。任何在异步响应式系统上做批处理的库都会撞上这个时间错位。
+
+### `$reset` 与 `$state` setter 都转调 `$patch`，换写路径语义统一
+
+`$reset`（仅 option store）和 `$state = newObj` 都不另起通知逻辑，而是内部直接调 `$patch`：
+
+- `$reset` 调 `$patch(s => assign(s, freshState()))`
+- `$state` setter 调 `$patch(s => assign(s, newState))`
+
+换来的是"所有写状态的操作共享同一套批处理与单次通知"——不用为重置/替换各写一套订阅通知逻辑、不用担心"直接改 rootState 会不会被订阅者漏掉"。
+
+代价是一个语义上的不直觉：`store.$state = { a: 1 }` 作用在 `{ a: 0, b: 2 }` 上，结果不是 `{ a: 1 }` 而是 `{ a: 1, b: 2 }`——是**浅合并**而非替换。`Object.assign` 不会删旧键。你以为 setter 是"换一整份新状态"，实际拿到的是"叠一层上去"。
+
+本质矛盾：**"重置/替换"在概念上像是一份全新的状态、理应另起通知路径，但工程上又必须复用 `$patch` 的批处理机制**——解法是承认它们其实就是一种特殊的补丁（覆盖式补丁），代价是命名上叫"替换"语义上却是"合并"。
+
+## 5. 最小原理演示
+
+下面这段几十行的 TS 把上面几条权衡压成一段可读脚本：根状态对象 + 订阅者集合 + 两个监听开关 + 一个补丁函数（双形态 + 不对称恢复 + 手动派发）。被暂停的深度 watcher 属于下一章的另一条订阅路径，这里不演。
 
 ```ts
-// ① 第 2 章的订阅回调集合，这里复用最简形态
-const subscribers = new Set<(e: any, s: any) => void>()
-const addSub = (fn: any) => (subscribers.add(fn), () => subscribers.delete(fn))
-const triggerSubscriptions = (e: any, s: any) => subscribers.forEach(fn => fn(e, s))
+type Listener = (mutation: any, state: any) => void
 
-// ② 状态：第 4 章那棵单一根状态树里的一个节点
-const raw = { count: 0, profile: { name: 'a', age: 1 } }
+// 根状态（真实场景被 Vue reactive 包起来；本章只演补丁路径）
+const state: any = { count: 0, list: [] as number[] }
 
-// ③ Vue 调度队列的极简替身：先进先出，flush 时一次跑完
-const queue: Array<() => void> = []
-const flush = async () => { while (queue.length) queue.splice(0).forEach(f => f()) }
+// 订阅者集合——第 2 章已讲透的 addSubscription/triggerSubscriptions 最小化身
+const subscriptions = new Set<Listener>()
 
-// ④ 两个监听开关（本章主角）
-let isListening = true        // 异步监听开关（默认 flush 模式）
-let isSyncListening = true    // 同步监听开关（flush:'sync' 模式）
-let activeListener: symbol | undefined   // 连续补丁的去重令牌
+// 两个监听开关：异步 / 同步（默认 true；补丁期间被关）
+let isListening = true
+let isSyncListening = true
 
-// ⑤ 极简深度响应式：任何一层 set 都向上冒泡成一次「被监听侦测到」
-function reactive<T extends object>(o: T): T {
-  return new Proxy(o, {
-    get(t, k, r) {
-      const v = Reflect.get(t, k, r)
-      return v && typeof v === 'object' ? reactive(v as any) : v
-    },
-    set(t, k, v, r) { Reflect.set(t, k, v, r); watchFired(); return true },
-  })
-}
-const state = reactive(raw)
+// 连续补丁去重：每次补丁用新 Symbol 编号、只有最近一次的微任务恢复生效
+let activeListener: symbol | undefined
 
-// ⑥ 深度监听回调（真实 Pinia 里这是 watch(state, cb, { deep: true }) 的回调）
-function watchFired() {
-  if (isSyncListening) triggerSubscriptions({ type: 'direct', via: 'sync' }, state)   // 同步：立即判
-  queue.push(() => { if (isListening) triggerSubscriptions({ type: 'direct', via: 'async' }, state) }) // 异步：入队，flush 再判
-}
-
-// ⑦ 对象式深合并（简化版：两边都是普通对象才递归，否则整值覆盖）
-const isPlain = (o: any) => o && typeof o === 'object' && Object.getPrototypeOf(o) === Object.prototype
-function mergeReactiveObjects(target: any, patch: any) {
+// 深合并：两边都是普通对象才递归，否则整值覆盖（含 ref/reactive 包装值）
+function deepMerge(target: any, patch: any) {
   for (const key in patch) {
     const sub = patch[key], cur = target[key]
-    target[key] = isPlain(cur) && isPlain(sub) ? mergeReactiveObjects(cur, sub) : sub
+    if (isPlain(cur) && isPlain(sub) && !isRef(sub)) {
+      target[key] = deepMerge(cur, sub)
+    } else {
+      target[key] = sub
+    }
   }
   return target
 }
+const isPlain = (v: any) => v && typeof v === 'object' && !Array.isArray(v)
+const isRef = (v: any) => v && v.__isRef
 
-// ⑧ $patch 本体：暂停 → 双形态分叉 → 恢复 → 手动派发
-function patch(input: any) {
-  isListening = isSyncListening = false                    // 1. 关掉两个监听开关
-  let event: any
-  if (typeof input === 'function') {                       // 2a. 函数式：状态直接交给你改
-    input(state); event = { type: 'patchFunction' }
-  } else {                                                 // 2b. 对象式：递归深合并
-    mergeReactiveObjects(state, input); event = { type: 'patchObject', payload: input }
+// 双形态补丁入口
+function $patch(arg: ((s: any) => void) | object) {
+  // 关掉两个监听开关：本批改动期间，被暂停的深度 watcher 即便被触发也被门控跳过
+  isListening = isSyncListening = false
+
+  let mutation: any
+  if (typeof arg === 'function') {
+    arg(state)                                    // 函数式：根状态交给回调命令式改写
+    mutation = { type: 'patch function' }
+  } else {
+    deepMerge(state, arg)                         // 对象式：递归深合并
+    mutation = { type: 'patch object', payload: arg }
   }
-  const myId = (activeListener = Symbol())                 // 3. 异步开关排进微任务恢复，且只留最近一次
-  queue.push(() => { if (activeListener === myId) isListening = true })
-  isSyncListening = true                                   //    同步开关立即恢复
-  triggerSubscriptions(event, state)                        // 4. 手动统一触发一次
-}
-```
 
-挂一个会数数的订阅者，然后跑两个对照场景：
+  // 异步开关排进微任务才恢复——把本 tick 排队的 watcher job 吞掉、避免与手动派发重复
+  const myId = (activeListener = Symbol())
+  queueMicrotask(() => {
+    if (activeListener === myId) isListening = true
+  })
+  // 同步开关立即恢复——后续同步监听不受影响
+  isSyncListening = true
 
-```ts
-let notify = 0
-addSub(() => notify++)
-```
-
-**场景一：不走 `$patch`，直接改两处。**
-
-```ts
-notify = 0
-state.count = 1            // watchFired：同步派发 1 次；异步入队
-state.profile.age = 2      // watchFired：同步派发 1 次；异步入队
-await flush()              // 异步 flush：再派发 2 次
-// notify = 4 —— 订阅者被叫了 4 次，正是开头痛点的最小复现
-```
-
-**场景二：走 `$patch`（函数式），同样改两处。**
-
-```ts
-notify = 0
-patch(s => { s.count++; s.profile.age++ })
-//   进入即 isListening = isSyncListening = false
-//   s.count++        → watchFired：同步判定 false → 吞；异步入队
-//   s.profile.age++  → watchFired：同步判定 false → 吞；异步入队
-//   手动 triggerSubscriptions(patchFunction) → notify = 1
-await flush()
-//   在途的异步派发：flush 时 isListening 仍为 false → 全吞
-//   本 patch 自己排的恢复回调：令牌命中 → isListening = true
-// 结果：notify = 1
-```
-
-同样的两处改动，订阅者只被叫了 **1 次**，而且拿到的是改完之后的完整状态。这就是 `$patch` 把一批改动收拢成一条订阅事件的全部魔法——暂停换来了原子批处理，代价是必须手动补那一次通知。
-
-对象式一样，只是改法换成递归合并：
-
-```ts
-notify = 0
-patch({ count: 5, profile: { age: 3 } })
-// mergeReactiveObjects：count 整值覆盖成 5；profile 两边都是普通对象 → 递归，age 改成 3，name 保留
-// 结果：notify = 1，state.profile = { name: 'a', age: 3 }
-```
-
-## 为什么是两个开关，恢复时机还不一样？
-
-这大概是 `$patch` 里最绕的一处，单独拎出来讲。
-
-订阅者注册监听时可以选两种触发时机：默认的「异步」（Vue 把通知排到微任务里再发）和「同步」（状态一改立刻发）。这两种监听各对应一个开关——`isListening` 管异步的，`isSyncListening` 管同步的。`$patch` 进门就把两个都关掉，所以不管订阅者选了哪种触发时机，补丁期间的改动都别想漏通知出去。
-
-但**两个开关的恢复时机故意不一样**，这是有原因的：
-
-- **同步开关立即恢复**。同步监听是「状态一改当场就触发」，它不排队——补丁里那几次改动，当场就已经触发过了（只是被门控吞掉）。既然没东西排在队列里，补丁一结束马上恢复它就是安全的，后续同步改动能被正常抓到。
-- **异步开关要拖到下一个微任务才恢复**。异步监听是「把通知排进队列、等 flush 再发」。补丁里那几次改动排进去的异步通知，此刻还排在队列里没 flush。要是立刻恢复异步开关，等 flush 一跑、这些通知就会真的发出去——和手动那一次重复。所以故意让它晚一个 tick 恢复，让那批在途通知 flush 时撞上「开关还是关的」被吞掉，恢复留到它们之后。
-
-**代价**：两个开关恢复时机不对称，第一眼很难看懂为什么。Pinia 用一句注释点破了用意——「我们主动暂停了 watcher，所以必须手动补一次通知」，而那个不对称的恢复时机，就是为了保证手动这一次和 watcher 那一次不撞车。
-
-**还有一个边角要处理**：连续多次 `$patch`。每次 patch 都会排一个「恢复异步开关」的微任务，要是每次都生效，前几次 patch 的恢复可能会在更后面的 patch 改动还没 flush 完时，就提前把监听打开。所以用一个模块级的 `activeListener`（一个 Symbol）当令牌：每次 patch 把自己的令牌写进去，恢复回调执行时先核对「我还是不是最近这一次 patch」——只有最近一次的恢复才真正把开关打开，中间那些自动作废。下面这段 trace 就是干这个的：
-
-```ts
-notify = 0
-patch(s => { s.count++ })   // 令牌 id1，排恢复回调 1
-patch(s => { s.count++ })   // 令牌 id2，覆盖 activeListener，排恢复回调 2
-// 两次手动派发 → notify = 2（两次补丁，理应两次通知）
-await flush()
-// 恢复回调 1：activeListener === id1？不（已是 id2）→ 作废
-// 恢复回调 2：activeListener === id2？是 → isListening = true
-// 在途的异步派发全被吞，没有一次重复通知
-```
-
-## 重置和整体赋值，其实也走 `$patch`
-
-`$patch` 这套「暂停 → 批 → 单次通知」太好用了，所以 Pinia 把另两个写状态的操作也路由回了它，复用同一套语义：
-
-```ts
-// $reset（仅 option store 有）：重建初始 state，再整体合进去
-const $reset = function () {
-  const newState = state ? state() : {}
-  this.$patch($state => { Object.assign($state, newState) })   // 用 patch 把所有改动收成一条订阅
+  // 既然 watcher 被暂停了，入口必须自己派发一次订阅
+  // 这一步漏掉 → 订阅者彻底错过本次补丁
+  subscriptions.forEach(fn => fn(mutation, state))
 }
 
-// $state 的 setter：整体赋值也走 patch
-Object.defineProperty(store, '$state', {
-  set: newState => store.$patch($state => { Object.assign($state, newState) }),
-})
+function $subscribe(fn: Listener) {
+  subscriptions.add(fn)
+  return () => subscriptions.delete(fn)
+}
+
+// === 跑一遍 ===
+$subscribe((m, s) => console.log(`[订阅] ${m.type} →`, JSON.stringify(s)))
+
+$patch(s => { s.count++; s.list.push(1) })
+// 输出：[订阅] patch function → {"count":1,"list":[1]}
+
+$patch({ count: 5 })
+// 输出：[订阅] patch object → {"count":5,"list":[1]}
 ```
 
-**换来的是**：所有改状态的路都共享同一套批处理，不用为重置/替换另写一套通知逻辑。**代价**是一个容易踩的坑——`$state = newObj` 用的是 `Object.assign`（浅合并），它**只覆盖、不删除**：
+第一个补丁里改了两个字段（`count` 与 `list`），订阅者只收到一条通知——这就是"批处理"的落地证据。
 
-```ts
-// 假设当前 state = { a: 0, b: 2 }
-store.$state = { a: 1 }
-// 你以为是替换，实际是合并 → 结果 { a: 1, b: 2 }，b 没被删掉
-```
+## 6. 执行轨迹
 
-所以 `$state = newObj` 在语义上不是「替换」，是「把 newObj 浅合并进现有状态」。这是「路由回 patch」这个选择必然带上的副作用。
+拿 `store.$patch(s => { s.count++; s.list.push(1) })` 走一遍，state 初始是 `{ count: 0, list: [] }`：
 
-（顺带一提：`$reset` 只有 option store 有，setup store 在 dev 下直接抛错、prod 下是空操作。原因是 option store 的 state 形状已知、能重建；setup store 的 state 是命令式创建的，框架不知道该怎么重建——这条统一装配路径的代价，会在讲 Options Store 的那一章展开。）
+1. 进入 `$patch`。第一行：`isListening = isSyncListening = false`。两个开关同时置关。
+2. 参数是函数，走函数式分叉：把根状态对象交给回调。回调里 `s.count++`（0 → 1）、`s.list.push(1)`（list 从 `[]` 变成 `[1]`）。这两次改动都被 Vue 的响应式系统捕获、watcher job 排进异步 flush 队列——但 job 真跑时撞上 `isListening=false` 被吞。
+3. 打包事件：`{ type: 'patch function', storeId, events: [] }`。
+4. `const myId = (activeListener = Symbol())`——给本次补丁起一个唯一编号。
+5. 把"恢复异步开关"排进 `nextTick` 微任务。这个回调里会检查 `activeListener === myId`：只有我是最近一次补丁才恢复。
+6. `isSyncListening = true`——同步开关立即恢复。
+7. `triggerSubscriptions(subscriptions, mutation, state)`——遍历订阅者集合，把事件 + 最新状态（`{ count: 1, list: [1] }`）一次性派发。订阅者收到 1 条通知。
+8. 微任务时刻：检查通过，`isListening = true`。下一次直接改 `store.x = ...` 又能被深度 watcher 正常捕获。
 
-## 小结
+订阅者从开始到结束只收到 1 条通知，尽管状态实际上变了两次。
 
-`$patch` 的本质就一句话：**改之前按住监听，改完手动补一次通知**。函数式和对象式两条入口、两个监听开关、不对称的恢复时机、连续补丁的去重令牌、重置与整体赋值路由回来——这些都是为了把「一批改动」干净地等价为「一条订阅事件」，同时避免 watcher 自动通知和手动通知撞车。
+## 7. 教学简化说明
 
-但它只动用了监听开关「被暂停」这一面。那两个开关平时怎么挂到 watcher 上、`$subscribe` 和 `$onAction` 又怎么靠它们跟 `$patch` 配合，做到「直接改 state」和「走 patch」都能被订阅正确抓到、而且只通知一次——这是下一章「订阅系统」要专门拆开讲的事。
+本章演示故意省略了一些旁支：Map/Set 的特判合并、devtools 的 `debuggerEvents` 收集、真实 Vue 调度器的异步 flush 细节、`$reset` 与 `$state` setter 转调 `$patch` 的具体路由、`isPlainObject` 的边界判定。省掉这些是为了让"暂停 → 改 → 手动派发 → 不对称恢复"这条主线尽量瘦。
+
+## 8. 小结
+
+补丁入口把"改状态"和"通知订阅者"在时间上拆开——独占一段窗口改个够、然后由入口自己统一喊一次。代价是入口必须接管通知职责、两个开关恢复不对称、对象式合并要做大量边界处理、`$state = newObj` 实际是浅合并而非替换。
+
+下一章会展开两个监听开关的另一面：它们平时怎么与深度 watcher 协作捕获"直接改 state"的场景、补丁路径和直接改路径如何在同一对开关上既不漏通知也不重复通知。

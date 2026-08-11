@@ -1,219 +1,208 @@
-# Vue Macros 的宏变换流水线：一个特性 = 一个函数 + 链上一个位置
+# Vue Macros 的宏变换流水线
 
-> 本章属于 composite 层。前置：『靠 AST 而非正则识别宏调用节点』『magic-string：sourcemap 友好的源码就地变换』。
-> 学完你能：用一句话讲清"为什么 Vue Macros 要把每个宏做成独立 transform、再用固定顺序的链串起来"，以及这套设计换来什么、付出什么。
+> 本章属于 composite 层。前置：靠 AST 而非正则识别宏调用节点、magic-string：sourcemap 友好的源码就地变换。
+> 学完你能用一句话讲清：为什么 Vue Macros 把"一个编译期特性"抽象成"一个独立 transform 函数 + 一条固定顺序的插件链"，以及换来了什么、代价是什么。
 
-## 1. 为什么需要它
+## 1. 为什么需要它（设计动机）
 
-上一章把"怎么在一份源码上做 offset 级就地改写、还能还原 sourcemap"这件事办成了：magic-string 给了我们一把不会弄丢原始坐标的手术刀。但它留下一个口子——一把手术刀只解决"改一处"，没解决"改很多处"。一个真实的宏集合动辄十几个宏，每个都想动 `<script setup>` 里的代码。如果没有一条统一的变换流水线，每个宏都要自己从头写"解析 SFC → 找调用 → 改代码 → 生成 sourcemap → 挂到 Vite/webpack/esbuild"，十几个宏就是十套重复脚手架。
+上一章讲了 magic-string：用 offset 级操作保住 sourcemap，让宏改写后的产物能精确回溯到用户源码。这一手解决了一个宏改一段代码的问题，但留下了更大的口子——一个 `.vue` 里要塞十几个宏、好几个还想改同一个 `defineProps()`，谁先改？谁后改？怎么不踩脚？
 
-更麻烦的是它们还会互相踩脚。设想你同时启用一个单事件宏 `defineEmit` 和一个批量宏 `defineModels`，好几个宏都要碰 `defineProps` 相关的调用：谁先改、谁后改？前一个改完之后，后一个看到的还是它认识的写法吗？
+第 4 章已经讲透怎么靠 AST 精确命中宏调用节点，第 5 章已经讲透怎么用 magic-string 在原 offset 上登记变换。把这两件事各自单独看都没问题，但堆到十几个宏身上，立刻撞上工程化的矛盾：
 
-矛盾很清楚：宏要被规模化地、互相不冲突地、跨构建工具地生产，但每个宏单独看又只是"一段 AST 改写逻辑"。这条流水线就是为了把这个矛盾接住而生的。
+- 写到第十个宏，每个宏都得自己从头写一遍"读文件 → 解析 SFC → 拿 `<script setup>` AST → 改写 → 生成 sourcemap → 挂到 Vite/webpack/esbuild"这一整套脚手架。同一份 SFC 被解析了十遍。
+- `defineProps` 这个调用可能同时被好几个宏盯上：`chainCall` 要把它的链式调用拆开、`defineModels` 要往里塞一个 model prop、`betterDefine` 要把 TypeScript 类型注解展开成运行时 props。谁先动？动完之后另一个看到的还是不是原来那棵 AST？
+- 同一个团队、不同的人在不同时间写出来的宏，怎么保证它们能拼到同一条构建管线里、还互不冲突？
+
+如果没有一条统一的变换流水线，写十几个宏就是十套重复脚手架、十种各异的接入方式、十次踩同一个坑。**宏要被规模化地、互相不冲突地、跨构建工具地生产**，这个矛盾就是这条流水线要解决的。它换来的是：写一个新宏 = 写一个独立的 transform 函数 + 在链上插一个位置，零脚手架、可独立开关、可单独发布为 npm 包、可跨 Vite/webpack/esbuild 分发。
 
 ## 2. 核心思想
 
-把"一个编译期特性"抽象成"一个独立的 transform 函数加上一个特性开关"，再用一条固定顺序的插件链把它们串起来：加一个宏 = 写一个函数 + 在链上插一个位置。
+**把"一个编译期特性"抽象成"一个独立 transform 函数 + 一个特性开关"，再用一条固定顺序的插件链把它们串起来——加一个宏 = 写一个函数 + 在链上插一个位置。**
+
+如果说前两章讲的是流水线上的**单兵动作**（怎么精确瞄准一个节点、怎么在源码上留下 sourcemap 友好的印记），那本章讲的是**编队**——怎么让一群单兵动作排成一条不会互相撞飞的链。每个动作都是独立的、可插拔的；链本身的顺序就是宏之间依赖关系的表达，不需要任何额外的依赖声明语言。
 
 ## 3. 心智模型
 
-先看一个特性长什么样。每个特性的标准形态是一个函数：
-
-```ts
-type FeatureTransform = (code: string, id: string) => { code: string; map: any } | undefined
-```
-
-返回 `{ code, map }` 表示"我要改这份代码，这是改完的结果"；返回 `undefined` 表示"我对这份代码不感兴趣，原样放行"。`undefined` 不是凑数的，它是后面整条链能顺畅接力的前提。
-
-一次构建工具 transform 钩子触发时，链是这样跑的：
+一个特性从被构建工具请求到交还改写后代码，走七步：
 
 ```
 请求文件 id
-  → 文件过滤：非 .vue / 非目标文件直接放行
-  → 进入【固定顺序的插件链】，对链中每个特性按顺序执行：
-       ① 短路：源码里不含本宏名？立即 return undefined，连 AST 都不解析
-       ② 解析：拆出 <script setup>，惰性产出它的 AST
-       ③ 命中：遍历 AST，按"节点类型 + 调用名"找到本宏的调用节点
-       ④ 就地改写：在一个 offset 记录器上登记 overwrite / appendLeft（不动原文）
-       ⑤ 收尾：一次性产出 { code, map } 交还构建工具
-       下一特性拿到上一步的 code，重复 ①~⑤
-  → 链尾 → 交给 Vue 官方编译器
+ → ① 过滤   文件名不在 include 规则里？直接放行，不进链
+ → ② 短路   源码字符串里不含本宏名？立刻 return，根本不解析
+ → ③ 解析   惰性产出 <script setup> 的 AST（结果缓存，后续宏复用）
+ → ④ 命中   walkAST，按"节点类型 + 调用名"精确匹配宏调用节点
+ → ⑤ 注入   在一份 offset 记录器上登记 overwrite / appendLeft
+ → ⑥ 收尾   一次性产出 { code, map }，交还构建工具
+ → ⑦ 接力   下一个特性拿这份 code 当原始输入，重复 ②~⑥
+链尾 → 交给 Vue 官方编译器（此时它看到的已全是它认识的原语）
 ```
 
-有三个不变量要钉死，后面讲权衡全靠它们：
+四个要钉死的不变量：
 
-- **独立遍历**：每个特性在自己的一次 `walkAST` 里遍历，不存在"把多个 visitor 合并到一次遍历"的设施。
-- **串行接力**：链上每个特性的输入，是上一个特性 `toString()` 出来的字符串。也就是说，宏 B 拿到的是宏 A 已经改过的字符串，不是最初的源码。
-- **offset 每步重算**：正因为接力的是字符串，每个特性都要对"自己拿到的那段代码"重新解析、重新建立 offset。前一步 appendLeft 进去的一行 helper，会让后面所有位置整体后移，但下一个特性完全无感，它只认自己重新解析出来的坐标。
-
-所以这不是一条"一次解析、多人共享"的流水线，而是一条"逐段改写、逐段重解析"的接力链。这一点很关键，下面权衡一的性能账全建立在它之上。
+- **每个特性是一个 `(code, id) => { code, map } | undefined` 函数**。返回 `undefined` 表示"我对这文件没兴趣"——这是 ② 的语言层落地。
+- **链上每个特性都 `new MagicStringAST(code)` 新建自己的变换实例**，不共享。前一个的 `toString()` 输出就是后一个的原始 code，offset 在每步重新计算。
+- **顺序就是依赖**。链是一个数组，构建工具按下标依次调用。"先把各种 `defineProps` 写法统一、再做类型展开"——这种先后关系不需要额外的依赖声明机制，写在数组里靠位置表达就够了。
+- **所有特性 `enforce: 'pre'`**——它们都在 Vue 官方编译器之前运行，这是流水线能成立的前提（详见 §4 第三条）。
 
 ## 4. 关键权衡
 
-### 权衡一：把每个特性拆成独立可装配单元
+### 把每个特性做成独立单元，换来可装配，代价是同一份源码被解析 N 次
 
-面对"十几个宏"，最省事的本能是写一个大 transform，按宏名 if-else 在一次遍历里处理所有宏。Vue Macros 偏不这么干。它选择把每个特性都做成一个独立的、可单独发布的 transform 函数，各自遍历、各自改写。
+每个特性都是一个独立的 unplugin 实例、可以单独发布为一个 npm 包、可以单独被某个项目关闭（开关为假就在装配时被 `filter(Boolean)` 剔除）。这件事的诱惑很大：宏的开发者只为自己的宏负责、用的人按需挑选、社区可以单独贡献一个宏而不必改动核心仓库。换来的是新宏零脚手架——把一个 transform 函数包成 `{ name, enforce: 'pre', transformInclude, transform }` 就完事，跨 Vite/webpack/esbuild 都能跑。
 
-换来的是四样东西：特性可以**独立开关**（开关关掉就整条从链上拿掉）、可以**单独发成独立 npm 包**（`@vue-macros/define-emit` 和 `@vue-macros/chain-call` 是分开的包）、可以**跨 Vite/webpack/esbuild 分发**、新宏几乎**零脚手架**（写一个函数 + 在链上插一个位置就完事）。
+代价也直白：N 个启用的特性就要解析 + 遍历同一份 SFC N 次。补救措施就两条——② 在解析前先做一次 `code.includes(宏名)` 的廉价字符串检查，绝大多数不含本宏的 `.vue` 第一行就退出了；③ AST 解析带 `cache: true`，重复解析同一份代码命中缓存。短路挡掉了无关节点、缓存挡掉了重复解析，剩下的实际开销是"每个启用的特性都得 walkAST 一次"——这是这条流水线选独立装配要承受的代价。
 
-代价是性能上的重复。接力链上每多一个启用的特性，就多一次"解析 + 遍历"。而且要强调一点：**每次解析的是一段不同的改写后代码**——宏 B 解析的是宏 A 改过的字符串，不是同一份源码被解析 N 遍。这条开销没法靠"共享一次解析"来消掉，因为本来就没有一次共享的解析可共享。
+**本质矛盾**：特性独立自治（好装配、好开关、好发布）与共享遍历上下文（一次 walk 多 visitor）天然对立。选了前者就得接受 N 次遍历，靠短路和缓存补救。
 
-| 选择 | 换来 | 代价 |
-|---|---|---|
-| 每个特性独立 transform、各自遍历 | 独立开关 / 单独发布 / 跨工具 / 零脚手架 | 接力链累计解析 N 次，每次解析的还是各不相同的改写后代码 |
+> 注：大纲里"统一 walk 调度"这个说法容易让人误以为有个设施把多个 visitor 合并到一次遍历。源码里的实际做法是"固定顺序 plugins 数组 + 串行 transform 传递"——每个特性在**自己的** walkAST 里独立遍历，**不存在**多 visitor 合并设施。
 
-这条流水线用了两样东西来压低这个代价，但它们各管各的事，别混为一谈：
+### 用一条固定顺序的链解决"多个宏想改同一节点"的冲突
 
-- **短路（主力）**：每个特性函数第一行几乎都是 `if (!code.includes(宏名)) return`。源码里压根没出现这个宏的名字，就根本不解析。一个文件通常只用到少数几个宏，所以"实际真正去解析 AST 的特性数"远小于"启用的特性总数"。短路压低的是**参与解析的宏数**。
-- **解析缓存（辅助，且作用域有限）**：底层 `babelParse` 带了缓存。但这个缓存只在**同一份代码字符串被重复请求解析**时才命中，比如 HMR / watch 里一个没改动的文件再次进入流水线，或者同一个特性内部多次取 setup / script 的 AST。它**不能**把接力链里 N 段互不相同的代码合并成一次解析，因为那些字符串本来就不一样，缓存键对不上，互不命中。
+想象一个反例：如果每个特性都并行触发、各改各的、最后再叠加，那 `chainCall` 改完的 `defineProps()` 节点，`defineModels` 还能认得出来吗？它的 offset 还对得上吗？这种"并发改写"几乎没有干净的解法。
 
-> 本质矛盾：这是『模块化、可独立装配』和『单次遍历的极致性能』在打架。流水线选了前者，再用短路把"实际参与解析的宏数"压下去、用缓存兜住"同一份代码被重复请求"的边角，把性能代价控在一个能接受的水位。
+Vue Macros 选了最朴素的路线——**串行**。链是一个数组，构建工具按下标依次调用，前一个的输出就是后一个的输入。每个特性在自己重新解析出的 AST 上工作，看到的永远是上一步改完之后的那份代码。冲突问题被消解为顺序问题：把"统一 `defineProps` 写法"的宏排在前面、"做类型展开"的宏排在后面——`betterDefine` 看到的就一定是已经统一好写法的 `defineProps()`，不用自己兜底各种语法变体。
 
-### 权衡二：用一条固定顺序的链解决冲突
+顺序本身还能表达依赖，不需要任何额外的依赖声明语言。
 
-多个宏可能都想改写同一个节点（比如好几个宏都要碰 `defineProps` 相关的调用）。怎么解决冲突？一个重型方案是引入依赖图、拓扑排序、甚至冲突检测器。Vue Macros 选了最朴素的一种：**一条固定顺序的插件链，串行传递代码**。链的顺序硬编码在聚合包的 `plugins` 数组里，还带着语义分组注释（`// props`、`// emits`、`// convert to runtime props & emits`），构建工具老老实实按数组顺序一个一个调，前一个的输出就是后一个的输入。
+代价是：顺序被硬编码在聚合包的 plugins 数组里（带 `// props` / `// emits` / `// convert to runtime props & emits` 这种语义分组注释）。新增特性必须人工找准插入位置——它该排在哪个分组后面、该让谁先走，都得作者想清楚。而且每个特性各自遍历，无法在一次 walk 里共享 visitor 上下文。
 
-换来的是简单和确定。顺序本身就表达了宏之间的依赖：先把 `defineProps` 的各种写法统一成标准形态，再做依赖标准形态的类型展开。谁先谁后，看链上的位置就知道，不用跑什么分析。
+**本质矛盾**：宏改写之间天然有先后依赖（A 改完 B 才能基于结果继续），并发不安全。串行接力牺牲了"无依赖宏之间本可并发"的优化空间，换来"顺序即依赖"的最简表达——不需要任何依赖图、拓扑排序、调度器。
 
-代价有两个。第一，顺序是手工维护的：新增一个特性，得人工找准它该插在链的哪个位置，插错了就出错。第二，正因为每个特性各自遍历，**无法在一次遍历里共享上下文**——A 在遍历时算出来的中间信息，B 拿不到，B 只能从 A 改完的字符串里重新推断一切。
+### 把所有宏放在官方编译器之前运行，换来与 Vue 版本解耦，代价是语义被锁死在"能否用官方原语还原"
 
-> 本质矛盾：这是『多个宏改写同一节点的冲突』和『不想引入复杂调度器』在打架。流水线用"确定的串行顺序"这个最朴素的调度来化解，省下一整套依赖图的复杂度，代价是顺序全靠人维护、特性间无法共享遍历上下文。
+这条流水线最关键的一个约束是：**所有自定义宏插件都标记 `enforce: 'pre'`，在 Vue 官方编译器之前运行**。这不是偶然，而是设计前提。
 
-（少数特性会返回一前一后两个插件，分别插在链的不同位置。所以"一个特性 = 一个插件"是个简化模型，真实的颗粒度允许"一个特性拆成多个阶段"。但这不改变"串行接力"的本质。）
+`defineEmit('open')` 最终被改写成两段：一行 `const __MACROS_emit = defineEmits(['open'])` 插在块首，原来的调用位置变成 `(...args) => __MACROS_emit('open', ...args)`。链式 `defineProps().withDefaults({...})` 被改写成 `withDefaults(defineProps(), {...})`。看出来了吗？不管自定义宏多花哨，最终落到代码里的全是 `defineProps` / `defineEmits` / `withDefaults` 这些**官方原语**。
 
-### 权衡三：所有宏在官方编译器之前，把自己降级成官方原语
+换来的是与官方编译器的彻底解耦——Vue Macros 根本不关心 Vue 是 3.2 还是 3.4、官方编译器内部怎么改，它只负责把自己识别的宏翻译成官方编译器认识的入口，剩下的事全交给官方。升级 Vue 版本时，只要官方原语的语义没变，宏这边一行都不用动。
 
-Vue Macros 的所有宏插件都带 `enforce: 'pre'`，强制跑在 Vue 官方编译器**之前**。它们不是去教官方编译器认识新语法，而是趁官方编译器还没上场，先把自定义宏"自降级"成官方本来就认识的原语：单个 `defineEmit('open')` 被改写成调用官方 `defineEmits(['open'])` 的局部变量；链式 `defineProps().withDefaults({...})` 被改写成官方的 `withDefaults(defineProps(), {...})`。
+代价是宏能引入的全新语义有限。它能"补全官方宏缺失的能力"（如单个事件的 `defineEmit`）、能"把运行期约定编译期化"（如响应式 Props 解构），但很难引入一种官方原语根本表达不了的全新运行时行为。宏的语义被锁死在"能否用 `defineProps`/`defineEmits`/`withDefaults` 等少数原语还原"这条边界上。第 7 章会专门归纳这种约束催生的几类设计原型。
 
-换来的是与官方编译器的彻底解耦。官方编译器上场时，看到的全是它认识的 `defineEmits` / `withDefaults` / `defineProps`，根本不知道刚才有一堆自定义宏来过。这意味着 Vue Macros 几乎与 Vue 版本无关，官方编译器怎么演进，只要那几个原语还在，这套宏就继续工作。
-
-代价是宏的语义被锁死在一条边界上：**它最终能不能还原成少数几个官方原语**。能引入的全新语义是有限的，你没法靠这套机制做出一个官方原语完全表达不了的运行时行为。
-
-> 本质矛盾：这是『想任意扩展宏的语义』和『不想 fork 官方编译器』在打架。流水线用"把自己降级成官方原语"来搭桥，换来不侵入官方编译器，代价是扩展能力被官方原语集合圈死。
+**本质矛盾**：宏想引入的语义新颖度 与 能否用官方原语还原 两头只能取一头。Vue Macros 选了对齐——可以激进改写语法糖，但糖的最底层必须是官方能吃下去的东西，否则插件写得再花哨官方编译器也不认。
 
 ## 5. 最小原理演示
 
-下面用约 50 行 JS 演透四个原理点：**短路、独立遍历、顺序接力、统一收尾**。两个特性都是 `(code) => { code, map } | undefined` 的形态，再用一个 `pipeline` 按数组顺序把它们串起来。为了不引重依赖，手写一个迷你 `MagicString`（只记 offset、最终 `toString` 输出）和一个迷你 `walkAST`。
+下面用大约 40 行 JS 把这条流水线的骨架演一遍。不引入 Vue、不引入 unplugin、不引入真实的 SFC 解析——这些都不是这条流水线的原理。原理只有四件事：**短路、独立遍历、顺序接力、统一收尾**。每一行都对应上面某个原理点。
 
 ```js
-// —— 原理点④的形：offset 级就地变换（第 5 章已讲透，这里只复用其形）——
+// offset 级就地变换的迷你实现：只记录操作，不改原文（原理点⑤）
 class MagicString {
   constructor(src) { this.src = src; this.ops = []; }
-  overwrite(start, end, str) { this.ops.push({ k: 'ow', start, end, str }); return this; }
-  appendLeft(at, str)        { this.ops.push({ k: 'al', at, str }); return this; }
+  overwrite(start, end, str) { this.ops.push([start, end, str]); return this; }
   toString() {
-    // 从后往前应用，避免改写影响前面的 offset
-    const sorted = [...this.ops].sort((a, b) => (b.start ?? b.at) - (a.start ?? a.at));
-    let out = this.src;
-    for (const op of sorted) {
-      if (op.k === 'ow') out = out.slice(0, op.start) + op.str + out.slice(op.end);
-      else               out = out.slice(0, op.at) + op.str + out.slice(op.at);
+    const sorted = [...this.ops].sort((a, b) => a[0] - b[0]);
+    let out = '', cursor = 0;
+    for (const [start, end, str] of sorted) {
+      out += this.src.slice(cursor, start) + str;
+      cursor = end;
     }
-    return out;
+    return out + this.src.slice(cursor);
   }
 }
 
-// —— 原理点③的形：命中（第 4 章已讲透，这里只复用其形）——
-const isCallOf = (n, name) => n && n.type === 'Call' && n.callee === name;
-function walkAST(node, visitors) {
-  if (!node || typeof node !== 'object') return;
-  if (node.type && visitors.enter) visitors.enter(node);
-  for (const k in node) {
-    const v = node[k];
-    if (Array.isArray(v)) v.forEach(c => walkAST(c, visitors));
-    else if (v && typeof v === 'object') walkAST(v, visitors);
+// 命中：在原文里找出 name(...) 调用的字节区间（演示用字符串模拟，
+// 真实流水线里走 AST + isCallOf——这是前置章已讲透的部分，这里只演"命中"这件事）
+function findCalls(code, name) {
+  const calls = [];
+  const needle = name + '(';
+  let i = 0;
+  while ((i = code.indexOf(needle, i)) !== -1) {
+    let depth = 1, j = i + needle.length;
+    while (depth > 0) { const c = code[j++]; if (c === '(') depth++; else if (c === ')') depth--; }
+    calls.push({ start: i, end: j, arg: code.slice(i + needle.length, j - 1) });
+    i = j;
   }
-}
-// 极简 parse：扫描出 name(args) 调用并标 offset（真实流水线用 babel，这里只为演示）
-function parse(code) {
-  const body = [];
-  for (let i = 0; i < code.length; i++) {
-    if (!/[a-zA-Z_$]/.test(code[i])) continue;
-    let j = i; while (j < code.length && /[\w$]/.test(code[j])) j++;
-    const name = code.slice(i, j);
-    let k = j; while (k < code.length && code[k] === ' ') k++;
-    if (code[k] !== '(') { i = j - 1; continue; }
-    let depth = 1, end = k + 1;
-    while (end < code.length && depth) { if (code[end] === '(') depth++; else if (code[end] === ')') depth--; end++; }
-    body.push({ type: 'Call', callee: name, start: i, end });
-    i = j - 1; // 只跳过名字，继续往里扫，让嵌套调用也被识别
-  }
-  return { type: 'Program', body };
+  return calls;
 }
 
-// —— 原理点①：每个特性是一个独立 transform 函数 ——
-// 特性 A：把 foo(x) 包成 bar(foo(x))，并在块首插一行 helper（演示 overwrite + appendLeft）
-function chainWrap(code) {
-  if (!code.includes('foo(')) return;              // 原理点②：短路
+// 特性 A：把 foo(...) 改写成 bar(...)（原理点①：每个特性是独立 transform 函数）
+function wrapFoo(code) {
+  if (!code.includes('foo(')) return;                  // 原理点②：短路
   const s = new MagicString(code);
-  walkAST(parse(code), { enter(n) {
-    if (isCallOf(n, 'foo')) {
-      s.overwrite(n.start, n.end, `bar(${code.slice(n.start, n.end)})`);
-      s.appendLeft(0, 'const bar = makeBar()\n');  // 插 helper：下一步拿到的字符串整体后移
-    }
-  } });
-  return { code: s.toString(), map: '<sourcemap>' }; // 原理点⑤：统一收尾
+  for (const c of findCalls(code, 'foo')) s.overwrite(c.start, c.end, `bar(${c.arg})`);
+  return s.toString();                                  // 原理点⑥：统一收尾
 }
-// 特性 B：把 double(x) 内联成 (x)*2
-function doubleInline(code) {
-  if (!code.includes('double(')) return;           // 短路
+
+// 特性 B：把 double(...) 改写成 (...)*2
+function inlineDouble(code) {
+  if (!code.includes('double(')) return;
   const s = new MagicString(code);
-  walkAST(parse(code), { enter(n) {
-    if (isCallOf(n, 'double')) {
-      const inner = code.slice(n.start + n.callee.length + 1, n.end - 1); // 剥掉 double( 和 )
-      s.overwrite(n.start, n.end, `(${inner})*2`);
-    }
-  } });
-  return { code: s.toString(), map: '<sourcemap>' };
+  for (const c of findCalls(code, 'double')) s.overwrite(c.start, c.end, `(${c.arg})*2`);
+  return s.toString();
 }
 
-// —— 原理③：固定顺序的插件链，串行接力（前者输出 = 后者输入）——
-const pipeline = (features) => (code, id) =>
-  features.reduce((c, f) => f(c, id)?.code ?? c, code);
+// 流水线：固定顺序的插件链，串行接力（原理点③与⑦）
+const pipeline = (features) => (code) =>
+  features.reduce((c, f) => f(c) ?? c, code);          // ?? ：本特性返回 undefined 就原样透传
 
-const transform = pipeline([chainWrap, doubleInline]); // 顺序即依赖
+const transform = pipeline([wrapFoo, inlineDouble]);   // 顺序即依赖
+console.log(transform('foo(1)\ndouble(2)\nfoo(double(3))'));
+// 输出：
+// bar(1)
+// (2)*2
+// bar((3)*2)
 ```
 
-注意 `pipeline` 里这一行 `features.reduce((c, f) => f(c, id)?.code ?? c, code)`：特性返回 `undefined` 时，链上原样传上一份代码；返回 `{ code }` 时，把改完的代码喂给下一个。"接力"的全部秘密就在这里，薄到只有一行 reduce。
+拿最后一行 `foo(double(3))` 走一遍：先轮到 `wrapFoo`，命中外层 `foo`、把整个表达式换成 `bar(double(3))`；再轮到 `inlineDouble`，它**重新扫**这份新代码、命中 `double(3)`、换成 `(3)*2`，最终得 `bar((3)*2)`。两个特性各自扫描、各自改写、靠 `reduce` 一环扣一环——这就是流水线最朴素的形态。
+
+注意 `pipeline` 那行 `f(c) ?? c`：本特性返回 `undefined`（短路退出）时，原样透传给下一个。短短一行就是"独立遍历 + 顺序接力"的全部实现。
 
 ## 6. 执行轨迹
 
-拿一个同时命中两个特性的输入走一遍：`double(foo(3))`。
+把演示换成真实的宏场景走一遍。
 
-**特性 A `chainWrap` 先跑**：
+**输入**：一段 `<script setup>` 源码：
 
-- 短路检查：`code.includes('foo(')` 命中，继续。
-- 解析 `double(foo(3))`，遍历找到 `foo(3)` 节点，offset 是 `7..13`。
-- 就地改写：`overwrite(7, 13, 'bar(foo(3))')`；再 `appendLeft(0, 'const bar = makeBar()\n')`。
-- 收尾 `toString()`，从后往前应用：先在 `7..13` 套上 `bar(...)`，再在开头插 helper。输出：
-
-```
-const bar = makeBar()
-double(bar(foo(3)))
+```js
+const open = defineEmit('open')
+const props = defineProps().withDefaults({ count: 0 })
 ```
 
-**特性 B `doubleInline` 接力**——注意它拿到的是 A 改过的字符串，不是原始输入：
+**链**：`[defineEmit, chainCall]`（顺序：先单个事件展开、再链式调用拆开）。
 
-- 短路检查：这段新代码里 `includes('double(')` 命中，继续。
-- **重新解析**这段新代码。因为 A 在开头插了一行 helper，`double(...)` 的 offset 已经整体后移，但 B 完全无感，它只认自己刚解析出来的坐标。
-- 遍历找到 `double(...)` 节点，就地改写成 `(bar(foo(3)))*2`。
-- 收尾输出：
+**第 1 步：`defineEmit` 拿到原始 code**
 
+- `code.includes('defineEmit(')` 命中，不短路。
+- `parseSFC` 解析、`getSetupAst()` 产出 AST（命中缓存）。
+- `walkAST` 找到 `defineEmit('open')` 节点（offset 假设为 14..36）。
+- `s.overwrite(14, 36, '(...args) => __MACROS_emit("open", ...args)')`。
+- `s.appendLeft(0, 'const __MACROS_emit = defineEmits(["open"])\n')`。
+- 返回 `{ code, map }`。
+
+**第 1 步产出 code**：
+
+```js
+const __MACROS_emit = defineEmits(["open"])
+const open = (...args) => __MACROS_emit("open", ...args)
+const props = defineProps().withDefaults({ count: 0 })
 ```
-const bar = makeBar()
-(bar(foo(3)))*2
+
+**第 2 步：`chainCall` 拿到上一步的 code 当原始输入**
+
+- `code.includes('withDefaults(')` 命中。
+- 重新 `new MagicStringAST(code)`、重新 `parseSFC`（缓存命中，开销可控）。
+- `walkAST` 这次盯的是 `defineProps().withDefaults(...)` 这种链式调用节点。
+- `s.overwriteNode(node, 'withDefaults(defineProps(), { count: 0 })')`。
+- 返回新的 `{ code, map }`。
+
+**第 2 步产出 code**：
+
+```js
+const __MACROS_emit = defineEmits(["open"])
+const open = (...args) => __MACROS_emit("open", ...args)
+const props = withDefaults(defineProps(), { count: 0 })
 ```
 
-两个关键中间态值得盯一眼。第一，B 之所以还能命中 `double(...)`，是因为 A 的改写只动了内层的 `foo`，外层的 `double(...)` 调用结构原封不动传了下来——这就是"顺序接力"能协作的基础：前一个宏别把后一个宏还要用的调用结构破坏掉。第二，每一步产出的都是"对那一步原始 offset 的增量记录"，下一步拿到的是字符串、重新建 offset，接力链没有任何跨步的共享状态。
+**链尾**：交给 Vue 官方编译器。它看到的只剩下 `defineEmits` / `defineProps` / `withDefaults`——全是它认识的原语。它按官方逻辑继续编译，根本不知道上面有两个插件替它做了归一。
 
-放到真实的 Vue Macros 里，这条链的终点是 Vue 官方编译器。链尾代码交到它手上时，自定义宏已经全部降级成了它认识的 `defineEmits` / `withDefaults` / `defineProps`，它压根不知道这层流水线存在过。
+每一步的关键中间态值得留意：每个特性产出的都是"对**自己**那份原始 code 的 offset 增量记录"。串行接力时，下一步拿到的字符串已经是上一步 `toString()` 的结果，offset 在每步重新计算——这就是为什么每个特性必须 `new` 自己的 `MagicStringAST`，不能跨特性共用。
 
 ## 7. 教学简化说明
 
-本章演示故意省略了：真实的 SFC 分块解析（演示直接吃整段代码）、跨构建工具的 unplugin 适配、IDE / Volar 的类型侧、特性开关的配置 schema、解析缓存的真实实现，以及少数特性拆成"前置 + 后置"两阶段插件的具体细节。这些在第 8 章及之后会展开。
+上面的演示故意省略了不少工程细节：真实的 SFC 分块解析（`<script setup>` vs `<script>` vs `<template>` 各自怎么拆）、跨构建工具的 include 规则差异（webpack/rspack 与 Vite/Rollup 用不同正则）、helper import 的去重（用 `WeakMap<MagicString, Set<string>>` 保证 `ref` 这类 helper 在同一次变换里只 import 一次）、宏导入的擦除（`import ... with { type: 'macro' }` 整行删除）、少数特性拆成"前置 + 后置"两个插件的多阶段形态、解析缓存的真实缓存键。这些都不影响"流水线"这条主线，分别属于 SFC 解析、跨工具统一插件抽象、宏运行时擦除等各自章节的题目。
 
 ## 8. 小结
 
-一条流水线，把"一个编译期特性"抽象成"一个独立 transform 函数 + 一个特性开关"，再用固定顺序的链串行接力。它换来的是新宏零脚手架、可独立开关、可单独发布、可跨工具分发，与官方编译器彻底解耦；付出的是接力链上累计 N 次解析（每次解析的还是各不相同的改写后代码）、顺序靠手工维护、特性间无法共享遍历上下文，以及宏语义被"能否还原成官方原语"这条边界圈死。
+一条固定顺序的 plugins 数组，加上每个特性 `(code, id) => { code, map } | undefined` 的统一形态，就是 Vue Macros 把"写一个新宏"压成"写一个函数 + 在链上插一个位置"的全部秘密。它放弃了"一次 walk 共享多 visitor"的性能上限，换来每个宏都能单独发布、单独开关、跨构建工具分发；它把所有宏锁死在"能否用官方原语还原"的边界内，换来与 Vue 官方编译器的彻底解耦。
 
-有了这条流水线，下一个自然的问题就是：到底哪些东西值得被做成宏？哪些运行期的样板，值得前移到编译期来消灭？这正是下一章《宏的设计原型：把什么前移到编译期》要归纳的。
+链跑完之后，每个特性都改过自己那一份、Vue 官方编译器接手一份它完全认识的代码。但下一个问题随之浮出来：什么样的"运行期约定"适合被这样前移到编译期、做成一个独立 transform 函数？这正是下一章「宏的设计原型：把什么前移到编译期」要回答的。

@@ -1,246 +1,210 @@
 # 声明式后处理流水线与链式 info 变换
 
-## 下载完，活才刚开始
+> 本章属于 composite 层。前置：info_dict 数据总线与提取器骨架。
+> 学完你能：用一句话讲清「为什么后处理做成声明式拼装的链、为什么用二元组当链上货币、为什么进度钩子由元类偷偷织入」。
 
-下载到一个文件，其实只是开了个头。
+## 1. 为什么需要它
 
-你可能想要 mp4 里的音轨单独抽出来做成 m4a；可能想给视频嵌上字幕；可能想把赞助商片段砍掉；可能还想把标题、章节这些元数据写进文件里。每一项都是一道独立的加工工序，而且工序之间有先后——你不会想在 3gp 这种根本不支持元数据的容器上写元数据（写了也白写，会丢），所以「转码定型」必须排在「写元数据」之前。
+上一章把长流拆成可恢复的分片，分片落盘后下载阶段就结束了——`info_dict` 多了个 `filepath` 字段，磁盘上多了个 `.webm`。但故事到这远没完：你可能还想把这个 webm 提取音频成 m4a、把赞助段砍掉、把标题和章节信息写进容器元数据。
 
-让用户自己去排「先转码还是先嵌字幕」，几乎一定会排错。用户想要的不是一箱子工具，而是一排开关：「我要音频」「我要嵌字幕」「我要砍赞助段」——剩下的，框架替我排成一条不会打架的流水线。
+这些后续动作有个隐性强依赖：**写元数据必须在容器定型之后**。如果你先把标题写进 webm，再提取音频改成 m4a，写进去的元数据就被丢掉了——因为旧容器连同它的元数据一起被替换。要是在不支持元数据的容器（比如 3gp）上写元数据，干脆写不进去。砍赞助段也类似：必须先裁剪、再写章节元数据，否则章节时间戳对不上。
 
-这一章就讲 yt-dlp 怎么把这一堆加工步骤，做成一条**声明式拼装的链**：链上每个站都对同一份元数据做一次纯变换，并顺带声明「我产生了哪些该删的旧文件」。
+使用者面对一堆 `--extract-audio`、`--embed-subs`、`--add-metadata`、`--remove-chapters` 开关，他不该自己去想「先转码还是先写元数据」。他要的是把开关丢给框架，框架替他排出一条不会打架的加工顺序。本章要解决的就是这件事——把「下载完之后」做成一条拼起来就不会错的加工管线。
 
-## 一个加工站只做一件事，顺带声明该删什么
+## 2. 核心思想
 
-先看这条流水线上最小的零件——一个加工站（PostProcessor）。
+换个抽象层看：每个加工步骤都被建模成同一个签名的纯函数——吃一份元数据字典、吐一份新字典外加一串「我这次产生的该删的旧文件」——首尾相连折叠下去。链不是用户自己拼的，而是由一个生成器函数把一堆 CLI 开关翻译出来的。换句话说，**这条链是声明式拼装出来的，执行方式只有一种：链式 fold**。
 
-每个站的执行约定是同一个签名：吃进一份 info 字典，吐出一个二元组：
+## 3. 心智模型
 
-```
-run(info) -> (待删文件列表, 新 info)
-```
+站在运行时角度看，链上跑的就两样东西：一份从下载阶段继承下来的胖元数据字典（第 4 章讲过它是贯穿全系统的数据总线，本章只看它的新角色——链上的可变状态载体，`filepath` 字段被反复改写、旧值落入待删清单），以及一份累积的「该删的旧文件」清单。
 
-第一项是「这次加工产生了哪些旧文件、可以删了」；第二项是「加工后的新 info」。比如「提取音频」这个站，吃进 `filepath = 'x.webm'`，转码出 `x.m4a`，它就返回 `(['x.webm'], {filepath: 'x.m4a', ...})`——旧的 webm 进待删清单，新文件路径写进 info。
-
-你可以把加工站想成流水线上的一个工位：工件（info + 文件）递过来，工位做一件事，再把工件递给下一个工位，顺手把产生的边角料（旧文件）扫进废料筐。这个「（废料筐，新工件）」的二元组，就是站与站之间唯一交接的东西。
-
-如果一个站什么都不想做，它返回 `[], info` 就行——一个空实现也是合法的「透传站」。
-
-> 这份 info 字典不是新东西。第 4 章讲过，它就是贯穿全系统的「万能数据总线」，提取器、下载器都在读写它。本章只看它的新身份：流到后处理阶段后，字典里多了一个 `filepath` 字段指向刚下载的文件，而每个加工站会反复改写这个 `filepath`、把旧值丢进待删清单。换句话说，字典在这里又多了一个角色——它就是那条链上唯一会动、被每个站改写的状态。
-
-## 把站首尾相连：链式折叠
-
-一个站只能做一件事。把它们首尾相连，才能完成「webm 进、m4a 出」这样的完整加工。
-
-编排器把同属一个时机的站放进同一个桶里，到点了就从这个桶里**依次取出、逐个执行**，并把上一个站的输出 info 喂给下一个站——这就是一次折叠（fold）：
+链的执行契约被压成一个二元组：
 
 ```
-info₀ ──→ 站A.run ──→ info₁ ──→ 站B.run ──→ info₂ ──→ 站C.run ──→ info₃
+PP.run(info) → (files_to_delete: string[], new_info: Info)
 ```
 
-核心只有几行：
+执行就是个 fold：上一步的 `new_info` 喂给下一个站，`files_to_delete` 累积起来交给框架。基类的 `run` 默认返回 `[], info`，意味着一个什么都不写的空 PP 是合法的「透传站」。
+
+链本身分三层拼起来：
+
+- **拼装层**：一个生成器函数 `get_postprocessors(opts)` 把一堆 CLI 开关逐条 `yield` 成有序声明（含名字、参数、运行时机）。顺序就是源码里的物理产出顺序，靠注释标注站间约束（例如 `# ModifyChapters must run before FFmpegMetadataPP`）。
+- **分桶层**：编排器按「运行时机」字段把声明分进 8 个桶（`pre_process` / `after_filter` / `video` / `post_process` / `after_move` …）。
+- **执行层**：主管线走到某个阶段时，取出对应桶，依次 fold 跑完每个站。
+
+进度上报不在业务里。元类在类创建那一刻，就把每个站的 `run` 方法偷偷包了一层「发 started 通知 → 调真业务 → 发 finished 通知」，作者写的代码里看不到任何 `hook_progress` 调用，运行时却自动有。
+
+跑完用户声明的链之后，编排器固定再跑一个硬编码的「把临时文件挪到最终位置」的站，它不参与声明式拼装，是少数几个「系统级」收尾站之一。
+
+## 4. 关键权衡
+
+### 元类偷换执行方法，换横切进度通知全自动
+
+每个加工站作者只写「我吃什么、我吐什么」的业务逻辑。但实际运行时，调用 `pp.run(info)` 拿到的远不止业务逻辑：包装层先复制一份 info 副本，发 started 通知，调真业务拿到 `(files_to_delete, new_info)`，发 finished 通知，副本只喂给进度钩子、真 info 用于链式传递。
+
+换来的是：横切的进度上报完全自动化，几十个内置加工站零样板，第三方插件作者也白嫖到同一套通知。
+
+代价是：执行方法被元类悄悄换掉，**字面定义和实际运行行为不一致**。新手调试时单步打进去，会看到自己没写过的 `started` 调用先于业务逻辑执行，断点位置和源码位置对不上要发懵。还要付一个隐式约定——业务返回 `None` 时包装层视为「未改」，这个隐式兼容在阅读签名时不明显。
+
+这条权衡化解的本质矛盾是：**业务作者只想写业务，框架想统一收口进度上报**——这两件事天然打架。元类把第二件事从作者视野里抹掉，是「横切织入」思路的典型用例。
+
+### 二元组当链上唯一货币，换任意加工站可自由组合
+
+每个站的签名都被强制成 `(info) → (files_to_delete, info)`。提取音频站产出 `(['x.webm'], {filepath:'x.m4a', ext:'m4a'})`，下一个写元数据站接到 m4a，产出 `([], {filepath:'x.m4a', ext:'m4a', title:'…'})`，再下一个嵌字幕站接着跑——任何站的输入都是上一个站的输出。
+
+换来的是：加工站是真正可组合的，按需增减一行不影响其它站；第三方插件 PP 走同一条 fold 路径，与内置 PP 平权。
+
+代价是：删文件这件事被框架接管了。加工站不能自己 `unlink` 旧文件，否则下一个站拿到的 `info.filepath` 指向一个不存在的路径，链就崩了。这顺带引出了 `keepvideo` 选项开启时的隐式语义——删除被延后成「待挪动」映射、等最终落位时再决定删不删，复杂度悄悄从加工站搬到了框架里。
+
+这条权衡化解的本质矛盾是：**加工站想自由改文件 + 自行清理，链式 fold 想要统一可组合契约**——把「清理意图」和「数据变换」打包成同一个返回值，是化解方式。
+
+### 生成器翻译开关，换「加一个开关 ≈ 加一个 if」的极低心智负担
+
+拼装函数体就是一堆 `if opts.xxx: yield {'key': …, 'when': …}`。先 yield 谁、后 yield 谁，就是源码里的物理顺序。站间依赖以注释形式硬编码（`# FFmpegMetadataPP should be run after FFmpegVideoConvertorPP and FFmpegExtractAudioPP … From this point the container won't change`）。
+
+换来的是：新增一个开关、新增一个站，作者只需要在生成器里找一个合适位置插一个 `if-yield`，心智负担极低；用户给一串开关，框架吐出顺序正确的链。
+
+代价是：**站与站之间的依赖关系散落在注释里，没有任何编译期或运行期保证**。加新站时插错位置，文件会被静默产出损坏——比如把 FFmpegMetadata 插到 ExtractAudio 之前，元数据写进 webm 后被丢弃，但程序不报错。
+
+这条权衡化解的本质矛盾是：**声明式追求「用户只给意图」，意图之间却有内在时序依赖**。生成器把依赖显式化进产出顺序 + 注释文档化，是这两件事的折中，没有银弹。
+
+### 阶段字段挂载多时机，换同一套机制横跨整个流程
+
+每条声明带个 `when` 字段，可挂到 `pre_process`、`after_filter`、`post_process`、`after_move` 等 8 个阶段。同一套加工机制、同一套二元组契约，复用于整个流程的多个时机——`pre_process` 桶里的 PP 可以在下载前改 info，`after_move` 桶里的 PP 可以在文件落位后做后扫尾。
+
+换来的是：机制可复用，加工站作者不用为「我的站在哪个时机跑」重新学一套 API，加个 `when` 字段就行。
+
+代价是：调用方要理解 8 个阶段语义才能正确写 `when`；而且少数「系统级」站（最终文件落位）被硬编码在收尾位置，不参与声明式拼装，形成「声明式拼装」与「命令式收尾」两套并存的尴尬——这部分代码读起来与声明式部分的风格完全不同。
+
+这条权衡化解的本质矛盾是：**流水线想统一「声明式」，但有些加工时机是「系统必需、不能让用户漏配」的**——这部分只能硬编码，妥协就出现了。
+
+## 5. 最小原理演示
+
+下面的 TS 片段用 60 行演透「声明式拼装 + 链式纯变换 + 元类自动进度钩子」三件事。Python 的元类用高阶函数 `withProgressHooks` 等价模拟——这恰好证明该机制不依赖 Python 元类语义，它本质是「对类方法做包装」。
 
 ```ts
-for (const pp of bucket) {
-  const [files, newInfo] = pp.run(info)   // 二元组解包
-  info = newInfo                           // 本站的新 info 是下一站的输入
-  toDelete.push(...files)                  // 待删文件由框架统一收集
-}
-```
+// 链上传递货币：待删旧文件清单 + 改写后的元数据
+type Info = { filepath: string; ext?: string; title?: string; [k: string]: unknown };
+type PPResult = [filesToDelete: string[], info: Info];
 
-跑完一整桶，info 里的 `filepath` 已经被一路改写成最终文件了。
-
-注意一个细节：**待删文件不是由加工站自己删的，而是交回框架统一处理**。框架拿到待删清单后看情况——如果用户开了「保留原始文件」（keepvideo），这些文件就不真删，而是记进一个「待挪动」的映射里，留到最后挪动时再处理；否则就立刻删掉。这设计让加工站保持纯粹：它只管「声明」该删什么，不管「怎么删、什么时候删」。
-
-## 作者只写业务，进度通知全自动
-
-写一个加工站时，作者只想关心「我要怎么转码」，根本不想操心「开始时报告一下进度、结束再报告一下」这种杂事。可进度上报又不能没有——下载器得靠它才能在屏幕上打出 `[ExtractAudio] started` / `[ExtractAudio] finished`。
-
-yt-dlp 的解法很巧妙：**在类被创建的那一刻，自动给执行方法包一层「开始/结束」通知**。作者照常写 `run`，但等类真正用起来时，那个 `run` 已经被悄悄替换成了「发开始通知 → 调真正的 run → 发结束通知」的包装版：
-
-```py
-# 作者写的是这个（纯业务）：
-def run(self, info):
-    ...转码...
-    return [old], new_info
-
-# 实际运行时被换成了这个（多了进度通知）：
-def run(self, info):
-    info_copy = self._copy_infodict(info)        # 复制一份，只喂给进度钩子
-    self._hook_progress({'status': 'started'}, info_copy)
-    ret = 真正的_run(info)
-    self._hook_progress({'status': 'finished'}, info_copy)
-    return ret
-```
-
-Python 里这件事是靠**元类**做到的：类对象被创建时，元类检查「类体里有没有直接定义 run」，有就把它拿去包一层再放回去。注意是「类体里**直接定义**的」——基类自己的默认 run 只在它自己的类体里被包一次，不会被二次包装；子类不重写 run 时，干净地继承那个已经包好的版本，不会重复套壳。
-
-这里还有个干净利落的细节：进度通知用的是 info 的**副本**，不是链上正在流动的真 info。副本只喂给进度钩子看看，绝不污染正在被加工的真数据。这样一来，横切关注点（进度上报）和业务逻辑就彻底分开了——作者写的每一行都是业务，进度全自动。
-
-## 给一串开关，框架替你排成不会打架的流水线
-
-用户不会、也不该知道「先转码还是先写元数据」。他们只给一串开关。
-
-把开关翻译成「有序的加工站列表」的，是一个**生成器函数**：它挨个检查每个开关，开关开了就 `yield` 一条加工站声明（带名字、参数、运行时机）。yield 的先后顺序，就是这条加工链的先后顺序。
-
-```
-{ extractAudio: true, addMetadata: true }
-        │
-        ▼  get_postprocessors(opts)
-[ 提取音频 ,  写元数据 ]        ← 产出顺序即执行顺序
-        │
-   ⚠️ 注释约束：写元数据必须在容器定型之后
-      （转换/提取音频会换容器，而 3gp/webm 等容器可能不支持元数据）
-```
-
-关键的先后约束，**靠函数里的注释标着**，并由 yield 顺序保证：
-
-- 「改章节（ModifyChapters）必须早于写元数据（FFmpegMetadata）」
-- 「写元数据必须在视频转换、音频提取**之后**——转换前的容器（3gp、webm…）可能不支持元数据；从写元数据这一站往后，容器就不会再变了」
-- 「Exec 必须是各自分类里最后一个站」
-
-这换来一个极低的扩展心智负担：**加一个开关 ≈ 加一个 `if ... yield ...`**。但你也能看出代价在哪——正确顺序没有任何机器保证，全靠作者读注释、守纪律。一个新站插错了位置，不会报错，只会静默产出损坏的文件。
-
-还有个藏得挺深的反向副作用：拼装函数在翻译开关时会**顺手改写 opts**。比如用户要嵌字幕（embedsubtitles），函数就把 `writesubtitles` 强行设为 `true`——因为嵌字幕这个站需要字幕文件已经下载好才能干活。这是「声明式拼装」对下游选项的一次偷偷反向修改，是个不太显眼的耦合点。
-
-## 一个 when 字段，让同一套机制挂在 8 个时机
-
-到目前为止聊的加工站都在「下载完之后」跑。但有些活儿得在更早或更晚的时机做：比如 SponsorBlock 查赞助段得在过滤后、下载前就拿到结果；有些信息又得等文件挪到最终位置之后才能动。
-
-每条加工站声明因此都带一个 `when` 字段，标明自己该挂在主管线的哪个时机。编排器构造时按 `when` 把站**分桶**存放：
-
-```
-_pps = {
-  'pre_process':  [...],
-  'after_filter': [...],
-  'post_process': [...],   ← 绝大多数用户声明默认落这里
-  'after_move':   [...],
-  ...                       ← 共 8 个阶段
-}
-```
-
-主管线走到某个阶段，就取出对应桶，按上一节那套折叠跑一遍。这样一来，同一套「声明式拼装 + 链式纯变换」的机制，就横跨了整个流程的好几个时机，可以复用。
-
-不过这套声明式并不包打天下。有一个「系统级」的收尾站——把临时文件挪到最终位置的 `MoveFilesAfterDownloadPP`——是**硬编码**在收尾位置的：用户声明的 `post_process` 桶跑完之后，编排器固定再跑这个落位站，挪完文件才接着跑 `after_move` 桶。这个落位站不参与声明式拼装，于是系统里其实**声明式和命令式两套并存**。
-
-> 顺带一提：所有内置加工站和用户自己写的插件，走的是同一条「丢个文件就注册一个新站」的发现路径——那套注册机制第 2 章已经讲透，本章不重复，只把它当成「工厂里现成的零件清单」来用。
-
-## 最小原理演示
-
-把上面三个机制——**声明式拼装 + 链式纯变换 + 自动进度钩子**——揉到一起，用一个能跑的小程序演一遍。真实 ffmpeg 调用全部用 mock 代替，目的是让你看清数据怎么流动。
-
-```ts
-// demo.ts —— 用 `bun demo.ts` 直接跑（或配下面 package.json）
-
-type Info = { filepath: string; [k: string]: unknown }
-type PPResult = [string[], Info]          // 链上唯一交接物：待删 + 新 info
-
-interface PostProcessor {
-  ppName: string
-  run: (info: Info) => PPResult
+interface PP {
+  name: string;
+  run(info: Info): PPResult;
 }
 
-// ---- 业务逻辑：作者只写这两个纯函数，不碰任何进度通知 ----
-function extractAudioLogic(info: Info): PPResult {
-  const oldFile = info.filepath
-  const newFile = oldFile.replace(/\.\w+$/, '.m4a')
-  console.log(`  [ffmpeg] ${oldFile} -> ${newFile}`)
-  return [[oldFile], { ...info, filepath: newFile, ext: 'm4a' }]   // 旧 webm 进待删，路径换 m4a
-}
-function writeMetadataLogic(info: Info): PPResult {
-  console.log(`  [ffmpeg] 写元数据到 ${info.filepath}`)
-  return [[], { ...info, ext: info.ext }]                            // 写元数据不改文件名
+// 高阶函数等价模拟「元类在类创建时给 run 包一层 started/finished 钩子」
+function withProgressHooks(pp: PP): PP {
+  const realRun = pp.run.bind(pp);
+  (pp as any).run = (info: Info): PPResult => {
+    console.log(`  [hook] ${pp.name} started`);
+    const ret = realRun(info);
+    console.log(`  [hook] ${pp.name} finished`);
+    return ret;
+  };
+  return pp;
 }
 
-// ---- 「元类」：用高阶函数在创建站时自动给 run 包一层 开始/结束 通知 ----
-// 这证明该机制不依赖 Python 元类，换门语言照样能做
-function autoWrap(name: string, realRun: (info: Info) => PPResult): PostProcessor {
-  return {
-    ppName: name,
-    run(info) {
-      const infoCopy = { ...info }                  // 副本只喂进度钩子，不污染链上真 info
-      console.log(`  [进度] ${name} started`)
-      const ret = realRun(info)                     // ← 作者写的纯业务逻辑藏在这里
-      console.log(`  [进度] ${name} finished`)
-      return ret
-    },
+// 加工站：webm 提取音频成 m4a（用 mock 的「换后缀」代替真 ffmpeg）
+const extractAudio = withProgressHooks({
+  name: 'ExtractAudio',
+  run(info): PPResult {
+    const oldPath = info.filepath;
+    const newPath = oldPath.replace(/\.\w+$/, '.m4a');
+    return [[oldPath], { ...info, filepath: newPath, ext: 'm4a' }];
+  },
+});
+
+// 加工站：把 title 写进容器元数据（不改文件名）
+const addMetadata = withProgressHooks({
+  name: 'FFmpegMetadata',
+  run(info): PPResult {
+    return [[], { ...info, title: info.title ?? 'untitled' }];
+  },
+});
+
+// 声明式拼装：把 CLI 开关翻译成有序声明，顺序由产出顺序 + 注释硬编码
+type PPDecl = { key: string; when?: string };
+
+function* getPostprocessors(opts: {
+  extractAudio?: boolean;
+  addMetadata?: boolean;
+}): Generator<PPDecl> {
+  if (opts.extractAudio) {
+    yield { key: 'ExtractAudio', when: 'post_process' };
+  }
+  // 顺序约束：FFmpegMetadata must run after ExtractAudio
+  // —— 写元数据必须在容器定型之后，否则元数据被丢弃
+  if (opts.addMetadata) {
+    yield { key: 'FFmpegMetadata', when: 'post_process' };
   }
 }
 
-// ---- 声明式拼装：开关 → 有序加工站；顺序靠注释约束 ----
-function getPostprocessors(opts: { extractAudio?: boolean; addMetadata?: boolean }): PostProcessor[] {
-  const chain: PostProcessor[] = []
-  if (opts.extractAudio) chain.push(autoWrap('ExtractAudio', extractAudioLogic))
-  // ⚠️ 写元数据必须在容器定型之后：转换/提取前容器可能不支持元数据
-  if (opts.addMetadata) chain.push(autoWrap('Metadata', writeMetadataLogic))
-  return chain
-}
+const REGISTRY: Record<string, PP> = {
+  ExtractAudio: extractAudio,
+  FFmpegMetadata: addMetadata,
+};
 
-// ---- 链式 fold 执行端：上一步的新 info 喂下一步 ----
-function runAllPps(bucket: PostProcessor[], info: Info) {
-  const toDelete: string[] = []
-  for (const pp of bucket) {
-    const [files, newInfo] = pp.run(info)
-    info = newInfo                                   // 折叠
-    toDelete.push(...files)                          // 待删由框架统一收集，站自己不删
+// 链式 fold 执行端：上一步 info 喂下一步，files_to_delete 累积
+function runPostProcess(info: Info, decls: PPDecl[]) {
+  let cur = info;
+  const filesToDelete: string[] = [];
+  for (const d of decls) {
+    const [del, newInfo] = REGISTRY[d.key].run(cur);
+    cur = newInfo;
+    filesToDelete.push(...del);
   }
-  return { info, toDelete }
+  return { info: cur, filesToDelete };
 }
 
-// ---- 跑一遍 ----
-const opts = { extractAudio: true, addMetadata: true }
-const chain = getPostprocessors(opts)
-console.log('开关', opts, '→ 拼出顺序:', chain.map(p => p.ppName).join(' → '))
+// 跑一遍：两个开关 → 一条顺序正确的链
+const decls = [...getPostprocessors({ extractAudio: true, addMetadata: true })];
+console.log('拼装出的有序声明 =', decls.map(d => d.key));
 
-const { info, toDelete } = runAllPps(chain, { filepath: 'x.webm', title: '我的视频' })
-console.log('最终 filepath:', info.filepath)
-console.log('待删清单:', toDelete, '（框架负责删）')
+const result = runPostProcess({ filepath: 'x.webm' }, decls);
+console.log('最终 info =', result.info);
+console.log('待删清单 =', result.filesToDelete);
 ```
 
-配套最小 `package.json`：
+运行后读者会看到：
 
-```json
-{
-  "name": "pp-pipeline-demo",
-  "private": true,
-  "scripts": { "start": "bun demo.ts" }
-}
-```
+- `getPostprocessors` 产出顺序为 `['ExtractAudio', 'FFmpegMetadata']`——注释约束生效，写元数据排在转码之后。
+- 每个 `pp.run` 调用前后自动多了 `[hook] started / finished`——作者根本没写过这两行，是 `withProgressHooks` 偷偷织进去的。
+- `info.filepath` 从 `x.webm` 改写成 `x.m4a`，旧 webm 进入待删清单；写元数据站不改文件名，但链式接得上。
+- 最终待删清单累积成 `['x.webm']`，框架后续会决定立即删还是延后删。
 
-运行结果——你会看到 `filepath` 从 `x.webm` 一路被改写成 `x.m4a`，旧 webm 进入待删清单：
+## 6. 执行轨迹
 
-```
-开关 { extractAudio: true, addMetadata: true } → 拼出顺序: ExtractAudio → Metadata
-  [进度] ExtractAudio started
-  [ffmpeg] x.webm -> x.m4a
-  [进度] ExtractAudio finished
-  [进度] Metadata started
-  [ffmpeg] 写元数据到 x.m4a
-  [进度] Metadata finished
-最终 filepath: x.m4a
-待删清单: [ 'x.webm' ] （框架负责删）
-```
+输入开关 `{extractAudio: true, addMetadata: true}`，info `{filepath: 'x.webm'}`：
 
-这段输出同时演透了三件事：进度通知在每个站的业务逻辑前后自动冒出来（作者没写一行通知代码）、info 在站之间被折叠传递、旧文件被收进待删清单交由框架处理。
+1. **拼装**：`getPostprocessors(opts)` 产出两条声明。注释 `# FFmpegMetadata must run after ExtractAudio` 决定了 FFmpegMetadata 在源码物理顺序上排在 ExtractAudio 之后，所以 yield 出来的就是 `['ExtractAudio', 'FFmpegMetadata']`。
 
-## 关键权衡
+2. **分桶**：编排器把两条声明都归进 `post_process` 桶（默认 when）。
 
-这一章机制密集，但真正值得记住的是下面这几条「做了什么选择 → 换来了什么 → 代价是什么」。
+3. **fold 第 1 步**：调 `ExtractAudio.run({filepath:'x.webm'})`。
+   - 元类包装层先发 `started` 通知（复制了一份 info 副本驱动进度钩子，真 info 不被污染）
+   - 真业务把 webm 转码成 m4a，返回 `(['x.webm'], {filepath:'x.m4a', ext:'m4a'})`
+   - 包装层发 `finished` 通知
+   - 框架拿到 `(['x.webm'], …)`，把 `x.webm` 加入累积待删清单
 
-**1. 用元类在类创建时自动给每个站的 run 包一层进度通知。**
-选择让执行方法在类被定义的那一刻就被悄悄包装。换来的是加工站作者只写纯业务逻辑，横切的进度上报全自动——这是整个后处理子系统最讨巧的设计。代价是字面定义和实际运行行为对不上：你在源码里看到的 `run` 不是真正跑的那个 `run`，新手调试时会困惑「我明明没写通知，通知从哪冒出来的」；而且每站运行都要先复制一份 info 副本去驱动进度通知，带来轻微开销和一个隐式的「返回值是二元组」约定。
+4. **fold 第 2 步**：调 `FFmpegMetadata.run({filepath:'x.m4a', ext:'m4a'})`。
+   - 包装层发 `started`
+   - 真业务把 title 写进 m4a 容器，返回 `([], {filepath:'x.m4a', ext:'m4a', title:'…'})`
+   - 包装层发 `finished`
+   - 待删清单这次为空，累积清单不变
 
-**2. 用「(待删文件列表, 新 info)」二元组作为链上唯一交接物。**
-选择把「清理声明」和「元数据变换」捏进同一个返回值。换来的是任意加工站可以自由组合——每个站既是元数据变换器，又是「我产生了哪些废料」的声明者，链的拼装因此极其灵活。代价是删文件的时机被框架接管了：加工站不能自己直接删文件（否则会破坏链的清理语义），保留原始文件（keepvideo）时删除还会被延后成「待挪动」映射而非真删。
+5. **收尾**：编排器跑硬编码的 `MoveFilesAfterDownloadPP`，把 `x.m4a` 从临时位置挪到最终位置；之后才跑 `after_move` 桶（本例为空）。
 
-**3. 用一个生成器把一堆开关翻译成有序声明，正确顺序靠注释 + 产出顺序硬编码。**
-选择把「顺序正确性」交给一个生成器函数和几行注释，而不是一张显式的依赖图。换来的是用户体验上的极大简化——只给开关，框架自动拼出顺序正确的管线；对开发者来说，「加一个开关 ≈ 加一个 if-yield」，心智负担极低。代价是站与站之间的正确依赖关系散落在注释里、没有任何编译期保证；新增一个站必须小心翼翼插对 yield 位置，错了不会报错，只会静默产出损坏的文件。
+6. **清理**：未开启 `keepvideo`，框架 `unlink` 掉待删清单里的 `x.webm`；开启则转成「待挪动」映射，最终落位时再处理。
 
-**4. 给每条声明附一个「何时运行」的 when 字段，挂到 8 个阶段。**
-选择用 when 字段把同一套加工机制铺到主管线的多个时机。换来的是机制高度复用——「声明式拼装 + 链式纯变换」这一套，横跨下载前、过滤后、下载后、挪动后等多个阶段都能用。代价是调用方必须理解 8 个阶段语义的差别；而且少数「系统级」的站（最终文件落位）被硬编码固定在收尾、不参与声明式流水线，于是系统里其实声明式和命令式两套并存，不是一个完全自洽的声明式系统。
+最终 `info.filepath = 'x.m4a'`，标题已写入容器，旧 webm 已删除。
 
-## 小结
+## 7. 教学简化说明
 
-后处理的本质，是把一连串「吃一份元数据、吐一份新元数据 + 一串待删文件」的加工站，首尾相连折叠成一条链。用户给一排开关，框架用一个生成器把它们拼成顺序正确的链，再靠元类把进度上报这种横切杂事全自动地织进每个站。整条链上流动的还是那份贯穿全系统的 info 字典——只不过在后处理阶段，它多了一个会被反复改写的 `filepath`，成了链上唯一会动的状态。
+本章演示故意省略了：真实的 ffmpeg 调用（用「换后缀 + 改字段」mock）、字幕与缩略图嵌入门类、`keepvideo` 下「待挪动」映射的完整语义、插件注册表与按名查表懒加载（约定类名后缀 `PP` 即类型，已在第 2 章讲过）、媒体类型限制装饰器（让 PP 声明「只对 video/audio/images 生效」）、8 个阶段的完整管线（只演示 `post_process` 一个桶）、进度模板渲染。这些都是链上某个具体站的业务，不影响理解「声明式拼装 + 链式纯变换 + 元类自动钩子」这三件事。
 
-下一章会看到 yt-dlp 怎么把 `-f bestvideo+bestaudio/best` 这样一串字符，编译成一个选择器去挑出要下载的格式——那是另一种「声明式」：用一门迷你语言声明意图，让框架去求解。
+## 8. 小结
+
+后处理这一段把「文件落盘之后」建模成一条 fold 链：用户给意图、生成器出顺序正确的声明、每个声明对 `(files_to_delete, info)` 二元组做一次纯变换，链式折叠是执行的唯一形式。横切的进度通知被元类偷偷塞进每个站的 `run`，业务作者只写业务；少数「系统级」站硬编码在收尾，不参与声明式拼装。
+
+链跑完，`filepath` 终于指向最终落盘的文件——但下载开始之前还有个问题：原始 formats 列表里有十几种分辨率 × 几种编码，到底选哪个下、哪个兜底、音视频要不要分流？把 `-f bestvideo+bestaudio/best` 这种字符串变成一个选择器 AST，是下一章的主题。

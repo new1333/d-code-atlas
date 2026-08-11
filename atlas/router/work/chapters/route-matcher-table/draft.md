@@ -1,299 +1,224 @@
 # 路由匹配表：从配置到 matched 链
 
-## 你写的是一棵树，浏览器问的是一条线
+> 本章属于 composite 层。前置：路径模式编译与优先级评分、导航失败的语义化分类。
+> 学完你能：用一句话讲清「为什么把路由配置预编译成一张有序扁平表 + 命中后沿父指针反推组件链」是配置形状与匹配形状之间的桥，以及它付出了哪些代价。
 
-想象你在配置路由，多半会写成这样——一层套一层：
+## 1. 为什么需要它
 
-```ts
-const routes = [
-  {
-    path: '/users',
-    component: Users,
-    alias: '/u',
-    children: [
-      { path: ':id', component: UserDetail },
-    ],
-  },
-]
-```
+上一章 History 抽象把 URL 模型封装成了可导航、可监听的窄接口：push、replace、listen 都齐了。但 URL 一变化，从那段字符串到「该渲染哪些组件、参数是什么」之间的桥还没人造。
 
-这棵树对你很好读：`Users` 是外壳，`UserDetail` 嵌在它里面，`/u` 是 `/users` 的小名。可运行期每次导航，浏览器甩过来的是一个冷冰冰的 URL（比如 `/users/42`），它不管你的树长什么样，就要你立刻回答两件事：**这次该渲染哪几个组件（连祖先一起算）？参数是什么？**
+想象一个真实场景：用户写了一棵嵌套的配置树——`/users` 下面挂着 `/users/:id` 再挂着 `/users/:id/posts`，`/users` 还带个别名 `/u`。每次导航拿到一个目标（可能是路由名、可能是完整路径、也可能是相对当前位置的偏移），必须立刻回答两件事：**该渲染哪几个组件（包括所有祖先组件）、参数是什么**。
 
-这里有个根本的不对仗——**配置的形状是树**（嵌套、还带别名），**匹配的形状却是线**（一个 URL 对一条记录）。如果每次导航都重新去遍历这棵树、逐条拿模式去比对，一来慢，二来碰到好几条模式都能匹配同一个 URL 时，你根本说不清该选谁。
+这里藏着一个结构性矛盾：**配置的形状是树**（嵌套、别名、重定向，天然带层级），**但匹配的形状是线**（一个 URL 对一条记录，要给确定的答案）。如果每次导航都重新遍历配置树逐条比对，既慢，又处理不了「同一段 URL 被多条模式命中时该选谁」的歧义。比如 `/users/list` 同时被 `/users/:id` 和 `/users/list` 命中，到底谁该赢？
 
-解法说人话就是：**趁还没开始导航，先把这棵树整个摊开成一张排好序的清单**，摊的时候顺手在每条后面写一句"我爸是谁"。等导航真来了，你只要从清单里挑第一条能对上的，再顺着"我爸是谁"一路往回找，就能凑齐该渲染的整串组件。整个运行期都不必再碰那棵树。
+所以需要一座桥：把树展平进一张可线性扫描的有序表，同时又不能丢父子关系——否则就算匹配到了 `/users/:id`，也不知道要顺手把 `/users` 的 Users 组件一起渲染。
 
-打个比方：图书馆把所有书按索书号排成一长溜（一张有序清单），你从头扫一眼就能锁定最合适的那本；至于"这本书属于哪套丛书、上册是谁"，扉页上写着指引，顺藤摸瓜就能把整套凑齐。书架是平的（线性数组），但"父子关系"靠书页上的备注重建（指针）。
+「评分排序」怎么从模式本身派生具体性分数，已经在「路径模式编译与优先级评分」讲透，本章只看分数怎么被消费来维持一张始终有序的运行期表。找不到匹配时抛什么语义化错误，已经在「导航失败的语义化分类」讲透，本章只把它当作 resolve 的失败出口。
 
-这一章就讲这张清单怎么造出来、又怎么被用起来。
+## 2. 核心思想
 
-## 一个表项长什么样：一个能认路的解析器，外加四个指针
+把配置树在**注册期**一次性预编译成一张按具体性评分排序的扁平匹配表，运行期解析只剩「一次正则命中 + 沿父指针反推组件链」。
 
-自底向上，先看这张清单里**一行**长什么样。
+这句话的关键不在「把路径编译成正则」（那是前一章），而在两件新事：把树压成扁平有序表，再用父指针把压扁时丢掉的父子关系挂回来。两步合起来，运行期才能既拿到线性扫描的速度、又拿到树形还原的完整组件链。
 
-每行叫一个**表项**（matcher）。它身兼两职：
+## 3. 心智模型
 
-- **前半截是个路径解析器**——带一条正则 `re`、一个分数 `score`、一组参数键 `keys`，外加 `parse`（从 URL 抠参数）和 `stringify`（反过来把参数拼回 URL）。这一截是上一章《路径模式编译与优先级评分》的产物：把 `"/users/:id"` 这种模式编译成一个能干活的对象。本章直接拿来用，不再讲它怎么编出来的。
-- **后半截是四个指针字段**——`record`（这条路由的全部配置）、`parent`（我爸是谁）、`children`（我的孩子们）、`alias`（跟我绑在一起、删我要一起删的别名）。
+运行期 imaginate 出来的样子，是**两套并行结构 + 三种解析入口 + 一条父指针回溯链**。
 
-关键就在这后半截。把树摊平进数组，本来意味着父子关系丢了；但每个表项都揣着 `parent`，关系就又接回来了。换句话说，**数据结构上是线性的，逻辑上却仍是一棵树**——线性是为了匹配时能快速扫描，指针是为了命中后能还原组件链。这正是本章最核心的一个设计。
+**两套并行结构**：
+- `matchers`：按分数降序排列的数组，是按路径解析时的扫描源。一次 `find(m => m.re.test(path))` 就拿到最高分命中。
+- `matcherMap`：名字到表项的哈希表，是按名解析时的 O(1) 索引。一次 `get(name)` 直接定位。
 
-## 第一步：把用户五花八门的写法，熨成同一种
+**一个表项身上挂两组东西**：路径解析器（正则、分数、参数键、parse、stringify，承前章产物）+ 规范化记录（组件、守卫、实例缓存）+ 三个指针字段（`parent` / `children` / `alias`）。前一半负责「这条 URL 是不是我」；后一半负责「命中我之后，组件链怎么拼回来」。
 
-用户配置路由的写法很自由：可能写 `component`（单组件），可能写 `components`（多命名视图），可能啥组件都不给（只用来分组），`children`、`meta` 也可能干脆没写。如果运行期到处都得判一遍"这个字段在不在、是哪种形态"，代码会很乱。
+**三种解析入口**：
+- 按 `path` 来：线性找第一个正则命中的表项，再 parse 出参数。
+- 按 `name` 来：查名字映射，按 `matcher.keys` 过滤参数，再 stringify 反解出路径。
+- 按相对位置来：基于 `currentLocation` 定位当前 matcher，合并传入参数后反解路径。
 
-所以加入路由的第一件事是**规范化**：把 `component` 统一成 `components.default`，把可能缺失的 `children`/`meta` 补成"永远存在"的形态，再预先开好几个运行期才用得上的空字段（守卫集合、已挂载组件实例的缓存等）。
+**一条父指针回溯链**：无论从哪个入口进来，命中后都做同一件事——`while (parent) { matched.unshift(record); parent = parent.parent }`。逆序 unshift 使祖先排在前、当前在最末，正好对齐 RouterView「由外到内」的渲染顺序。
 
-熨平之后，下游所有逻辑都可以放心假设"字段都在、形态统一"，不用再写一堆 `if`。这是用一点点注册期的整理，换来运行期代码的清爽。
+想象一面墙的目录卡片：每张卡片开个小窗（正则）只让某种形状的 URL 透过；卡片按精确度从左到右排，最具体的靠最左；卡片背面贴着「我爸是哪张卡」的标签。查 URL 时从左往右扫到第一张能透过的卡，就翻背面标签一路回溯到顶，把整串卡片摘下来——那就是要渲染的组件链。
 
-## 第二步：把树拍平，但留住父子关系
+## 4. 关键权衡
 
-规范完一条记录，就轮到**递归**了。这一步要做两件相互纠缠的事：把相对路径拼成完整路径，同时把父子指针接上。
+### 注册期预编译，换运行期极简解析
 
-**先建对象，再递归孩子**——这是顺序上的关键。必须先把当前这条的表项创建出来，才能把它当作 `parent` 传给子调用的递归。对象不存在，子就没法挂上来。
+**选择**：用户调 `addRoute` 那一刻就把每条路径编译成正则、解析/反解函数、分数（编译细节承前章），然后插入有序表——而不是把这种工作拖到 resolve 时按需做。
 
-父子路径的拼接是手工活，因为树里存的是相对路径（孩子写 `:id`），而最终要拿来匹配的是绝对路径（`/users/:id`）。规则很朴素：
+**换来**：运行期解析 `path` 时只剩一次 `find(m => m.re.test(path))`，命中的是表上第一个正则通过的表项（因为表已按分数降序，第一个就是最具体的）；解析 `name` 时是一次哈希查表。每次导航开销是「O(表长) 次正则 test + 一次 parse + 一次指针回溯」，跟配置树的深度无关——树再深，组件链也是沿指针反推的常数步。
 
-```ts
-// 子路径不以 / 开头，才算相对路径
-if (parent && path[0] !== '/') {
-  const parentPath = parent.record.path
-  // 父路径已经以 / 结尾就不重复加，否则补一个分隔斜杠
-  const connectingSlash =
-    parentPath[parentPath.length - 1] === '/' ? '' : '/'
-  normalizedRecord.path = parent.record.path + connectingSlash + path
-}
-```
+**代价**：路由表成了「可变、有维护成本的结构」。增删一条路由开销大（二分定位 + 数组移动），并且必须同步维护三套结构：有序数组、名字到表项的映射、别名反向引用。任一处不一致整张表就坏了。这是一种典型的「把复杂度从高频读路径搬到低频写路径」的取舍：导航每秒可能发生几十次，路由表变更一辈子可能就几次。
 
-就这么几行，处理的是"树形存储"到"字符串拼接"的转换。看着不起眼，但斜杠加错一位，整条路径就匹配不上——这是把树摊平必须付出的手工代价之一。
+**本质矛盾**：编译开销 vs 运行期性能。这种「读多写少 → 把成本挪到写」的骨架，在数据库索引、JIT 编译器、缓存预热里都能看到同一种形状。
 
-## 第三步：别名——一份定义，挂到多条路径上
+### 树展平加双向指针，换匹配无需递归
 
-别名（alias）是个常见需求：`/users` 想同时能用 `/u` 访问。怎么实现？
+**选择**：递归把嵌套配置树拍平进一个扁平数组，但每个表项同时携带 `parent` 和 `children` 双向指针——既享受线性扫描的简单，又能在命中后沿 `parent` 反推出完整组件链。
 
-朴素想法是复制一份记录。但复制会有麻烦：异步组件加载后的缓存、注册的守卫，如果每条路径各存一份，就重复了，状态也对不齐。
+**换来**：解析的核心循环里没有任何递归。「找表项」是数组 `find`，「拼组件链」是 `while (parent)`，两种操作都是恒定结构。树形复杂度被压平进了数组排序。
 
-这里的做法更巧：**为每个别名单独建一个表项**（它有自己的正则、自己的分数、自己的路径，毕竟 `/u` 和 `/users` 长得不一样），但所有别名表项的 `record.aliasOf` 都**指向同一个原始记录**。组件、守卫、实例缓存全部共享原始记录那一份。
+**代价**：父子关系再也不能「靠路径嵌套表达」，必须在注册期手工处理两件事：
 
-于是同一个组件逻辑，能被多条路径命中；而删除原始记录时，顺着 `alias` 列表一级级清，别名会跟着一起消失。一份定义，多处生效，删一处全干净。代价是别名路径必须拥有和原路径相同的必要参数（否则解析出来的参数对不上）——这点注册期会校验提醒。
+- **父子路径拼接**。子路径首字符非 `/` 时才算相对路径，中间的分隔符 `/` 仅在「父路径不以 `/` 结尾且子路径非空」时补上。把树压成串的关键就在这几行小心翼翼的代码：
+  ```ts
+  if (parent && path[0] !== '/') {
+    const parentPath = parent.record.path
+    const connectingSlash = parentPath.endsWith('/') ? '' : '/'
+    normalizedRecord.path = parentPath + (path && connectingSlash + path)
+  }
+  ```
+- **同分排序调整**。父子分数相同时（典型场景：父 `/a` 与子拼出的 `/a` 空路径），分数比较函数看不出谁先谁后；必须额外在二分插入时查「同分祖先」并把后代挪到祖先之前，否则命中祖先会提前短路，漏掉更具体的后代。
 
-## 第四步：塞进一张始终排好序的表
+**本质矛盾**：扁平数据的扫描速度 vs 树形结构的关系还原。鱼和熊掌都想要的代价，是关系要靠指针手工缝合、歧义要靠规则逐条补全。这种「扁平存储 + 指针重建关系」的形状，在 ORM 关联映射、文档数据库、虚拟 DOM diff 里都能看到。
 
-到目前为止我们造出了一堆表项，现在要把它们组织起来。匹配表内部其实同时养着**两套结构**：
+### 别名共享同一份记录，换一处定义多处生效
 
-- **`matchers`：一个有序数组**，按分数从高到低排。运行期按路径解析时，就从它里面扫。
-- **`matcherMap`：一个 名字 → 表项 的映射**。运行期按名字解析时，O(1) 直接查表。
+**选择**：为每个别名单独建一个表项，它有自己的路径、自己的正则、自己的分数，跟原表项平起平坐地住进 `matchers` 数组里；但它的「记录归属」指针指向**同一个原始记录**——组件、守卫、已挂载实例缓存全部共享。
 
-按路径走数组、按名字走哈希，各取所长。但还没完——不是所有表项都该进表。有一种**纯分组路由**：既没组件、又没名字、也没重定向，它存在的唯一目的是把一堆子路由组织在一起，自己根本不会被访问到。这种表项**不进 `matchers` 数组**（进了也是命中后无物可渲染），但它照样当别人的 `parent`，该接的指针一个不少。
+**换来**：同一段组件逻辑可以被多条路径命中，异步组件缓存挂在原记录上、所有别名共用一份（避免每个别名各自实例化一份组件）。删除原记录时，级联递归清掉所有别名表项，不会留下指向虚空的孤儿。
 
-至于排序，这里只消费上一章讲透的那套分数（静态段 > 动态段 > 正则 > 通配），不重新推导。新路由加进来时，用**二分查找**定位该插的位置，再 `splice` 进去——表始终保持有序，不必每次匹配前再排一遍。
+**代价**：别名路径必须拥有与原路径相同的必要参数，否则解析出来的参数对不上（注册期有校验告警）。同时，名字映射里只登记原记录、别名靠原记录的 `alias` 列表间接可达——这意味着别名「能命中、不能按名直查」，要按名跳别名必须走原记录。
 
-有一个细节值得单独说：当**父子俩分数相同**时，光按分数排会出 bug——祖先可能挡在后代前面被先扫到，于是命中了较宽泛的祖先、漏掉了更具体的后代。所以插入时还有第二阶段调整：往上找有没有同分的祖先表项，有的话就把当前这条插到**那位祖先的前面**，保证"同分时后代排在祖先之前"。这条规则只在父子同分这个边界上起作用，分数不同的父子本来就由分数决定了先后。
+**本质矛盾**：路径的多样性 vs 组件状态的一致性。同一段 UI 想被多个 URL 入口复用，但组件状态（缓存、守卫、实例）只该有一份——别名表项负责把多个入口分流到同一段实现。
 
-## 第五步：导航来了——一次命中，沿指针回溯
+### 判别联合用互斥标记描述五种变体
 
-表建好了，运行期 `resolve` 就轻松了。它按输入分三条路：
+**选择**：把用户配置的形态拆成五个变体（单组件 / 单组件带子路由 / 多命名视图 / 多命名视图带子路由 / 纯重定向），用「互斥的 `never` 字段」锁死组合——同时写了 `component` 又写了 `redirect` 是合法的 TypeScript 写法，但写出来在编译期就报红。
 
-- **按名字**：查 `matcherMap`，拿到表项后用 `stringify` 把参数反拼成路径。查不到名字就抛一个"找不到匹配"的错——这种导航失败的语义化分类，上一章《导航失败的语义化分类》已经讲透，这里只当它是解析失败时的出口。
-- **按路径**：`matchers.find(m => m.re.test(path))`——线性扫，找**第一个**正则能命中的表项。为什么 find 第一个就够、不用比较多个候选？因为表已经按分数降序排好，首个命中的就是分数最高、最具体的那条，结果既确定又自明，无需回溯。命中后调 `parse` 抠出参数，再清掉那些值为空的可选参数。
-- **按相对位置**：既没给名字也没给完整路径（比如 `router.push({ params: { id: 7 } })`），就基于"当前在哪个路由"先定位当前表项，合并传入参数后 `stringify`。
+**换来**：规范化逻辑能放心用「属性存在性」分支判断五种变体，不必做运行期猜测；错误配置在用户写代码时就报红，而不是上线后撞到一个没考虑过的分支。
 
-不管走哪条，命中表项之后的活儿都一样——**沿 `parent` 指针一路回溯，把组件链凑齐**：
+**代价**：五个接口定义较长，用户第一次看到「我写了 `component`，为什么 `redirect` 报错」时需要理解 `component?: never` 表示这个变体里这个字段必须不存在这条 TS 惯用法。代价薄到不展开——主要是换来类型安全，代价是用户多学一条互斥规则。
+
+**本质矛盾**：配置表达力 vs 类型安全。把「互斥变体」上提到类型层而不是运行期校验，是用编译器的成本换运行时不会撞到不该撞的分支。
+
+## 5. 最小原理演示
+
+下面这段演示只演透核心思想：递归把配置树拍平成带父指针的扁平表项数组、按分数二分插入、命中后沿父指针 unshift 出组件链，再加一条别名共享记录。每一段都对应上面某条权衡。
 
 ```ts
-const matched = []
-let p = matcher
-while (p) {
-  matched.unshift(p.record)   // 逆序插入，让祖先排在前面
-  p = p.parent
-}
-```
-
-注意是 `unshift`：从命中点往祖先走，但每次往数组头部塞，最终祖先在前、命中点在后——正好是渲染时从外到内的顺序。最后把链上各层记录的 `meta` 逐层合并，一次解析就齐活了：组件链、参数、合并后的元信息，全部到手。**全程零递归遍历配置树**，只有一次正则命中加一次指针回溯。这就是注册期预编译换来的运行期清爽。
-
-## 从零实现一张匹配表
-
-把上面五步串起来，写一个能跑的最小实现。重点演三件事：递归把配置树拍平成"带父指针的表项数组"、按分数二分插入、解析时"找到第一个正则命中的表项、沿父指针 unshift 出组件链"；再演一条别名的共享与级联删除。
-
-```ts
-// route-matcher-demo.ts —— 配置树 → 有序匹配表 → 一次命中 + 沿父指针反推
-// 用 bun run route-matcher-demo.ts 或 npx tsx route-matcher-demo.ts 运行
-
-type Comp = string // 极简"组件"，用字符串代表，重点是结构
-
-interface RawRoute {
+type RawRoute = {
   path: string
-  component?: Comp
+  component?: Function
+  name?: string
   alias?: string[]
   children?: RawRoute[]
 }
 
-interface RouteRecord {
+type Record = { path: string; component?: Function; name?: string }
+
+type Matcher = {
   path: string
-  component: Comp | null
-  children: RawRoute[]
-  aliasOf?: RouteRecord // 别名指向原始记录；原始记录这里为 undefined
-}
-
-// 表项 = 路径解析器(re/keys/score/parse) + 四个指针字段(record/parent/children/alias)
-interface Matcher {
   re: RegExp
-  keys: string[]
-  score: number
-  parse: (path: string) => Record<string, string>
-  record: RouteRecord
-  parent: Matcher | undefined
-  children: Matcher[]
-  alias: Matcher[]
+  score: number               // 简化：仅用静态段数当分数（前章的真实算法此处压缩成一档）
+  record: Record
+  parent: Matcher | null
+  aliasOf: Matcher | null     // 非空表示这是别名表项，指向原始表项
 }
 
-// ① 极简编译器：把 "/users/:id" 编成正则 + 分数 + parse
-//    真实的字符级评分见上一章，这里只用"静态段 > 动态段"两档示意
-function compile(path: string) {
-  const keys: string[] = []
-  const segs = path.split('/').filter(Boolean)
-  const pattern = segs
-    .map(seg => (seg.startsWith(':') ? (keys.push(seg.slice(1)), '([^/]+)') : seg))
-    .join('/')
-  const re = new RegExp('^/' + pattern + '/?$')
-  const parse = (p: string) => {
-    const m = re.exec(p)!
-    const out: Record<string, string> = {}
-    keys.forEach((k, i) => (out[k] = m[i + 1]))
-    return out
-  }
-  // 分数：静态段 4 分，动态段 1 分
-  const score = segs.reduce((s, seg) => s + (seg.startsWith(':') ? 1 : 4), 0)
-  return { re, keys, score, parse }
+// 工具：路径模式编译成正则（:param → 捕获组；承前章的细粒度编译此处极度简化）
+function compileToRegex(path: string): RegExp {
+  return new RegExp('^' + path.replace(/:\w+/g, '([^/]+)') + '$')
 }
 
-function createMatcherTable(routes: RawRoute[]) {
-  const matchers: Matcher[] = [] // 有序数组，分数从高到低
+function scoreOf(path: string): number {
+  return path.split('/').filter(seg => seg && !seg.startsWith(':')).length
+}
 
-  function normalize(raw: RawRoute): RouteRecord {
-    return { path: raw.path, component: raw.component ?? null, children: raw.children ?? [] }
-  }
+// 注册期：递归把配置树拍平进扁平数组，同时挂双向指针
+function buildMatchers(raw: RawRoute[], parent: Matcher | null = null): Matcher[] {
+  const out: Matcher[] = []
+  for (const r of raw) {
+    // 子路径首字符非 / 时算相对路径，手工补一个分隔符——树压成串的关键
+    const fullPath = parent && !r.path.startsWith('/')
+      ? parent.path + '/' + r.path
+      : r.path
 
-  // 按分数二分插入，保持数组降序
-  function insertSorted(m: Matcher) {
-    let lo = 0
-    let hi = matchers.length
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1
-      if (m.score > matchers[mid].score) hi = mid
-      else lo = mid + 1
+    const m: Matcher = {
+      path: fullPath,
+      re: compileToRegex(fullPath),
+      score: scoreOf(fullPath),
+      record: { path: fullPath, component: r.component, name: r.name },
+      parent,
+      aliasOf: null,
     }
-    matchers.splice(lo, 0, m)
-  }
+    out.push(m)
 
-  // 递归建表：parent 必须先建好；original 让别名一脉挂回原始表项，便于级联删除
-  function addRoute(raw: RawRoute, parent?: Matcher, original?: Matcher) {
-    const main = normalize(raw)
-    main.aliasOf = original?.record
-
-    // 展开别名：原始路径 + 每个别名各一条记录，组件定义复用原始记录
-    const variants: { record: RouteRecord; path: string; aliasOf?: RouteRecord }[] = [
-      { record: main, path: raw.path },
-    ]
-    for (const a of raw.alias ?? []) variants.push({ record: { ...main }, path: a, aliasOf: main })
-
-    let first: Matcher | undefined // 这一脉里第一个（原始）表项
-    for (const v of variants) {
-      v.record.aliasOf = v.aliasOf
-      // 父子路径拼接：子路径不以 / 开头才算相对
-      if (parent && v.path[0] !== '/') {
-        const slash = parent.record.path.endsWith('/') ? '' : '/'
-        v.record.path = parent.record.path + slash + v.path
-      }
-
-      const matcher: Matcher = {
-        ...compile(v.record.path),
-        record: v.record,
+    // 别名各自有路径/正则/分数，但 record 字段直接复用原表项的对象引用
+    // 同一份组件/守卫/实例缓存被多条路径共享
+    for (const aliasPath of r.alias ?? []) {
+      out.push({
+        path: aliasPath,
+        re: compileToRegex(aliasPath),
+        score: scoreOf(aliasPath),
+        record: m.record,
         parent,
-        children: [],
-        alias: [],
-      }
-      if (parent) parent.children.push(matcher)
-
-      // 别名挂回原始表项，删原始时能级联清掉
-      if (original) original.alias.push(matcher)
-      else {
-        first = first ?? matcher
-        if (first !== matcher) first.alias.push(matcher)
-      }
-
-      // 纯分组（无组件）不入表，但照样当别人的父
-      if (matcher.record.component) insertSorted(matcher)
-
-      for (const c of raw.children ?? []) addRoute(c, matcher, original)
-      if (!original) original = matcher
+        aliasOf: m,
+      })
     }
-  }
 
-  // 运行期：一次正则命中 + 沿父指针反推组件链
-  function resolve(path: string) {
-    const matcher = matchers.find(m => m.re.test(path)) // 表已降序，首个命中即最具体
-    if (!matcher) return null
-    const params = matcher.parse(path)
-    const matched: RouteRecord[] = []
-    let p: Matcher | undefined = matcher
-    while (p) {
-      matched.unshift(p.record) // 逆序插入，祖先在前
-      p = p.parent
-    }
-    return { params, components: matched.map(r => r.component) }
+    // 先建好 matcher 才能作为 parent 传给子调用——递归建树的前序
+    if (r.children) out.push(...buildMatchers(r.children, m))
   }
-
-  // 删一条：连带子树和别名一起消失
-  function removeRoute(m: Matcher) {
-    const i = matchers.indexOf(m)
-    if (i >= 0) matchers.splice(i, 1)
-    m.children.forEach(removeRoute)
-    m.alias.forEach(removeRoute)
-  }
-
-  routes.forEach(r => addRoute(r))
-  return { matchers, resolve, removeRoute }
+  return out
 }
 
-// —— 跑一遍 ——
+// 二分插入：保持按分数降序，使「第一个正则命中的」就是「最具体的命中」
+function insertSorted(table: Matcher[], m: Matcher): void {
+  let lo = 0, hi = table.length
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (table[mid].score > m.score) lo = mid + 1
+    else hi = mid
+  }
+  table.splice(lo, 0, m)
+}
 
-// 场景一：嵌套路由，演"拍平 + 父指针 + 一次命中"
-const t1 = createMatcherTable([
-  { path: '/users', component: 'Users', children: [{ path: ':id', component: 'UserDetail' }] },
-])
-console.log('表内顺序（分数降序）:', t1.matchers.map(m => `${m.record.path}(${m.score})`))
-// [ '/users/:id(5)', '/users(4)' ]
-console.log('解析 /users/42:', t1.resolve('/users/42'))
-// { params: { id: '42' }, components: [ 'Users', 'UserDetail' ] }
+// 运行期解析：一次正则命中 + 沿父指针 unshift 出组件链
+function resolve(table: Matcher[], path: string) {
+  // 表已按分数降序，find 返回的首个命中即最高分匹配，无需回溯比较多个候选
+  const matcher = table.find(m => m.re.test(path))
+  if (!matcher) throw new Error('MATCHER_NOT_FOUND')  // 失败出口的语义化分类承前章
 
-// 场景二：别名，演"一份定义多条路径 + 级联删除"
-const t2 = createMatcherTable([{ path: '/home', component: 'Home', alias: ['/index', '/start'] }])
-console.log('三条路径都指向 Home:', t2.resolve('/start'))
-// { params: {}, components: [ 'Home' ] }
-console.log('删前表大小:', t2.matchers.length) // 3
-t2.removeRoute(t2.matchers[0])
-console.log('删原记录后表大小:', t2.matchers.length) // 0 —— 别名一起没了
+  const matched: Record[] = []
+  let p: Matcher | null = matcher
+  while (p) {
+    matched.unshift(p.record)  // 逆序插入：祖先在前、当前在末，对齐由外到内的渲染顺序
+    p = p.parent
+  }
+  return { matched }
+}
 ```
 
-看场景一的输出：表里 `/users/:id`（分数 5）排在 `/users`（分数 4）前面，所以解析 `/users/42` 时第一个命中的就是更具体的那条，再沿父指针回溯出 `[Users, UserDetail]`——外层组件在前，正好是嵌套渲染的顺序。场景二里，`/home`、`/index`、`/start` 三条路径都解析出同一个 `Home` 组件（共享原始记录），删掉原始记录后表瞬间清空，别名没留一点残渣。
+读法：`buildMatchers` 演的是权衡「树展平加双向指针」——树被压成扁平数组、父子关系靠 `parent` 字段挂回；`compileToRegex` 和 `scoreOf` 都在注册期一次完成、运行期不再触碰，演的是权衡「注册期预编译」；别名表项的 `record` 字段直接复用原表项对象引用，演的是权衡「别名共享同一份记录」；`while (p) matched.unshift(p.record)` 演的是核心思想本身——无递归还原组件链。
 
-## 几个关键的设计取舍
+## 6. 执行轨迹
 
-**取舍一：注册期把所有路径预编译，换来运行期只剩"一次正则命中 + 一次指针回溯"。**
-选择在添加路由的那一刻，就把每条路径编译成正则、分数、parse/stringify，并接好父指针——这意味着开销全压在配置阶段。换来的是运行期解析路径时极其简单：线性找到第一个正则通过的表项、调一次 parse、沿指针走一遍，全程零递归；按名字解析更是一次哈希查表。代价是**表是可变的，增删路由开销大**，而且必须同时维护好几套结构（有序数组、名字映射、别名反向引用），任何一处没同步好，整张表就坏了。这是个典型的"把贵的工作前移到一次性阶段、把热路径做到极简"的取舍。
+以配置 `{ path: '/users', component: Users, alias: '/u', children: [{ path: ':id', component: UserDetail }] }` 走一遍。
 
-**取舍二：树展平进数组，但用双向指针把父子关系接回来，换来匹配无需递归。**
-选择把嵌套配置递归拍平成一个扁平数组，享受线性扫描的简单；同时每个表项都揣着 `parent`（和被推入父亲的 `children`），于是命中之后只要沿 `parent` 一路回溯就能还原完整组件链，不必再回到那棵树上去递归。代价是**"树形相对路径"到"字符串绝对路径"的转换得手工做**——父子路径拼接时那一个分隔斜杠加不加、加在哪，全靠人肉处理，错一位就匹配不上；而且当父子分数相同时，还得多一道"把后代挪到祖先前面"的调整，否则祖先会提前短路、漏掉更具体的后代。换句话说，这个设计换来的是匹配期的简单，付出的是建表期的细碎。
+**注册期**（addRoute 递归）：
 
-**取舍三：别名各自建表项，但记录共享同一份，换来一处定义多处生效。**
-选择为每个别名单独编译出一个表项（它有自己的正则和分数，毕竟 `/u` 和 `/users` 形态不同），但所有别名表项的 `record.aliasOf` 都指向同一个原始记录——组件、守卫、已挂载实例的缓存全部共享。换来的是同一段组件/守卫逻辑能被多条路径复用，删除原始记录时顺着 `alias` 列表级联清理、一条不留。代价是**别名路径必须拥有与原路径相同的必要参数**：原路径有 `:id`，别名也得有，否则别名解析出来的参数对不上原记录的组件，注册期会有校验告警。这是"共享带来一致性约束"的常见代价。
+1. 规范化 `/users`：分数 1（一个静态段），`parent: null`，`aliasOf: null`。二分插入 → `matchers = [/users]`。
+2. 展开别名 `/u`：分数 1，`aliasOf` 指向上一步的 `/users` 表项，`record` 共享同一份 Users 组件定义。插入 → `matchers = [/users, /u]`（同分时按插入顺序排）。
+3. 递归子路由 `:id`：相对路径，拼成 `/users/:id`（父路径 `/users` 不以 `/` 结尾，补一个 `/`）。分数 1（一个静态段 + 一个动态段，简化算法只数静态段）。`parent` 指向 `/users` 表项。插入 → `matchers = [/users, /u, /users/:id]`。
+4. 实际工程里别名 `/u` 也会展开自己的子树路径 `/u/:id`，record 共享 UserDetail。表里再多一条。
 
-**取舍四：用判别联合 + 互斥的 `never` 字段，把五种路由形态精确锁死，换来编译期就拒绝非法配置。**
-用户的路由配置其实有五种合法形态：单组件、单组件带子路由、多命名视图、多命名视图带子路由、纯重定向。选择把它们写成五个类型，靠 `component?: never`、`components?: never`、`redirect?: never`、`children?: never` 这种互斥标记让它们在类型层彼此排斥。于是"同时写了 `component` 又写了 `redirect`"这种非法组合，你在编辑器里就红了，根本到不了运行期；规范化逻辑也能放心用"某个属性在不在"来做分支。代价是**五个接口定义偏长，用户得理解这套互斥规则**——但比起让错误混到运行期再排查，这点学习成本很值。
+**运行期**（resolve `/users/42`）：
 
-## 小结
+1. 进入 `path` 分支。`matchers.find(m => m.re.test('/users/42'))` 从头扫：
+   - `/users` 的正则 `^/users$` 不通过；
+   - `/u` 的正则 `^/u$` 不通过；
+   - `/users/:id` 的正则 `^/users/([^/]+)$` 通过。停在这里。
+2. `matcher.parse('/users/42')` 得到 `{ id: '42' }`。
+3. 命中后沿父指针回溯：当前 `matcher` 是 `/users/:id` → `unshift(UserDetail)` → 走到 `parent = /users` → `unshift(Users)` → 走到 `parent = null`，结束。`matched = [Users, UserDetail]`，祖先在前、当前在末。
+4. 合并各层 `meta`，返回 `{ name: undefined, path: '/users/42', params: { id: '42' }, matched: [Users, UserDetail] }`。
 
-这一章的核心，是用一张**注册期预编译、按分数排好序、靠父指针重建树形关系**的扁平匹配表，去桥接"配置是树、匹配是线"这个根本矛盾。运行期因此变得极其轻：一次正则命中加一次指针回溯，组件链和参数就到手了。别名靠"独立表项共享记录"实现一处定义多处生效；五种路由形态靠判别联合在编译期就被精确区分。
+整个解析过程零递归遍历配置树：「找表项」是一次数组扫描，「拼组件链」是三次 `unshift`。
 
-match 出来的这条组件链（`matched` 数组）拿去渲染时，还得先过一道关卡——这些组件到底能不能进入、要不要被拦截或重定向。这就是紧邻的下一章《导航守卫管线》要讲的：怎么把一堆守卫按严格顺序串成一条可异步、可取消的流水线。
+## 7. 教学简化说明
+
+本章演示故意省略了：真实的字符级评分算法（承前章已演）；参数键的可选/可重复细节、props 规范化、守卫集合实例化、所有开发期校验告警；query、hash、编码；重定向记录的单独处理；以及「同分父子时把后代挪到祖先之前」的边界调整；纯分组路由（无组件/无名/无重定向）不入 `matchers` 数组但仍作 parent 的过滤规则。这些都是工程化包装，不在原理主线上。
+
+## 8. 小结
+
+注册期把树压成有序扁平表、运行期只做一次正则命中加沿父指针反推，这是把「树形配置」与「线性匹配」两种形状捏到一起的代价：用低频的写时编译换高频的读时极简，用扁平存储加指针重建关系，用别名共享记录换多处入口指向同一份状态。matched 链到手之后，下一章「导航守卫管线」就在这条链上串联起一长串异步钩子，决定这次导航到底要不要放它过去。

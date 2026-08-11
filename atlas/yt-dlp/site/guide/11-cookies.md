@@ -1,196 +1,222 @@
 # 统一 cookiejar：从浏览器密钥环解密登录态
 
-你在浏览器里早就登录好了 YouTube，现在想让下载工具直接用这份登录态，而不是再开个网页去手动导出一份 cookies.txt。这听起来天经地义——「我都登进去了，你拿去用不就行？」麻烦在于：浏览器把你的登录态加密锁在它自己的私有存储里，而且每个浏览器存的格式不一样、每个操作系统加密的方式又不一样。这一章讲的，就是怎么把这些五花八门的「加密登录态」还原成一份干净的 cookie，再在发请求时按域名塞回去。
+> 本章属于 composite 层。前置：可插拔传输层。
+> 学完你能：用一句话讲清「为什么 cookie 容器要把来源各异、加密各异的登录态坍缩成同一套标准 Cookie，再按域名注入请求」——以及为此必须扛下的「浏览器×OS 适配矩阵」脆裂代价。
 
-## 先认识「产物」：一个谁都对它说话的 cookie 罐子
+## 1. 为什么需要它
 
-要理解整条链路，最好先盯着终点看。不管登录态来自浏览器还是来自一个文本文件，最后都要落进同一个东西——一个统一的 cookie 容器。说人话就是：下载主流程只认这一个罐子，它根本不关心罐子里的 cookie 是谁放进去的、当初是加密的还是明文的。
+上一章把 `info_dict` 投影成文件名——把「拿到数据后怎么命名」这件事办了；可那份 `info_dict` 不是凭空掉下来的。本章就接着这个口子讲：很多站点（YouTube、B 站、各种会员制视频站）得先登录、拿到「我是谁」的凭证，才肯把完整视频源交出来。**登录态从哪来**就是这一章要回答的问题。
 
-打个比方，这个罐子像一块**公共留言板**：谁都往上面贴条子（放 cookie），发请求的时候再按「收件人」（也就是域名）把对得上号的条子取出来带走。罐子对外的契约很简单：
+最朴素的办法是让用户去浏览器里手动导出一份 `cookies.txt` 喂给下载工具。这件事繁琐、容易过期，更糟的是用户根本不知道自己在干什么——他只觉得「我浏览器里登着呢，为什么这边还要我再登一次？」
 
-- 往里贴一条 cookie（`setCookie`）；
-- 给一个 URL，吐出这条请求该带上哪些 cookie（`getCookieHeader(url)`）。
+理想体验一句话就能说清：「我在浏览器里已经登录了，下载工具直接复用这份登录态」。
 
-第二点尤其关键，它是「按域注入」的入口。容器内部会拿请求的 host 去跟每条 cookie 的 domain 做后缀匹配——比如 cookie 的 domain 是 `.youtube.com`，那请求 `www.youtube.com` 就命中——把命中的那些拼成一个 `Cookie:` 请求头交出去。
+问题是浏览器的登录态不是给你下载工具用的。它被加密锁在浏览器各自的私有存储里：Firefox 存在明文 SQLite 里还算厚道；Safari 用一套自有二进制格式 `Cookies.binarycookies`；Chromium 系（Chrome / Edge / Brave / ...）更狠——cookie 值在 SQLite 里是密文，主密钥又被锁进操作系统的密钥环（Linux KWallet / GNOME keyring、macOS keychain、Windows DPAPI）。
 
-> 这一步和第 1 章「可插拔传输层」是衔接关系，那里讲的「中立请求管线 + 多后端竞争」不在这里重复。只需要知道：那个管线管的是「用什么引擎发请求」，而这个 cookie 罐子是挂在那条管线上的一件共享附件——任何一种传输后端发请求前，都可以来罐子里取一句 `Cookie:` 头贴上去。
+这是一道**跨私有存储格式 + 跨 OS 加密方案**的还原难题。本章产出的统一 cookie 容器，最终挂在第 1 章「可插拔传输层」那个中立的 `Request` 上当附件——它把 `Cookie:` 头按域名填好，由 urllib / requests / curl_cffi 任一后端发出去，传输层对此无感。
 
-## 来源五花八门，但都得喂进同一个罐子
+## 2. 核心思想
 
-罐子定了，剩下的问题就是「怎么往里喂」。登录态的来源大致两类：
+**来源异构、产物统一、按域注入。**
 
-- **文件来源**：用户给的 `cookies.txt`；
-- **浏览器来源**：从已安装的浏览器里现抽。
+不管登录态来自 Netscape 文件、Firefox 明文、Safari 二进制、还是被 Chromium 各 OS 密钥环加密的密文——统统坍缩成同一套标准 Cookie 集合；之后任何 URL 来要 cookie，按域名后缀匹配出适用条目，拼成 `Cookie:` 头交出去。
 
-浏览器来源这一支是重点。它有一个分派入口，按浏览器名把活儿派给不同的提取器：Firefox 走 Firefox 的、Safari 走 Safari 的，剩下那一大票 Chromium 系（Chrome / Edge / Brave / Opera / Vivaldi / Whale…）统一走 Chromium 的。这个「按名字路由到不同提取器」的设计，正是后面几条权衡的起点。
+## 3. 心智模型
 
-## Chromium 那一支最麻烦：先按操作系统选解密器
+整个机制拆成三段：**抽 → 装入统一容器 → 注入**。
 
-Firefox 的 cookie 表是明文的，直接读就行；Safari 用的是自家一套二进制格式，得逐字节手写解析器。真正棘手的是 Chromium 系——它的 cookie 是加密的，而且加密方式随操作系统变。
-
-所以 Chromium 提取器内部做的第一件事，是看自己在哪个系统上跑，然后选一个对应的解密器：Linux 一个、Mac 一个、Windows 一个。三个解密器的差别，用一张表说清：
-
-| 系统 | `v10` | `v11` | 其它前缀 |
-|------|-------|-------|---------|
-| Linux | AES-CBC，固定口令 `peanuts` 派生的钥匙 + 空口令兜底 | AES-CBC，钥匙来自系统密钥环 + 空口令兜底 | 未知，告警并跳过 |
-| Mac | AES-CBC，钥匙来自系统 keychain | — | 当作明文「旧数据」直接读 |
-| Windows | AES-GCM，主钥匙存在配置文件里、经 DPAPI 解一层 | — | 直接交 DPAPI 解 |
-
-（顺带一提，Linux 和 Mac 派生钥匙都用 PBKDF2-SHA1、盐 `saltysalt`、16 字节，但 Linux 只迭代 1 次、Mac 迭代 1003 次——这种「同算法不同参数」的差异，本身就是逆向出来、随版本漂移的脆裂点之一。）
-
-注意这张表里「钥匙从哪来」每个格子都不一样，这是最容易搞混的地方，下一节专门讲。
-
-## 多把钥匙轮着试：版本前缀分派 + 候选钥匙兜底
-
-一条加密 cookie 长这样：最前 3 个字节是版本标签（`v10` 或 `v11`），剩下的才是密文。解密器拿到一条记录，先把前 3 字节切出来看是哪个版本，再走对应的解密路子；不认识的版本就告警跳过，不会因为一条坏数据拖垮整批。
-
-真正绕的是「钥匙从哪来」。这里要特别小心一个常见误解：**不是所有 v10 钥匙都来自系统密钥环**。以 Linux 为例（三个解密器里它最能说明问题）：
-
-- Linux 的 **v10 钥匙**，是拿 Chromium 硬编码的一个固定口令 `peanuts`，做一次 PBKDF2 派生出来的。这把钥匙跟系统密钥环一点关系都没有——`peanuts` 就是个写死在 Chromium 代码里的常量，逆向出来的。
-- Linux 的 **v11 钥匙**，才真的去问系统密钥环（KWallet / GNOME keyring）要浏览器的 Safe Storage 口令，再派生。而且这把钥匙是**懒求值**的——只有真碰到 v11 的 cookie 才去跑那趟 D-Bus 查询；没有 v11 cookie，就压根不查，省一次开销。
-
-（对比一下就不难发现，「v10 用密钥环、v11 用密钥环」这种一刀切的说法是错的：Mac 上的 v10 钥匙反而是从 keychain 来的；Windows 的 v10 钥匙存在一个叫 `Local State` 的配置文件里、还得先用系统 DPAPI 解一层。所以得分系统看，不能混为一谈。）
-
-那「多把钥匙轮着试」又是怎么回事？Linux 解密器初始化时其实准备了两把候选钥匙：一把是从 `peanuts` 派生的「正经 v10 钥匙」，另一把是从**空口令**派生的「空钥匙」。解密时它不赌哪把对，而是把两把都喂给一个「挨个试」的函数：第一把先解，解完看结果能不能当成合法文本读出来——能读，就算命中；读不出来，换下一把再试。
-
-这里有个关键点必须分清：**那把空钥匙并不是 v10 主钥匙**。它是 yt-dlp 仿照 Chromium 自己一个 bugfix（解密器注释里引用的那个 `[1]` 提交）额外加的一道兜底——当正经钥匙因为某些原因解不开时，再退一步试试空口令，模拟 Chromium「主钥匙失败就回落到空口令」的行为。命中判据是「能不能当合法文本读」这个启发式，注释也坦白说这跟 Chromium 官方判定不完全一致，理论上存在钥匙错了但恰好解出合法文本的极小概率误判。但它换来的是一件很值钱的事：**完全不需要调浏览器自己的 API，纯文件层 + 系统密钥环就能把明文 cookie 还原出来**。
-
-## 绕开浏览器锁：把数据库复制一份再读
-
-Chromium 的 cookie 存在 SQLite 数据库里。问题来了：浏览器正开着的时候，这个数据库文件是被占用的，直接 `sqlite3.connect` 打开会失败。yt-dlp 的办法很直接——把整个数据库文件复制到临时目录，去打开那个副本。注释里写得很明白：「数据库正在被浏览器用时打不开」。这是个明确的用户体验取舍：宁可多花一次文件复制的 I/O，也不让用户为了下个视频去关浏览器。
-
-## 串起来：抽出来、合并、按域注入
-
-把上面这些件拼起来，主装配链是这样的：
+抽这段最复杂，分四层路由：
 
 ```
-load_cookies(文件, 浏览器)
-   ├─ 文件来源 → 解析 → 喂进 jar A
-   └─ 浏览器来源
-        └─ extract_cookies_from_browser(浏览器名)
-             ├─ firefox → 读明文表 → setCookie
-             ├─ safari  → 逐字节解析二进制 → setCookie
-             └─ chromium → 复制库绕锁 → 按 OS 选解密器
-                          → 逐行：前缀分派 + 多钥匙兜底 → 明文 → setCookie
-   → 把多个 jar 合并成一个统一 jar 返回
+来源描述（浏览器名 + profile + 容器 + 密钥环）
+        │
+        ▼
+┌───────────────────────────┐
+│  来源分派入口              │  按 browser_name 路由
+└──────┬────────────────────┘
+       │
+   ┌───┼────┬─────────┐
+   ▼   ▼    ▼         ▼
+Firefox Safari Chromium-系（chrome/edge/brave/...）
+明文   二进制  按 OS 选解密器（Linux/Mac/Windows）
+       │       │
+       │       ├─ 复制 SQLite 到临时目录（绕过浏览器锁）
+       │       ├─ 读 meta.version（决定是否砍 32 字节哈希前缀）
+       │       └─ 逐行解密：版本前缀分派 + 多密钥兜底
+       ▼       ▼
+   每条 cookie（明文 name/value/domain/path/expires/...）
+        │
+        ▼
+┌───────────────────────────┐
+│  YoutubeDLCookieJar        │  统一容器（继承自 MozillaCookieJar）
+└───────────────────────────┘
+        │
+        ▼  （请求来时）
+URL → 按 host 后缀匹配命中 cookie → 拼成 `Cookie: k=v; ...` 注入请求头
 ```
 
-之后任何请求 URL，容器就按域名后缀匹配，吐出该带的 `Cookie:` 头。一条典型执行轨迹（Windows 上跑 `--cookies-from-browser chrome`）：选 Windows 解密器 → 定位到 Cookies 库 → 复制到临时目录打开绕锁 → 从 `Local State` 读主密钥、用 DPAPI 解出 AES-GCM 主密钥 → 逐行：前 3 字节是 `v10` → 切出 nonce 和认证 tag → AES-GCM 解出明文 → 装进罐子 → 之后请求 `https://www.youtube.com/...` 时按域名命中 → 输出 `Cookie: SID=...; LOGIN_INFO=...`。
+三条不变量贯穿全程：
 
-## 一个最小骨架：演透「来源异构 → 产物统一 → 按域注入」
+1. **主流程只对着一个 cookie 容器说话**，不知道也无需知道登录态来自哪。
+2. **来源解密失败不会中断整批**——某条 cookie 解不出明文就跳过、计入 `failed_cookies`。
+3. **注入只看域名匹配**，不管来源；同一个 jar 既能装文件来源的 cookie，也能装浏览器来源的 cookie，还能用 `_merge_cookie_jars` 把两者合并。
 
-下面这段 TS 把本章要教的抽象骨架演出来：统一的罐子、按浏览器名分派、版本前缀分派 + 多候选钥匙挨个试、最后按域名注入。真实 OS 密钥环解密链（Windows 的 DPAPI、Mac 的 keychain、Linux 的 KWallet/secretstorage）依赖原生系统调用，TS 讲不透，所以这里用一个 mock 的 `decrypt` 占位——它演的是**控制流结构**（换把钥匙结果会变、第一把解不出就试下一把），不是真实密码学。
+## 4. 关键权衡
+
+四条取舍撑起了整个设计。
+
+### 统一产物换来主流程无感，代价是浏览器×OS 适配器矩阵
+
+抽 cookie 的核心选择是：**所有来源最终都坍缩进同一个 `YoutubeDLCookieJar`**——而不是给文件、Firefox、Safari、Chromium 各开一种容器类型。
+
+换来的是主流程只对一个接口说话：`jar.get_cookie_header(url)`，根本不关心登录态怎么来的。下载器、提取器、传输层，谁都不必为 cookie 的来源分叉逻辑。
+
+代价是适配器矩阵爆炸：行是浏览器（Firefox / Safari / Chromium 系若干），列是 OS（Linux / Mac / Windows），其中 Chromium 这一格还要再拆三套解密器。任何新浏览器上线、任何一次浏览器升级改了存储位置或加密方案，都得回这张表里改对应单元。**本质矛盾**是「主流程要单一来源的 cookie」与「真实世界登录态分布在 N 个加密私有存储里」之间的鸿沟——用一张适配器矩阵把它架起来，是这类「统一抽象 + 多后端」问题（第 1 章的可插拔传输就是同构的）的通解骨架。
+
+### 复制数据库换「无需关浏览器」，代价是 I/O 与临时文件管理
+
+读 cookie 数据库时 Chromium/Firefox 都有一个反直觉的选择：**先把 SQLite 文件 `shutil.copy` 到临时目录，再 `sqlite3.connect` 那份副本**。
+
+原因写在源码注释里：浏览器正运行时会锁住 cookie 数据库，直接 `connect` 会失败。两种解法——要求用户关掉浏览器，或者复制一份再读。本设计选了后者。
+
+换来的是「用户无需关闭浏览器」——这件事看起来小，对体验却是实打实的减负（用户压根不该被牵扯进工具的实现细节）。
+
+代价是每次提取要复制整个 SQLite 库的 I/O 开销，外加临时文件的生命周期管理（创建、用完清理、跨进程竞争）。**对立的两头**是浏览器对 cookie 库的独占访问与下载工具要随时读——拿副本绕锁是处理这类「第三方独占资源」的常见招法，用空间换并发自由度。
+
+### 文件层逆向常量换「零浏览器 API 依赖」，代价是版本脆裂
+
+最硬核的选择：**不调用浏览器的任何 API**——不用 Chrome DevTools Protocol、不用 Firefox Remote Debugging、不用任何「问浏览器要 cookie」的官方途径。所有 cookie 都从**原始文件 + 操作系统密钥环 API** 直接解出来。
+
+这意味着大量逆向得来的常量被硬编码进代码：Chromium os_crypt 写在密文前 3 字节的版本标签 `v10` / `v11`、PBKDF2 派生密钥用的盐 `b'saltysalt'`、Linux 上迭代 1 次 vs Mac 上迭代 1003 次、Windows 上 AES-GCM 主密钥存在 `Local State` 的 `os_crypt.encrypted_key` 字段、`meta.version >= 24` 时解出明文要砍掉前 32 字节哈希前缀……
+
+换来的是「完全不依赖浏览器自身 API，纯文件层 + 系统密钥环 API 就能还原明文 cookie」——这条换来的东西非常硬：浏览器不需要开、不需要装、不需要兼容某个调试端口，整套提取在任何静默环境下都能跑。
+
+代价是这些常量随浏览器版本升级极易碎裂。Chromium 元数据 `meta.version >= 24` 要砍哈希前缀、Firefox schema 16 起 expiry 改毫秒要 `/1000`、`MAX_SUPPORTED_DB_SCHEMA_VERSION = 17` 的版本上限告警——这些不是修一次就完的 bug，而是**持续打补丁的承诺**，每升一个大版本维护者都得回来对这张表。**矛盾的两头**是不依赖浏览器进程与浏览器持续变更存储格式——把变更追踪的负担从运行时挪到维护期，是所有直接读第三方私有格式的工具都会撞上的代价。
+
+### 多密钥 + 空口令兜底换「用户无需配置密钥环」，代价是命中靠启发式
+
+Linux 上 Chromium 的 cookie 主密钥来自桌面环境的密钥环（KWallet / GNOME keyring / 纯文本三选一）。解密时一个反直觉的设计是：**初始化时同时派生两把候选密钥**——一把来自固定口令 `peanuts`，一把来自空口令——然后把两把都喂进 `_decrypt_aes_cbc_multi` 逐一尝试，以「能否 UTF-8 解码」作为命中判据。
+
+换来的能力是用户无需告知「我用的是哪个密钥环」：就算 Chromium 主密钥解不出来，回落到空口令派生密钥常常也能解开大部分 cookie（很多发行版的 Chromium 在没设密钥环密码时就是用空口令加密的）。配合「探测桌面环境决定密钥环后端」，整个 Linux 提取链对用户完全透明。
+
+代价有二：一是命中靠**启发式**——「能 UTF-8 解码」并不严格等价于「密钥正确」，理论上存在密钥错误但恰好解出合法 UTF-8 的极小概率误判；二是「探测桌面环境」读 `XDG_CURRENT_DESKTOP` / `DESKTOP_SESSION` 等环境变量，本身脆弱——用户可用 `--keyring` 参数强制覆盖探测，但这就要求用户知道自己在用什么密钥环，又把成本退回给了用户。**底层对立**是「自动适配」与「Linux 桌面生态碎片化」——多候选 + 启发式兜底是处理碎片化生态的通用招法。
+
+## 5. 最小原理演示
+
+下面这段 TS 演示**只演透三件事**：来源分派（统一产物 + 路由）、版本前缀 + 多密钥兜底（解密思路抽象）、按域注入（核心思想最后一公里）。**真实 OS 密钥环解密**（DPAPI / keychain / secretstorage / KWallet D-Bus）强依赖原生系统调用，TS 讲不透，留作 §6 文字执行轨迹；这里用 mock 占位。
 
 ```ts
-// cookiejar.ts —— 演透「来源异构 → 产物统一 → 按域注入」+「前缀分派 + 多钥匙兜底」的骨架
-// 跑法：bun run cookiejar.ts  （bun 原生懂 TS；node 可用 npx tsx cookiejar.ts）
+type Cookie = {
+  name: string;
+  value: string;
+  domain: string;
+  path: string;
+  expires?: number;
+};
 
-interface Cookie {
-  name: string
-  value: string
-  domain: string          // 如 ".youtube.com"
-  encrypted?: Buffer      // 仅 chromium 系才有：v10/v11 密文
-}
+type BrowserName = 'firefox' | 'safari' | 'chrome' | 'edge' | 'brave';
 
-// 1) 统一产物：一个谁都对它说话的 cookie 罐子
+// 统一产物：所有来源最终都进同一个 jar
 class CookieJar {
-  private cookies: Cookie[] = []
-  setCookie(c: Cookie) { this.cookies.push(c) }
+  private cookies: Cookie[] = [];
+  setCookie(c: Cookie) { this.cookies.push(c); }
 
-  // 按域名后缀匹配，吐出该带的 Cookie 头
-  getCookieHeader(url: string): string | null {
-    const host = new URL(url).hostname
-    const hit = this.cookies.filter(c => hostMatches(host, c.domain))
-    return hit.length ? hit.map(c => `${c.name}=${c.value}`).join('; ') : null
+  // 按域注入：host 后缀匹配命中的 cookie 拼成请求头
+  getCookieHeader(url: { host: string; path: string }): string {
+    return this.cookies
+      .filter(
+        (c) =>
+          url.host.endsWith(c.domain.replace(/^\./, '')) &&
+          url.path.startsWith(c.path),
+      )
+      .map((c) => `${c.name}=${c.value}`)
+      .join('; ');
   }
 }
-const hostMatches = (host: string, domain: string) =>
-  host === domain.replace(/^\./, '') || host.endsWith(domain)
 
-// 2) 解密骨架：版本前缀分派 + 多候选钥匙挨个试 + 「能否当合法文本读」当命中判据
-function decryptCookie(blob: Buffer, candidateKeys: Buffer[]): string | null {
-  const prefix = blob.subarray(0, 3).toString('latin1')
-  if (prefix !== 'v10') return null             // 未知前缀：跳过（真实代码里 Mac/Win 的「旧数据」另有处理）
-  const cipher = blob.subarray(3)
-  for (const key of candidateKeys) {
-    const plain = mockAesDecrypt(cipher, key)   // 真实链路：Linux/Mac = AES-CBC，Windows = AES-GCM
-    if (looksLikeText(plain)) return plain      // 命中判据：解出来能当合法文本读
+// 来源分派入口：按浏览器名路由到对应提取器
+function extractFromBrowser(name: BrowserName): CookieJar {
+  if (name === 'firefox') return extractFirefox();
+  if (name === 'safari') return extractSafari();
+  return extractChromiumBased(name); // chrome / edge / brave 共用同一条提取链
+}
+
+// Chromium 系：按 OS 选解密器，逐行解密后装入统一 jar
+function extractChromiumBased(name: BrowserName): CookieJar {
+  const jar = new CookieJar();
+  const decryptor = pickDecryptor(process.platform); // linux / darwin / win32
+  for (const row of mockChromiumEncryptedRows(name)) {
+    if (row.value) { jar.setCookie(row); continue; }   // 少数明文条目直接装
+    const plain = decryptor.decrypt(row.encrypted_value!);
+    if (plain === null) continue;                      // 解不出就跳过，不中断整批
+    jar.setCookie({ ...row, value: plain });
   }
-  return null                                   // 两把都试失败 → 这条作废，不拖垮整批
-}
-// 占位：真实实现里是 AES-CBC / AES-GCM + UTF-8 严格校验；这里只为演示「换把钥匙结果会变」
-const mockAesDecrypt = (cipher: Buffer, key: Buffer) =>
-  Buffer.from(cipher.map((b, i) => b ^ key[i % key.length]))
-const looksLikeText = (b: Buffer) =>
-  ![...b].some(byte => byte < 0x20 && byte !== 0x09)   // 简化：不含控制字符就算「像文本」
-
-// 3) 两个来源各异的提取器
-function firefoxExtractor(): Cookie[] {
-  // Firefox：明文表，无需解密
-  return [{ name: 'SID', value: 'ff-plain', domain: '.youtube.com' }]
-}
-function chromeExtractor(): Cookie[] {
-  const v10Key   = Buffer.from('peanuts')        // 对应 Linux derive_key(b'peanuts')：固定口令派生
-  const emptyKey = Buffer.from('empty-pw')       // 对应 derive_key(b'')：空口令派生（真实仍是 16 字节，此处简化）
-  const blob = Buffer.concat([Buffer.from('v10'), Buffer.from('login-secret')])  // mock 一条 v10 密文
-  return [{
-    name: 'LOGIN_INFO',
-    value: decryptCookie(blob, [v10Key, emptyKey])!,   // 正经钥匙先试，空口令兜底
-    domain: '.youtube.com',
-  }]
+  return jar;
 }
 
-// 4) 装配入口：文件 + 浏览器，合并进同一个罐子
-function loadCookies(opts: { file?: Cookie[]; browser?: 'firefox' | 'chrome' }): CookieJar {
-  const jar = new CookieJar()
-  opts.file?.forEach(c => jar.setCookie(c))
-  if (opts.browser === 'firefox') firefoxExtractor().forEach(c => jar.setCookie(c))
-  if (opts.browser === 'chrome')  chromeExtractor().forEach(c => jar.setCookie(c))
-  return jar
+interface Decryptor { decrypt(blob: Buffer): string | null }
+
+// Linux 解密器：版本前缀分派 + 多密钥兜底
+class LinuxChromiumDecryptor implements Decryptor {
+  private v10Key = pbkdf2('peanuts', 'saltysalt', 1, 16);
+  private emptyKey = pbkdf2('', 'saltysalt', 1, 16);
+
+  decrypt(blob: Buffer): string | null {
+    const version = blob.subarray(0, 3).toString('ascii');
+    const ciphertext = blob.subarray(3);
+    if (version !== 'v10') return null;                // 未知版本前缀直接放弃
+    for (const key of [this.v10Key, this.emptyKey]) {  // 两把候选密钥逐一尝试
+      const plain = aesCbcDecrypt(ciphertext, key);
+      try { return plain.toString('utf8'); }           // 能 UTF-8 解码即视为命中
+      catch { /* 这把不对，换下一把 */ }
+    }
+    return null;
+  }
 }
 
-// 5) 演示按域注入
-const jar = loadCookies({ browser: 'chrome' })
-console.log(jar.getCookieHeader('https://www.youtube.com/watch?v=dQw4w9WgXcQ'))
-// → "LOGIN_INFO=..."   （host www.youtube.com 命中 domain .youtube.com）
-console.log(jar.getCookieHeader('https://example.org/'))
-// → null               （域名不匹配，不带 cookie）
+function pickDecryptor(platform: string): Decryptor { /* 省略 Mac/Win 分派 */ }
+
+// 顶层装配：多来源合并进同一个 jar
+function loadCookies(spec: { file?: string; browser?: BrowserName }): CookieJar {
+  const jars: CookieJar[] = [];
+  if (spec.file) jars.push(extractFromNetscapeFile(spec.file));
+  if (spec.browser) jars.push(extractFromBrowser(spec.browser));
+  return mergeJars(jars);                               // 合并成唯一返回容器
+}
+
+// 演示按域注入：用户在浏览器里登过 youtube
+const jar = loadCookies({ browser: 'chrome' });
+const header = jar.getCookieHeader({ host: 'www.youtube.com', path: '/watch' });
+// → "SID=...; LOGIN_INFO=...; VISITOR_INFO=..." 交给中立 Request 当 Cookie 头
 ```
 
-配套最小 `package.json`：
+每个块对应一个原理点：`CookieJar` 是统一产物；`extractFromBrowser` 是来源分派入口；`LinuxChromiumDecryptor.decrypt` 实现版本前缀分派 + 多密钥兜底；`getCookieHeader` 落实按域注入。**绕锁、OS 密钥环调用、Safari 二进制解析**全用 mock / 省略号带过——它们是工程细节，不是原理。
 
-```json
-{ "name": "cookiejar-demo", "private": true, "type": "module" }
-```
+## 6. 执行轨迹
 
-这段骨架演的是权衡 1（统一产物 + 分派）和「前缀分派 + 多钥匙兜底」的控制流；权衡 2 的「复制绕锁」用注释带过，因为它只是个文件操作，没有值得演的结构。
+拿一个具体输入走一遍：用户在 Windows 上跑 `--cookies-from-browser chrome`，要下载一个登录后才能看的 YouTube 视频。
 
-## 关键权衡
+1. **顶层装配**：`load_cookies(cookie_file=None, browser_specification=('chrome',))` 进入 `extract_cookies_from_browser('chrome', ...)`。
+2. **来源分派**：`chrome` ∈ `CHROMIUM_BASED_BROWSERS` → 进入 `_extract_chrome_cookies`。
+3. **定位存储**：按 Windows 约定找到 `%LOCALAPPDATA%\Google\Chrome\User Data\Default\Network\Cookies`。
+4. **绕锁**：`_open_database_copy` 把这个 SQLite 库 `shutil.copy` 到临时目录，对副本 `sqlite3.connect`——浏览器此刻可能正开着、原始库被锁，但副本不受影响。
+5. **取主密钥**：读同目录 `Local State` JSON 里的 `os_crypt.encrypted_key`，base64 解码、校验 `DPAPI` 前缀，调 Windows DPAPI `CryptUnprotectData` 解出 AES-GCM 主密钥（32 字节）。
+6. **按 OS 选解密器**：`get_cookie_decryptor('win32', ...)` 返回 `WindowsChromeCookieDecryptor`，持上一步的主密钥；同时读 `meta.version` 决定后续是否砍 32 字节哈希前缀。
+7. **逐行解密 cookie 表**：`SELECT host_key, name, path, encrypted_value, expires_utc, ... FROM cookies` —— 对每行：
+   - 加密判定：明文 `value` 为空且 `encrypted_value` 非空 → 是加密的。
+   - 取 `encrypted_value[:3]` = `b'v10'` → 进入 AES-GCM 路径。
+   - 切出 nonce（前 12 字节）与认证 tag（末 16 字节），用主密钥解出明文。
+   - 检查 `meta.version >= 24`：若是，砍掉明文前 32 字节哈希前缀。
+   - 解出明文 `value`（如 `SID=xxxxxxxx`）→ `jar.set_cookie(...)`。
+8. **装入统一容器**：所有解出的 cookie 进同一个 `YoutubeDLCookieJar`。
+9. **请求注入**：下载流程要请求 `https://www.youtube.com/watch?v=xxxx` → `jar.get_cookie_header(url)` 内部构造一个 urllib `Request` 载体、调 `add_cookie_header` 让标准库按域名匹配填好头、取出 `Cookie` 头（如 `SID=...; LOGIN_INFO=...; VISITOR_INFO=...`）→ 这串头被第 1 章那个中立的 `Request` 对象收下，由具体传输后端发出去。
 
-理解了机制，回头看这几条设计到底换来了什么、又付了什么代价。
+闭环是「探测 → 定位 → 绕锁 → 解密 → 装入 → 注入」，每一步都对应核心思想里的一环。
 
-**1. 统一产物 + 来源分派入口**
-- **选择**：所有来源都落进同一个 `YoutubeDLCookieJar`，再用一个按浏览器名路由的分派入口。
-- **换来**：主流程只对着一个 cookie 容器说话，根本不需要知道登录态来自文件还是哪个浏览器；后续的注入逻辑（按域匹配）也只需要写一套。
-- **代价**：得为「浏览器 × 操作系统」维护一整张异构适配器矩阵——Firefox 明文表、Safari 自有二进制、Chromium 还要再按 Linux/Mac/Windows 三套密钥方案。每加一个浏览器或换一个 OS，都要新写或改动一条提取/解密路径。
+## 7. 教学简化说明
 
-**2. 把数据库复制到临时目录再读**
-- **选择**：不请求用户关闭浏览器，而是把整个 SQLite 库复制到临时目录后打开副本。
-- **换来**：浏览器正开着、数据库被锁也能读 cookie，用户体感「无感」——下个视频不必先关浏览器。
-- **代价**：每次提取都要复制整个库的 I/O 开销，外加临时文件的生命周期管理（用完得清理）。源码里 Windows 上碰到 `PermissionError errno 13` 还会单独给 issue 链接并退出，说明开发者把「浏览器可能正开着」当常态，连报错路径都为它设计。
+本章演示故意省略了：真实 OS 密钥环解密链（Windows DPAPI 的 `CryptUnprotectData`、macOS keychain 的 `security find-generic-password`、Linux 上 KWallet 的 `dbus-send` + `kwallet-query` 和 GNOME 的 `secretstorage` D-Bus 调用）、Safari `Cookies.binarycookies` 的字节级四层解析器（header / page / record）、PBKDF2 / AES-CBC / AES-GCM 的密码学实现、Netscape `cookies.txt` 7 列格式与 `#HttpOnly_` 前缀、宽泛 Set-Cookie 解析器的字符级容错、Firefox `originAttributes` 容器筛选与 schema 16 毫秒 expiry 的兼容分支、多 profile 取最新 `st_mtime` 的细节。这些是工程脚手架，不是原理。
 
-**3. 解密常量靠逆向硬编码 + 多钥匙/空口令兜底**
-- **选择**：完全绕开浏览器自己的 API，纯文件层 + 系统密钥环 API 还原明文 cookie；解密需要的常量（版本前缀 `v10`/`v11`、派生盐 `saltysalt`、迭代次数、那个固定口令 `peanuts`）全是逆向 Chromium 源码硬编码进来的；解密时还多备一把空口令钥匙挨个试。
-- **换来**：不依赖浏览器进程、不依赖任何浏览器扩展或官方导出接口，跨机器可移植；只要文件和系统密钥环在，就能解。
-- **代价**：这些常量随浏览器版本升级极易碎裂——元数据版本号到 24 就得砍掉解密结果前 32 字节的哈希前缀（App-Bound Encryption 的后续变更）、Firefox schema 16 起 expiry 改毫秒要 `/1000`、还设了 schema 版本上限告警。源码里散落的大量 chromium/firefox commit 链接，正是持续打补丁的痕迹——浏览器一升级，这些路径随时可能失效。
+## 8. 小结
 
-**4. 探测桌面环境再决定密钥环后端（Linux）**
-- **选择**：Linux 上先读 `XDG_CURRENT_DESKTOP` / `DESKTOP_SESSION` 等环境变量判断桌面环境（KDE / GNOME / 纯文本），再映射到 KWallet / GNOME keyring / 无密钥环三条取密钥路径；也允许用户用 `--keyring` 手动覆盖。
-- **换来**：Linux 上自动适配三种主流密钥存储，多数用户不用管密钥环是什么。
-- **代价**：探测逻辑强依赖环境变量，很脆弱——用户处在非典型桌面、远程会话、或自定义 XDG 设置下，很容易探测错；而且浏览器本身支持用命令行参数强制指定密钥存储、从而绕过环境变量，一旦如此，yt-dlp 的自动探测就会扑空，只能靠用户手动告知用哪个密钥环。
-
-## 小结
-
-一句话收束本章：**来源异构、产物统一、按域注入**。Firefox 的明文、Safari 的二进制、Chromium 在三个 OS 上各自的加密方案，最后都坍缩成同一个 cookie 罐子；罐子再按请求的域名，把对得上号的 cookie 拼成 `Cookie:` 头注入。其中最容易踩的坑，是别把「v10 钥匙」一律当成「来自密钥环」——Linux 上 v10 用的是硬编码的 `peanuts`，密钥环口令只喂给 v11。
-
-下一章会看到 YoutubeDL 编排器怎么把这个 cookie 罐子当作一项横切关注点，挂到贯穿提取→下载→后处理的主管线上去。
+用户只看到「我在浏览器里登过」，主流程只看到一个统一容器——背后那张浏览器×OS 适配器矩阵和那一堆随版本脆裂的逆向常量，就是这个简洁对外接口要持续付的代价。下一章会看到，这个容器被 `YoutubeDL` 编排器收编，和 urlopen 门面、进度钩子、归档去重等横切关注点一起，由编排器塞进每一个发出的请求。

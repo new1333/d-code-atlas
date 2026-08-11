@@ -1,206 +1,180 @@
 # 一源多格式通吃所有 JS 运行时
 
-## 四种消费者，各报各的错
+> 本章属于 system 层。前置：函数工厂与无 this 的方法、一张 Events 映射派生全 API 类型。
+> 学完你能：用一句话讲清「为什么一份 TS 源码要让四种消费者各拿各的产物，以及靠条件映射做路由时付出的是什么代价」。
 
-想象你写好一个小巧的事件发射器，往 npm 一发，以为万事大吉。结果用户的反馈炸成四片：
+## 1. 为什么需要它（设计动机）
 
-- 有人 `require('mitt')` 引不到东西，报「入口找不到」；
-- 有人用打包器 `import mitt from 'mitt'`，tree-shaking 失效——打包器吃到的是 CommonJS 版本，没法把没用的代码摇掉；
-- 有人想直接在页面里 `<script src="...">` 引入，却发现 `mitt` 这个名字根本没挂到 `window` 上；
-- 还有人在编辑器里 import，类型检查器红波浪线报「找不到类型声明」。
+前八章把 mitt 的运行时机制和类型派生都讲透了——上一章刚讲完「条件类型区分可选载荷事件」，源码层面已经无可再加。但合上源码、要发布出去时，留下的最后一个口子是：**怎么让这一份逻辑，被四个年代的运行时各自无摩擦地用上**。本章正是这道发布层的适配。
 
-你的函数明明没问题。这四种报错，根子全在「JS 这个生态，从来就没有一个统一的『库该怎么被用』的标准」。不同年代、不同环境的工具，各认各的入口、各读各的字段。
+把源码发到 npm，下面四种消费者会各报各的错：
 
-本章要讲的，就是在这份已经造好的函数（前面几章那个靠闭包、不靠 `this` 的 `mitt()` 工厂）和全世界各种运行时之间，再加一道**纯发布层的适配**：把同一个导出包装成几套不同的模块外壳，再给每种消费者标好它该走哪个门。前面那些章讲的是「这函数怎么造」，这一章讲的是「造好的东西怎么递给全世界」。
+- 用 `require` 的老 Node 脚本——它要的是 CommonJS，拿到 ES 模块就 `SyntaxError`；
+- 用 `import` 的现代打包器——它要的是 ESM，吃到 CommonJS 就 tree-shaking 失效；
+- 浏览器里 `<script>` 直接引入——它没有模块系统，要的是 UMD，能挂到 `window.mitt`；
+- 类型检查器——它要的是 `.d.ts` 类型声明，找不到就报「找不到类型定义」。
 
-## 同一个函数，说三种方言
+JS 生态从来没有统一的「库如何被消费」标准。ES 模块、CommonJS、UMD、类型声明各自为政；不同年代的工具读不同的字段。要成为「生态公民」被所有运行时无摩擦消费，就必须在发布层加一道**纯运行时之外的适配层**——它不改 mitt 的运行时形态（前八章定下来的东西一行不动），只决定「这份逻辑被装进哪种模块外壳、交到哪种消费者手里」。
 
-要适配，先得搞清楚消费者到底在期待什么。它们期待的，其实是**模块外壳**——也就是「这个文件第一行用哪种语法把东西交出来」。同一个 `mitt`，至少要会三种方言。
+## 2. 核心思想
 
-**ES 模块（ESM）方言**，开头这么写：
+一次编译出三套模块外壳（ESM / CJS / UMD），再靠包清单里的**条件映射**，让每个运行时敲门时自动领走它认的那一份。
 
-```js
-export default function mitt() { /* ... */ }
-```
+## 3. 心智模型
 
-这是现代标准。打包器（webpack、Vite、Rollup）和较新的 Node 都用它。它最大的好处是「静态可分析」——打包器能看清谁导出了什么，没用到就能摇掉，这就是 tree-shaking 的前提。
+整个适配层就两个东西：一份产物池、一张路由表。
 
-**CommonJS（CJS）方言**，长这样：
+**产物池**——同一条构建命令从 `src/index.ts` 一次产出三份物理文件，每份被套上不同模块语义的外壳：
 
-```js
-module.exports = mitt;
-```
+| 文件 | 模块语义 | 一句话外壳 |
+|------|----------|------------|
+| `dist/mitt.mjs` | ES Module | `export default mitt` |
+| `dist/mitt.js` | CommonJS | `module.exports = mitt` |
+| `dist/mitt.umd.js` | UMD | 探测到模块系统就交给它，否则挂到全局 `window.mitt` |
 
-这是 Node 的老传统。凡是 `require('mitt')` 的代码，期待拿到的就是这种「把值挂到 `module.exports` 上」的文件。老项目、老 Node、一大堆历史包袱都在用它。
+外加一份 `index.d.ts`——类型声明产物，给类型检查器读的。
 
-**UMD 方言**，开头是一坨看着吓人、其实就干一件事的代码：
+注意被包装的是**同一个** default export 函数。第 2 章「函数工厂与无 this 的方法」里那个 `mitt()` 一旦被调用，三份产物里的行为完全一致；不一样的只是「这函数是怎么被装进调用者手里的」。
 
-```js
-(function (g) {
-  // 探测当前环境：是 CommonJS？是 AMD？都没有？那就是浏览器，挂到全局
-  if (typeof exports === 'object' && typeof module !== 'undefined')
-    module.exports = mitt;
-  else
-    g.mitt = mitt;
-})(typeof self !== 'undefined' ? self : this);
-```
+**路由表**——`package.json` 里的 `exports` 字段就是这张表。消费者敲门时带着「我是什么环境」的条件（`import` / `require` / `types` / 什么都没带），路由表按字段书写的先后顺序逐个匹配，第一个命中的条件指向哪份产物，就把哪份产物交出去。
 
-说人话就是：**UMD 是个自带环境检测的万能插座**。它不指望消费者有模块系统，自己伸手去探——探测到 CommonJS 就按 CommonJS 给，探测到什么都没有（比如一个老浏览器页面）就把 `mitt` 挂到全局对象（`window`/`self`）上。所以一条 `<script src>` 进来，`window.mitt` 就有了。
+不认 `exports` 的旧工具怎么办？还有一组更老的扁平字段兜底——`main`、`module`、`typings`——它们直接说「CommonJS 走这里」「ESM 走这里」「类型走这里」，没有条件判断，照着读即可。
 
-三套外壳，里子是同一个函数，区别只在「用哪种语法把函数递出去」。
+## 4. 关键权衡
 
-## 一条命令，一次产三壳
+### 双轨入口换来新旧工具通吃，代价是手工对齐的隐性耦合
 
-那这三份文件从哪来？答案出乎意料地简单——**一条构建命令**：
+`package.json` 里同时保留了两套入口字段：
 
 ```json
-"bundle": "microbundle -f es,cjs,umd"
+{
+  "main":    "dist/mitt.js",
+  "module":  "dist/mitt.mjs",
+  "typings": "index.d.ts",
+  "exports": {
+    "types":   "./index.d.ts",
+    "import":  "./dist/mitt.mjs",
+    "require": "./dist/mitt.js",
+    "default": "./dist/mitt.mjs"
+  }
+}
 ```
 
-`-f es,cjs,umd` 就是「formats = ESM、CJS、UMD」。这条命令拿**单一源文件** `src/index.ts`，一次性吐出三份产物：
+上面那一组扁平字段（`main`/`module`/`typings`）是更早年代的入口约定，没有条件判断能力；下面那一组 `exports` 才是现代条件映射。两套同时存在，换来的是「新版打包器、新版 Node 走 `exports` 精确匹配；老 Node、老工具退回去读扁平字段兜底」——两代生态都能无摩擦消费。
 
-- `dist/mitt.mjs` —— ESM 版（`.mjs` 后缀）
-- `dist/mitt.js` —— CJS 版（`.js` 后缀）
-- `dist/mitt.umd.js` —— UMD 版（`.umd.js` 后缀）
+代价是一份隐性耦合：两套字段必须**手工指向一致**。指向 ES 产物的字段散落在 `module`、`exports.import`、`exports.default` 多处；指向 CommonJS 的有 `main`、`exports.require`。任意一处错位，工具会静默解析到错误产物，不报错——`module` 指到 CJS 文件就 tree-shaking 失效，`require` 指到 ESM 文件就运行时 `SyntaxError`，且都是「发布出去之后用户那边才暴露」。
 
-文件名是「包名 + 格式后缀」拼出来的，由打包器按约定命名。被包装的，始终是那个唯一的 `export default function mitt`——前面第 2 章讲过的函数工厂。**它的运行时形态一个字都没变**，变的只是外面这层模块壳。换句话说，分发不改造函数，只是给它换不同的「出门衣服」。
+**化解的本质矛盾**：新生态需要条件映射的精确性，旧生态只认扁平字段——同一份包要同时被两代工具认出来，就只能背两套字段、自己保证一致。这不是 mitt 的特殊选择，而是任何想跨年代存活的 JS 库都要吃的税。
 
-为了看清「一源三壳」到底长什么样，这里写一份从零模拟的极简产物，每份就一行外壳语句：
+### 类型声明作为构建产物自动生成，代价是类型对齐质量交给打包器
 
-```js
-// 三份产物的「外壳」各长什么样（真实产物由打包器生成，这里只示意其首行语句）
-const products = {
-  'index.d.ts':    'declare const mitt: () => Emitter',          // 类型外壳：给类型检查器看
-  'dist/mitt.mjs': 'export default function mitt(){}',           // ESM 外壳：给打包器 import
-  'dist/mitt.js':  'module.exports = mitt',                      // CJS 外壳：给 Node require
-  'dist/mitt.umd.js': '(g=>{g.mitt=mitt})(typeof self<"u"?self:this)', // UMD 外壳：给浏览器 <script>
-};
+仓库里看不到手工维护的 `index.d.ts`——它被 `.gitignore` 显式忽略：
+
+```json
+// .gitignore
+/index.d.ts
+/dist
 ```
 
-同一份逻辑，四种「递出去」的方式。接下来的问题就是：消费者来了，怎么让它**自动领到对的那一份**？
+类型声明是构建时由 `microbundle` 从 `src/index.ts` 自动生成出来的，发布时跟着 `dist/` 一起进 npm 包。`tsconfig.json` 设了 `noEmit:true`，项目自己的 tsc 根本不产出任何文件——声明完全由打包器接管。发布白名单因此只需写两行：
 
-## 条件映射：一张登记表分发所有敲门者
+```json
+"files": ["dist", "index.d.ts"]
+```
 
-把 `package.json` 里的 `exports` 字段想象成酒店前台的一张**登记表**。消费者来敲门时，会报上自己的身份（「我是来 require 的」「我是来 import 的」「我是来找类型的」），前台就照着这张表，按顺序往下核对，**第一个对得上的身份，就把对应的房间钥匙（产物文件）发给他**。
+换来的是源码仓库纯净（类型声明不和源码抢版本控制空间）、类型自动随构建刷新（不会出现「源码改了类型没跟上」）、发布清单极简。
 
-这张表长这样：
+代价是类型与实现的对齐质量**完全交给打包工具**。源码里加了一个新导出，打包器若没正确识别、`.d.ts` 就会少一项，类型检查器看到的是「类型与实现不一致」——且这种漂移在源码仓库里看不见（声明根本没入库），只在用户那边导入时才暴露。
+
+**化解的本质矛盾**：源码仓库要纯净、类型声明又要随源码变化保持新鲜——把声明当成「源码的编译产物」而非「源码的兄弟文件」就同时满足了两者，代价是把生成正确性的责任压到工具链上。这和「把锁文件提交进版本控制」恰好相反：声明主动选择不入库，是因为它「能被自动重建」。
+
+### `types` 钉在 `exports` 首位换来类型检查稳定命中，代价是一条隐性硬约束
 
 ```json
 "exports": {
-  "types":   "./index.d.ts",
-  "module":  "./dist/mitt.mjs",
+  "types":   "./index.d.ts",   // 必须排在第一位
   "import":  "./dist/mitt.mjs",
-  "require": "./dist/mitt.js",
-  "default": "./dist/mitt.mjs"
+  "require": "./dist/mitt.js"
 }
 ```
 
-左边的 `types`/`import`/`require` 叫**条件**（消费者是什么身份），右边是对应的产物文件。整个路由的心智模型可以压成几步：
+TypeScript 解析 `exports` 时**按顺序逐个匹配**——`types` 必须出现在 `import`、`require` 之前，否则类型声明被静默忽略、且没有任何报错。这是 TypeScript 解析 `exports` 时的强制要求，但 `package.json` 里没有任何注释提示这个顺序约束。
 
-1. 消费者带着「我满足哪些条件」来敲门；
-2. 工具读这张 `exports` 表；
-3. **按表里条件键书写的先后顺序，从上往下一个个试**——注意，是「按顺序试」，不是「谁优先级最高」；
-4. 命中第一个满足的条件，返回它指向的文件，结束；
-5. 如果是个老工具、根本不认 `exports` 这张表，就退回去读另一套老字段兜底（下一节讲）。
+换来的是「类型检查器最先敲到 `types`、拿到声明产物就退场」，不让运行时条件意外遮蔽类型条件。
 
-这里最容易踩的坑是第 3 步：匹配是**有序的**，键写在前面就先被试。下面这段解析器把这个「有序匹配」原原本本演出来：
+代价是一条**隐性硬约束**——后人若把 `import` 提到 `types` 前面（看起来更「自然」），类型解析会静默失败：IDE 提示消失、`tsc` 报「找不到类型定义」，但 `package.json` 本身读起来毫无问题。读者回头审视上面三段权衡，会发现「静默失败且无报错」是这套适配层的共通代价——路由逻辑全靠约定，约定一旦违反没有任何兜底。
 
-```js
-// 一张条件映射表（顺序即优先级，从上往下试）
-const exportsField = {
-  types:   './index.d.ts',
-  module:  './dist/mitt.mjs',
-  import:  './dist/mitt.mjs',
-  require: './dist/mitt.js',
-  default: './dist/mitt.mjs',
-};
+**化解的本质矛盾**：同一个 `exports` 既要被运行时（Node、打包器）读，又要被类型检查器读——而类型检查器是「按顺序匹配第一个命中」的简单逻辑，要让它可靠命中类型，就只能把类型条件钉在第一位，让运行时条件退居其后。
 
-// 解析器：消费者带来「它能满足的条件列表」，按键书写顺序逐个试，命中第一个就返回
-function resolve(conditions) {
-  for (const key in exportsField) {        // ← 关键：按 exportsField 里键的书写顺序
-    if (conditions.includes(key)) {        //   消费者满足这个条件吗？
-      return exportsField[key];            //   满足 → 返回它指向的产物，停止
-    }
+## 5. 最小原理演示
+
+下面这段代码不真的去跑打包器——打包器只是「生产产物」的手段，不是本章的原理。本章的原理是「**条件映射如何路由**」，一个纯逻辑函数。
+
+```ts
+// 三份 mock 产物，每份一行，演「同一逻辑入口的三套模块外壳」
+const artifacts = {
+  esm:   `export default mitt`,
+  cjs:   `module.exports = mitt`,
+  umd:   `typeof window!=='undefined' && (window.mitt = mitt)`,
+  types: `declare const mitt: () => void`
+}
+
+// 包清单里的「条件映射路由表」——有序对象，键书写顺序即匹配顺序
+const pkgExports = {
+  types:   artifacts.types,   // 类型条件必须排在首位
+  import:  artifacts.esm,     // 现代打包器 / Node ESM
+  require: artifacts.cjs,     // Node CJS
+  default: artifacts.esm      // 啥都不带的兜底
+}
+
+// 扁平入口字段——给不认 exports 的旧工具做兜底
+const flatEntries = {
+  main:    artifacts.cjs,
+  module:  artifacts.esm,
+  typings: artifacts.types
+}
+
+// 路由函数：输入「消费者带来的条件」，输出命中的产物
+function resolveArtifact(consumerConditions: string[]): string {
+  // 按 exports 键书写顺序逐个匹配，命中第一个就返回
+  for (const [condition, artifact] of Object.entries(pkgExports)) {
+    if (consumerConditions.includes(condition)) return artifact
   }
-  return exportsField.default;             // 全都不满足 → 走 default 兜底
+  // 旧工具没带任何条件、或不认 exports，退回扁平字段
+  return flatEntries.main
 }
 
-// 三种「带模块系统」的消费者，各带不同条件来敲门：
-resolve(['types']);                 // → index.d.ts   类型检查器（types 在表里第一位，最先命中）
-resolve(['import']);                // → mitt.mjs     打包器 / 现代 Node（ESM）
-resolve(['require']);               // → mitt.js      Node require（CJS）
+// 四种消费者敲门——演「同一逻辑入口、按条件分流到不同物理产物」
+resolveArtifact(['require'])   // → module.exports = mitt
+resolveArtifact(['import'])    // → export default mitt
+resolveArtifact(['types'])     // → declare const mitt...
+resolveArtifact([])            // → module.exports = mitt（旧工具兜底）
 ```
 
-「同一次敲门，三个出口」，路由的活就干完了。
+把四份输出放在一起看，最直观地体现了核心思想：**敲门时带的条件不同，领到的产物就不同**；产物本身的内容早在构建时就定型了，路由层只决定「选哪份」。
 
-不过有个细节必须挑明：**浏览器的 `<script>` 这条出口，根本不走 `exports` 这张表。** 因为 `<script>` 没有模块系统，它也不会带任何「条件」来敲门——它只是直接拼一个文件网址（比如从 CDN 拉 `dist/mitt.umd.js`），把文件下载下来执行。正因为有这么一类「连模块系统都没有」的消费者无法被条件映射路由，UMD 这种「自带检测、自挂全局」的外壳才有存在的必要。它是给 `<script>` 这种裸环境准备的万能插座，和 `exports` 是两套并行的机制。
+## 6. 执行轨迹
 
-## 给老工具留的后门
+四种消费者依次敲门：
 
-`exports` 这张表虽好，但它是个**比较新的标准**。早些年的 Node、老的打包器、一些陈旧工具，压根不认识 `exports` 字段。如果只有这一张表，这些老工具会直接抓瞎。
+- **Node `require('mitt')`** → Node 带 `['require']` 条件 → `exports` 按顺序匹配：`types` 不命中、`import` 不命中、`require` 命中 → 拿到 `dist/mitt.js`（`module.exports = mitt`）→ `require()` 返回这个对象，调用方拿到 `mitt` 函数。老版 Node 不认 `exports`，退回去读 `main`，同样指向 `dist/mitt.js`，结果一致。
+- **打包器 `import mitt from 'mitt'`** → 打包器带 `['import']`（或更宽泛的模块解析条件）→ 命中 `import` → 拿到 `dist/mitt.mjs`（`export default mitt`）→ 打包器把这份 ESM 喂进依赖图，可以静态分析、做 tree-shaking。
+- **浏览器 `<script src=".../mitt.umd.js">`** → 没有模块系统、没条件可带 → 直接加载 UMD 产物 → UMD 在加载时自适配探测：发现 `module`、`exports` 就走 CommonJS 协议；都没有就把 `mitt` 挂到 `window`。用户在 console 里敲 `window.mitt` 就拿到函数。
+- **类型检查器 `tsc`** → 带 `['types']` 条件 → 命中位于首位的 `types` → 拿到 `index.d.ts` → 后续 `import` 语句的类型检查都基于这份声明。
 
-所以 `package.json` 里还平行摆着一套**扁平入口字段**，作为老工具的后门：
+整个流程的关键是：**四条出口都在同一次「找包」动作里被分流**，没有运行时分支判断；分流发生在构建时（产物被预先包装好）和解析时（路由表把敲门条件映射到产物文件名）。
 
-```json
-"main":          "dist/mitt.js",       // 最老的公约字段，Node require 的兜底入口（CJS）
-"module":        "dist/mitt.mjs",      // 打包器约定，指向 ESM 版
-"typings":       "index.d.ts",         // 类型声明的老字段名
-"jsnext:main":   "dist/mitt.mjs",      // 早期 Rollup 推广 ESM 用的字段，现已被 module 取代，留着只为兼容
-"umd:main":      "dist/mitt.umd.js",   // 打包器私用：标明 UMD 入口在哪
-"source":        "src/index.ts",       // 打包器私用：标明「源」入口在哪
-```
+## 7. 教学简化说明
 
-这里要分清两类字段。`main`、`module`、`typings`、`exports` 是 **npm/Node 公认的公约字段**，谁来了都读；而 `jsnext:main`、`umd:main`、`source` 是**打包器（microbundle）私有的约定字段**，只有它自己读，用来定位「UMD 入口」和「源入口」。读者看到这些奇奇怪怪的字段别慌——它们不是 npm 标准，是工具之间的暗号。
+本章演示故意省略了：
 
-于是这个库的发布策略就成了「两套并行」：新工具认 `exports`，按条件精确分流；老工具不认 `exports`，退回去各读各的扁平字段兜底。两套都摆上，谁都不落空。
+- 真正的打包工具链（microbundle 如何调度转译、压缩、模块封装，与原理无关）；
+- ESM 与 CJS 在 Node 里互操作时的 dual-package hazard（mitt 是纯函数无副作用、影响极小）；
+- UMD 探测全局的完整逻辑（演示里只写了一行挂 `window`，真实 UMD 还要兼容 AMD/CommonJS）；
+- IE9+ 兼容所需的 polyfill 细节、CDN 版本与缓存语义、`.npmignore` 与 `files` 的发布白名单机制。
 
-## 类型这条路，必须排第一
+## 8. 小结
 
-回头看 `exports` 表最上面一行——`"types": "./index.d.ts"` 它是**故意**写在第一位的。这不是排版好看，是一条隐性硬规则：**`types` 条件必须排在所有其他条件之前**。
+mitt 的运行时机制和类型派生前面都讲透了，最后这一章只多了一件事：把同一份逻辑装进三套模块外壳，再用一张有序的条件映射让每种运行时敲门时领走自己认的那一份。多格式的代价不在运行时，全在发布层的「字段对齐」和「顺序约束」这些隐性耦合里——错了不报错，只在用户那边暴露。
 
-为什么？类型检查器（比如 TS）来敲门时，它其实同时满足好几个条件——它既能 `import`，也要找 `types`。解析器按顺序从上往下试，**谁写在前面谁先命中**。把 `types` 放第一位，类型检查器才会最先命中类型声明文件；要是把它放到 `import` 后面，类型检查器会先命中 `import` 那行，拿到一个 `.mjs` 文件——那里面没有类型信息——于是类型声明被静默跳过，TS 报「找不到类型」，却**没有任何报错会指向这个顺序问题**。
-
-用一段反例把这个坑演透：
-
-```js
-// 反例：把 types 写到 import 后面，会出什么事？
-const brokenExports = {
-  import: './dist/mitt.mjs',   // ← 排到了前面
-  types:  './index.d.ts',      // ← 排到了后面
-};
-
-// 类型检查器敲门时，它「同时满足」import 和 types（它本来就是个会 import 的 TS）
-// 有序匹配 → 第一个命中 import → 返回 mitt.mjs（一个没有类型信息的运行时文件）
-// 类型声明被静默忽略，TS 报错却没人能想到是顺序问题
-resolve(['import', 'types']);   // → ./dist/mitt.mjs   （拿错了！要的是 .d.ts）
-```
-
-把 `types` 挪回第一位，同一个消费者就会先命中 `types`，拿走 `.d.ts`。一字之差，静默成败。
-
-这里还要顺手纠正一个常见的误解。这份 `index.d.ts` **不是手工长期维护的源文件，而是构建自动生成的产物**。几个证据摆在一起就看明白了：它被 `.gitignore` 显式忽略、没进版本控制；项目的 `tsconfig.json` 设了 `noEmit: true`（意思是「类型检查归类型检查，但 tsc 不许产出任何文件」）；scripts 里也没有任何单独的「生成类型声明」命令。所以这个声明多半是打包器在跑那条 `microbundle -f es,cjs,umd` 时，顺手从 `src/index.ts` 生成的。它和三份运行时产物一样，是构建的副产物——这恰恰解释了为什么发布清单（`files` 字段）里只要写上 `dist` 和 `index.d.ts` 两样就够了。
-
-## 关键权衡
-
-这一章机制密集，集中展开下面这几条核心权衡。
-
-**权衡一：同时摆两套入口字段（现代 `exports` + 老扁平字段），换来「新旧生态全部无摩擦消费」，代价是「指向一致性得手工维护，错位会静默失败」。**
-
-库作者大可只写 `exports` 一张表，干净、现代，但那样老 Node、老打包器全得抓瞎。这里的做法是新旧两套都留：新工具读 `exports` 精确分流，老工具读扁平字段兜底。换来的好处是真实的——无论消费者多老，都能无摩擦用上。代价是同一份 ES 产物，要在 `exports.import`、`exports.module`、`exports.default`、外加扁平字段 `module`、`jsnext:main` 这**好几个地方**分别指过去；CommonJS 产物也在 `exports.require` 和 `main` 两处指。任何一处指错或漏改（比如某次重构改了产物路径，只改了 `exports` 忘了 `main`），某些工具就会静默解析到错误的产物——不报错，只是行为悄悄错了。这是「面向兼容性」的典型代价：换来广覆盖，欠下了一笔永远要手工对账的债。
-
-**权衡二：把 `types` 条件钉在 `exports` 首位，换来「类型检查器按序匹配时最先命中声明」，代价是「这是一条隐性硬约束，违反它会静默失败」。**
-
-这个选择本身几乎零成本——只是把 `types` 写到第一行。但它换来的是类型声明能被正确解析，整个 TS 生态用起来才有类型提示。代价全在「隐性」二字：这条规则写在 `package.json` 本身里没有任何注释提示，靠的是 TS 官方文档里的一句约定。新人很容易把 `types` 顺手排到后面，然后面对「明明有 `.d.ts` 却报找不到类型」百思不得其解。换句话说，这个设计把一条硬约束伪装成了一个看起来无所谓的字段顺序。
-
-**权衡三：类型声明当作构建产物（而非版本控制里手工维护的源文件），换来「源仓库纯净、声明随构建自动刷新」，代价是「类型与实现对齐的质量，完全交给了打包工具」。**
-
-把 `index.d.ts` 当产物、用 `.gitignore` 忽略掉，源仓库就干净了——只剩 `src/index.ts` 一个真源，类型声明每次构建自动重新生成、随发布刷新，发布清单也只要列个产物名。这比「在仓库里手工维护一份 `.d.ts`、每次改实现都得记得同步」省心太多。但代价是：**类型和真实行为是否对得齐，完全取决于打包工具的类型生成能力**。如果生成有偏差（比如某个泛型被拍平、某个重载被合并），类型就会和真实运行时行为悄悄错位，而且因为 `.d.ts` 不在版本控制里，这种漂移在 code review 时根本看不见，要等用户在编辑器里碰到奇怪的类型提示才会暴露。
-
-至于「一条命令一次产三壳」这件事——它的权衡其实渗透在前面的演示里了：换来单一真源、消费端零配置、三产物行为天然一致；代价是构建工具链变厚（一条命令背后隐式拉起了转译、压缩、模块封装整条链路），三产物的体积和语义是否真的一致，完全依赖打包器而非人工核验。这点不再单独展开。
-
-## 小结
-
-走到这里，整条链路就闭合了：一份 `src/index.ts`，经一条多格式命令变成 ESM/CJS/UMD 三套外壳（外加一份自动生成的类型声明），再靠 `exports` 条件映射把带模块系统的消费者各路由到对的那份、靠扁平入口字段给老工具兜底、靠 UMD 这只万能插座覆盖连模块系统都没有的浏览器 `<script>`。
-
-说到底，这一章的原理就一句话：**一源多格式，靠条件映射让每个运行时自动领走它认的那一份。** 它不改变前面那些章造出来的函数本身——那张查找表（第 1 章）、那个不靠 `this` 的函数工厂（第 2 章）、那张派生全部 API 类型的映射（第 7 章）——运行时该是什么样还是什么样。这一章做的，纯粹是「把这些已经造好的东西，换上不同的出门衣服，再标好每个人该走哪个门，整齐地递给全世界」。
-
-整个 mitt 之旅到这里也就走完了：从最底层一张 `Map` 当状态，到无 `this` 的函数式方法，到惰性追加、无分支移除、快照派发、通配符第二条路径，再到一张映射派生全 API 类型——最后这一章把它们打包成三套外壳分发出去。一个小到 200 字节的事件发射器，从内核到分发，每一层都留下了清晰可学的原理。
+至此，从 `Map<EventType, Handler[]>` 这张查找表起步，走过闭包存储、惰性追加、无分支移除、快照派发、通配符第二条路径、Events 映射派生类型、条件类型可选载荷，最后落到「一份源码、三套外壳、一张路由表」——mitt 这个小库，从原理到工程交付，章节走完了。

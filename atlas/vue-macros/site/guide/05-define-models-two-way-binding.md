@@ -1,241 +1,185 @@
----
-title: "defineModels：从类型合成 props/emits 双向绑定"
----
-
 # defineModels：从类型合成 props/emits 双向绑定
 
-## 1. 痛点：同一个字段，要在两个地方各登记一次
+> 本章属于 composite 层。前置：SFC 解析与增量 AST 编辑、编译期注入虚拟 helper 模块、props/emit 宏的编译期重写与类型转换。
+> 学完你能：用一句话讲清「为什么 defineModels 要把一份类型编译期双向展开、又为什么提供 runtime / reactivity-transform 两种粘合形态」。
 
-想象你在写一个计数器组件，父组件要用 `v-model` 控制它。Vue 的 `v-model` 协议要求子组件**同时**有两样东西：一根叫 `modelValue` 的 prop，和一个叫 `update:modelValue` 的事件。
+## 1. 为什么需要它
 
-写出来是这样：
+上一章我们看了怎么把 `$defineProps`、ShortEmits、defineProp 这些「更顺手或更旧的写法」在编译期改写成原生 `defineProps` / `defineEmits`。那批宏都是**一对一**重写：一种输入写法 → 一个原生宏。但 Vue 的双向绑定协议在这里留了个口子。
+
+写一个 `v-model` 子组件时，你要的不是一根 prop，也不是一个事件，而是「一个双向的字段」。可 Vue 协议要求你把它**拆成两半**登记：
 
 ```ts
 const props = defineProps<{ modelValue: string }>()
-const emit = defineEmits<{
-  (e: 'update:modelValue', value: string): void
-}>()
+const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
 ```
 
-你会觉得哪里不对劲：`modelValue` 这个字段，你定义了一次类型 `string`，然后又把同一个 `string` 抄到事件签名里。字段一改名（比如 `modelValue` → `count`），prop 和事件名两处都得改；类型一变，两处都得跟。你心里想表达的是「这是一个双向绑定的字段」，但协议逼你把它拆成两半，分别塞进两个宏。
+字段一改名，两处都得动；类型一改，两处都得对齐；要写五个 v-model 字段，这种成对的样板就抄五遍。你心里真正想说的是「这是一个双向绑定的字段」，可协议逼你把它翻译成「一根下行的 prop + 一个上行的事件」。更糟的是，子组件内要「写它」还得绕一层——`emit('update:modelValue', newVal)`，而不是像本地变量那样直接 `modelValue = newVal`。
 
-`defineModels` 就是来消灭这份重复的。它让你**只写一份类型**，编译期替你把这一份类型同时展开成 prop 和事件，运行时再把这俩粘成一个能读能写的整体。
+`defineModels` 就是冲这个矛盾来的：让用户写**一份类型**描述一个双向字段，编译期替他把这一份类型翻译成 Vue 协议要的 prop + `update:` 事件对，运行时再补上「写它就等于发事件」的粘合。
 
-## 2. 先看协议底子：双向绑定 = 一根下行 + 一根上行
+## 2. 核心思想
 
-要理解 `defineModels` 在粘合什么，得先看它要粘的两根线。
+**一份类型，编译期把它双向展开成 prop 与 `update:` 事件，再用两种运行时形态把这对 prop/event 粘成一个可写单元。**
 
-Vue 的双向绑定说白了是两条线在走：
+这个抽象骨架是「翻译 + 粘合」：编译期翻译负责把用户的单一概念落成 Vue 协议要的两根线，运行时粘合负责在子组件内部把这两根线重新捏成一个能读能写的本地句柄。**展开是给协议看的，粘合是给开发者用的**。这是它跟上一章那些「纯重写器」宏最根本的区别：那些宏只翻译、不粘合，运行时什么也没多。
 
-- **下行**：父组件把值通过 prop 传给子组件；
-- **上行**：子组件要改值时，不能直接改父组件的变量（单向数据流），只能「喊一声」——发个 `update:modelValue` 事件把新值通报上去，父组件听到后自己改。
+## 3. 心智模型
 
-父组件写 `v-model="x"`，Vue 帮它展开成 `:modelValue="x"` 加上 `@update:modelValue="x = $event"`，等价于：值往下传，变化往上喊。这两条线合起来才是「双向」。
+把整个流程想成一条流水线，每一步都对源码做一次基于偏移的增量改写（这套机制第 1 章讲透了，本章只看它的新用法）：
 
-`defineModels` 做的事，就是在「一份类型」和「这两根线」之间做翻译。下面三小节拆开看它怎么翻。
+```
+源码
+  ↓ ① 扫 setup 顶层，定模式（runtime 还是 reactivity-transform）
+  ↓ ② 从宏的泛型字面量抽出「字段名 → { 类型, 是否可选 }」映射表
+  ↓ ③ 把表双向展开：propsText + emitsText 两段文本
+  ↓ ④ 以类型交集注入到用户已有的 defineProps / defineEmits 类型上
+  ↓ ⑤ 按模式落地运行时粘合（runtime: 整节点替换为 helper 调用；rt: 改为从 props 解构别名）
+  ↓ ⑥ （仅 rt）walkAST 把对该别名的赋值改写为「发 update: 事件」helper 调用
+改写后的源码 + sourcemap
+```
 
-## 3. 双向展开：一份类型，翻成两段文本
+关键数据结构就一张表：`字段名 → { 类型注解, 是否可选 }`。一切 props/emits 文本、helper 元组、改写规则都从这张表派生出来。
 
-还记得第 1 节那段又臭又长的 `defineProps` 加 `defineEmits` 吗？宏干的第一件事，就是别让你再写它。它把你给的那份类型，翻成 prop 和事件两段文本。
+## 4. 关键权衡
 
-你给宏一个泛型类型字面量：
+### 4.1 双向展开成类型交集，而非各写各的
+
+选了**编译期一次性合成**：把字段表翻译成 props 类型文本和 emits 类型文本，再用 `(旧类型) & { 新字段 }` 的**类型交集**形式注入到用户已有的 `defineProps` / `defineEmits` 上。换来的是用户只写一份类型就拿到类型天然一致的 prop + event 对，且能与用户已声明的其它字段共存。代价有两条：一是编译期要做类型交集的字符串拼接（不是替换），稍有泄漏会破坏用户原类型；二是字段名与事件名按硬约定绑定（`update:${字段名}`），事件名**不可自由命名**，想自定义事件名得用专门的选项元组。
+
+化解的**本质矛盾**：双向绑定协议要求「prop/event 成对出现」，而开发者的心智里只有「一个字段」。这条权衡把「成对」压回了「一份」，让协议与心智对齐。
+
+### 4.2 runtime 模式：用 passive 可写代理做粘合
+
+runtime 模式选了**把宏调用整节点替换成一个 helper 调用**，这个 helper 对每个字段返回一个 passive 可写代理——读它返回 prop 值，写它则触发 `update:` 事件。换来的是用户拿到的是**标准 ref**：读写语义透明、`a.value = b.value = x` 这种链式赋值天然成立、且**完全不改写用户的赋值表达式**——编译期干净利落，源码长什么样、产物就长什么样。代价是用户必须显式写 `.value`，并且这个代理依赖一个外部运行时（`useVModel`，借宿主实例的 `$emit` 兜底发事件），这个 helper 通过第 3 章那套虚拟模块机制注入到源码里。
+
+### 4.3 reactivity-transform 模式：静态改写赋值表达式
+
+reactivity-transform 模式选了**把所有指向某字段的赋值/自增表达式静态改写成发事件调用**：声明语句被删除，字段改为从 `defineProps` 解构的别名；然后 walkAST 整段 setup，对每个赋值表达式查作用域，若左侧标识符是已登记的 model，就把这行赋值改写为 `emitHelper(emit, 'update:字段', 值)`。换来的是用户像写普通变量一样 `字段 = 值` 完成双向更新，无 `.value` 心智负担，语法最简。
+
+代价分两层。表层：编译期必须遍历整段 setup 识别**每一个**指向该字段的赋值，含 `+=`、`++`、链式赋值、解构重命名、同名变量遮蔽（靠作用域比对来分辨「这是 model 别名还是恰好同名的本地变量」）。深层：这个「变量」**本质不是真变量**，它从 props 解构而来，对其赋值被替换成发事件，但**本地副本不会因父组件的状态变化而自动同步**——解构丢失响应性是该模式固有的代价。
+
+4.2 与 4.3 化解的是**同一个本质矛盾**的两端：开发者想要「一个能像普通变量一样赋值的双向字段」，可这个赋值必须变成「向父组件通报」。要么保住语法透明、付出 `.value`（4.2），要么消掉 `.value`、付出赋值语义的侵入（4.3）。**这是双向绑定「下行 prop + 上行 event」协议在子组件内部必然要付出的代价，宏只能把它从开发者眼前挪到编译期，不能消灭它。**
+
+## 5. 最小原理演示
+
+下面这段代码从零演透「一份类型 → 双向展开 + 两种粘合」。它不依赖 Vue 运行时，一个假 emit 函数就能跑通原理。
 
 ```ts
-defineModels<{ modelValue: string; count: number }>()
+// 演示「从泛型字面量抽字段表」（教学简化：正则代替 AST 解析）
+function extractFields(generic: string): Map<string, { type: string; optional: boolean }> {
+  const fields = new Map<string, { type: string; optional: boolean }>()
+  for (const m of generic.matchAll(/(\w+)(\?)?:\s*([^,}>]+)/g)) {
+    fields.set(m[1], { type: m[3].trim(), optional: !!m[2] })
+  }
+  return fields
+}
+
+// 演示「双向展开」：一份字段表 → props 文本 + emits 文本
+function expand(fields: Map<string, { type: string; optional: boolean }>) {
+  const propsText = [...fields]
+    .map(([k, v]) => `${k}${v.optional ? '?' : ''}: ${v.type}`)
+    .join(';\n')
+  // 事件名按硬约定拼成 update:${字段名}
+  const emitsText = [...fields]
+    .map(([k, v]) => `(evt: 'update:${k}', value${v.optional ? '?' : ''}: ${v.type}): void`)
+    .join(';\n  ')
+  return { propsText, emitsText }
+}
+
+// 演示「以类型交集注入」：旧类型 & { 新字段 }，叠加而非替换
+function intersect(oldType: string, addition: string) {
+  return `(${oldType}) & {\n  ${addition}\n}`
+}
+
+// 演示 runtime 粘合：getter/setter 实现 passive 可写代理，写它即触发 emit
+function makeWritableProxies(props: Record<string, any>, emit: (e: string, v: any) => void) {
+  const ret: Record<string, any> = {}
+  for (const key of Object.keys(props)) {
+    Object.defineProperty(ret, key, {
+      get: () => props[key],
+      set: (v) => emit(`update:${key}`, v),
+      enumerable: true,
+    })
+  }
+  return ret
+}
+
+// 演示 rt 粘合：把「赋值」静态改写成「发事件」（教学简化：只演 = 单字段）
+function rewriteAssignment(src: string, fields: Map<string, { type: string; optional: boolean }>) {
+  let out = src
+  for (const key of fields.keys()) {
+    out = out.replace(
+      new RegExp(`^\\s*${key}\\s*=\\s*(.+)$`, 'm'),
+      `emit('update:${key}', $1)`,
+    )
+  }
+  return out
+}
+
+// ============= 走一遍主线 =============
+const fields = extractFields('{ modelValue: string }')
+const { propsText, emitsText } = expand(fields)
+
+console.log(intersect('UserProps', propsText))
+// → (UserProps) & { modelValue: string }
+
+console.log(intersect('UserEmits', emitsText))
+// → (UserEmits) & { (evt: 'update:modelValue', value: string): void }
+
+// runtime 模式：拿到可写代理，写它即触发事件
+const proxies = makeWritableProxies(
+  { modelValue: 'hello' },
+  (e, v) => console.log(`[emit] ${e} = ${v}`),
+)
+proxies.modelValue = 'world'   // → [emit] update:modelValue = world
+
+// rt 模式：赋值表达式被静态改写（输入假设声明已改写为 defineProps 解构）
+const setupCode = `
+let { modelValue } = defineProps<{ modelValue: string }>()
+modelValue = 'hi'
+`
+console.log(rewriteAssignment(setupCode, fields))
+// → 第二行 modelValue = 'hi' 被替换为 emit('update:modelValue', 'hi')
 ```
 
-宏扫一遍这个字面量，为每个字段造一张卡片：`{ 字段名, 类型, 事件名 }`。事件名没有自由发挥的余地，直接按硬约定拼成 `update:${字段名}`——`modelValue` 对应 `update:modelValue`，`count` 对应 `update:count`。然后拿这张卡片表合成两段文本：
+每一行都对应上面某个原理点：`extractFields` 演「抽字段表」、`expand` 演「双向展开」、`intersect` 演「类型交集叠加而非替换」、`makeWritableProxies` 演「runtime 模式的可写代理粘合」、`rewriteAssignment` 演「reactivity-transform 模式侵入赋值语义」。
 
-```
-prop 端： modelValue: string; count: number
-事件端： (evt: 'update:modelValue', value: string): void;
-         (evt: 'update:count', value: number): void
-```
+## 6. 执行轨迹
 
-左边那段当 `defineProps` 的类型，右边那段当 `defineEmits` 的类型。注意事件签名里的 `value` 类型跟 prop 一模一样——因为它们本来就来自同一张卡片，想对不上都难。这就是「一份类型」换来的天然一致性。
-
-### 用交集叠进去，而不是替换
-
-用户可能已经自己写过 `defineProps<{ foo: number }>()`。宏不能把人家原有的 `foo` 字段抹掉。它不替换，而是把新字段**以类型交集的形式叠进去**：
-
-```ts
-// 用户原本： defineProps<{ foo: number }>()
-// 注入后：
-defineProps<({ foo: number }) & {
-  modelValue: string
-  count: number
-}>()
-```
-
-`(旧类型) & { 新字段 }` 这个写法，旧字段照常生效，新字段加了进来。用户压根没写 `defineProps`，宏就就地生成一个。`defineEmits` 同理。
-
-这里有个前置概念要回指：怎么扫描 SFC、怎么懒解析 setup 的 AST、怎么用偏移做增量改写，是所有宏共用的地基，第 1 章「SFC 解析与增量 AST 编辑」已讲透。本章只看它用这套地基的**新侧面**——**一个宏，在这一次转换里，同时叠加了三种增量编辑**：把 prop 类型做交集改写（类型层）、把 emit 类型做交集改写（类型层）、再视模式对宏调用本身做整节点替换或对赋值表达式做改写（语句层）。三种编辑叠在同一次改写里、共用一套偏移。
-
-同样，往源码注入一个磁盘上不存在的 helper 模块这套机制（虚拟 id + resolveId/load 拦截），第 3 章「编译期注入虚拟 helper 模块」已展开。本章只看**新侧面**：**同一次转换里，按模式二选一，注入不同的 helper**——runtime 模式注入 `useVModel`，reactivity 模式注入 `emitHelper`，两个 helper 各自撑起一种粘合方式。
-
-而跟第 4 章「props/emit 宏的编译期重写」相比，这里有个根本区别：第 4 章那些宏是把**某种更顺手的写法改写成原生 `defineProps`/`defineEmits`**（纯重写器，不引入新运行时能力）；`defineModels` 不是重写某个写法，而是**从一份「描述双向绑定」的类型，一次性同时合成 props 和 emits 两个原生宏的类型**，外加一套运行时粘合。它真的多带来了一种运行时能力。
-
-## 4. 粘合：两种模式，两种代价
-
-展开类型只是把协议的形状凑齐了。但用户拿到手还差一步：`modelValue` 这个东西，得能**读**它（拿当前值）、能**写**它（改了之后向上通报）。怎么把读和写接到一起去，`defineModels` 给了两套方案，由宏名决定走哪套：
-
-- 写 `defineModels()` → **runtime 模式**（返回 ref）；
-- 写 `$defineModels()`（带美元符）→ **reactivity-transform 模式**（赋值即触发）。
-
-两者互斥，重复声明直接抛错。
-
-### 模式一：返回一个能读能写的代理
-
-runtime 模式下，宏调用被整段替换成一个 helper 调用，这个 helper 给每个字段返回一个**可写代理**（一个 passive ref）：
-
-```ts
-// 用户写的
-const { modelValue } = defineModels<{ modelValue: string }>()
-
-// 编译后大致长这样
-const { modelValue } = useVModel(props, emit)
-// modelValue 是个 { value } 对象：读 .value 拿 prop 值，写 .value 就触发 emit
-```
-
-这个代理说人话就是「一个带开关的盒子」：你读它的 `.value`，它把父组件传下来的 prop 值递给你；你给它的 `.value` 赋值，它转身就喊一嗓子 `update:modelValue`。读写透明，且因为是标准 ref，链式赋值（`a.value = b.value = x`）天然成立——setter 会一个接一个触发 emit。
-
-### 模式二：赋值即触发，把赋值语句整个改写
-
-reactivity-transform 模式走得更激进。用户写：
+拿一行真实的源码，看编译期到底发生了什么。输入是 reactivity-transform 模式：
 
 ```ts
 let { modelValue } = $defineModels<{ modelValue: string }>()
 modelValue = 'hi'
 ```
 
-编译期发生两件事：
+**第一步：定模式、抽字段表。** 扫到 `$defineModels`（带 `$` 前缀）→ 模式锁定为 reactivity-transform。从泛型字面量抽出字段表：`modelValue → { type: 'string', optional: false }`。
 
-1. **声明语句被删掉**，`modelValue` 改成从 `defineProps` 解构出来的别名（`let { modelValue } = defineProps<...>()`）。也就是说，这个所谓的「变量」，本质是 prop 的一个本地副本。
-2. **整段 setup 被扫一遍**，凡是给 `modelValue` 赋值的地方，都被静态改写成「发事件」：
-
-```ts
-// modelValue = 'hi'  →  emitHelper(emit, 'update:modelValue', 'hi')
-```
-
-赋值动作被换成了向上通报。用户感觉自己在「给变量赋值」，实际每写一个 `=`，编译期都替你换成了一句「喂，父组件，modelValue 变成 'hi' 了」。
-
-这套方案的吸引力是**语法最简**——没有 `.value`，写起来跟普通变量一模一样。但它的代价比模式一重得多，下一节专门讲。
-
-## 5. 关键权衡
-
-### 权衡一：编译期把单类型双向展开，换来「一份类型 = 一对协议对」
-
-**选择**：在编译期，把用户给的那一份类型，翻成 prop 端和事件端两段文本，以类型交集叠进 `defineProps`/`defineEmits`。
-
-**换来**：用户只写一份类型，就拿到符合 `v-model` 协议的「prop + 对应事件」一对，而且两者类型天然一致（同源）。字段改名、改类型，只动一处。`v-model` 那套「prop 下行、事件上行」的协议形状，用户再也不用手动凑。
-
-**代价**：一是编译期得做类型交集的字符串拼接（`(旧类型) & { 新字段 }`），不是简单赋值；二是**事件名按硬约定绑定**——`update:${字段名}` 写死，事件名不可自由命名。如果某个字段你想叫一个别的事件名，得专门用选项类型去指明，绕一层。
-
-### 权衡二：runtime 模式用可写代理做粘合，换来「标准 ref、读写透明」
-
-**选择**：返回一个 passive 可写代理（读返回 prop 值、写则触发 `update:` 事件）来做 prop 和 event 的粘合。
-
-**换来**：用户拿到的是标准 ref，读写语义透明、链式赋值天然成立、且**不侵入普通赋值语法**——你用的是正常的 `.value` 写法，编译期不会去偷偷改你的赋值语句，所见即所得。
-
-**代价**：用户必须显式写 `.value`（ref 的老毛病）；且这个代理依赖外部运行时——它借宿主组件实例的 `$emit` 来兜底发事件，所以必须有真实的 Vue 运行时环境，不是纯函数。
-
-### 权衡三：reactivity-transform 模式静态改写赋值，换来「无 .value、语法最简」，代价是侵入赋值语义
-
-**选择**：删掉宏声明、字段改为 props 解构别名，然后遍历整段 setup，把每个指向该字段的赋值表达式静态改写成「发事件」调用。
-
-**换来**：用户像写普通变量一样 `modelValue = 'hi'` 就完成了双向更新，没有 `.value` 心智负担，语法是两种模式里最简的。
-
-**代价**分两层，都不轻：
-
-1. **编译期要做大量静态分析**。赋值不只是 `modelValue = x` 这一种。还有 `modelValue += 1`（复合赋值，得还原成 `modelValue + 1` 再发）、`modelValue++`（自增，得算出旧值/新值）、链式赋值、解构重命名（`{ modelValue: visible }` 时，得建立 `visible → modelValue` 的别名表，改写 `visible = x` 时用原字段名拼事件）、甚至**同名变量遮蔽**——你在 setup 里又声明了一个局部 `modelValue`，改写时得靠作用域表比对，只改真正指向 model 的那一个，不能误伤局部变量。每一种都要正确处理，漏一种就是 bug。
-
-2. **更隐蔽的代价：这个「变量」根本不是真变量**。它的声明语句被删了，本质是从 `defineProps` 解构出来的别名。你给它赋值，编译期把赋值换成了发事件——但**本地这个别名并不会因为发了事件就自动更新**。你写下 `modelValue = 'hi'` 之后，本地 `modelValue` 在这次渲染里还是旧值，要等父组件把新值通过 prop 传回来、重新渲染，别名才跟着变。在「赋值完立刻读」这种场景下，行为会和真变量的直觉不符——解构本身就会丢失响应性，这是该模式固有的代价。
-
-一个对比能看清楚两条路：同样是「写它就触发事件」，runtime 模式靠代理的 setter（运行时机制，所见即所得，但要 `.value`）；reactivity 模式靠编译期改写赋值语句（语法最简，但赋值语义被偷偷改了、变量也不是真变量）。**一边拿运行时透明换语法简洁，一边拿语法简洁换运行时透明**，没有两全。
-
-## 6. 原理演示
-
-下面这段脚本从零实现「一份类型 → 双向展开 + 两种粘合」这条主线。每一行对应上面某个原理点。不追求工程完整——省掉了绑定选项、`withDefaults`、接口形式类型、复合赋值/自增、sourcemap、偏移修正（那些是真实宏的工程细节，不影响你看懂主线）。
+**第二步：双向展开、以类型交集注入。** 合成 propsText = `modelValue: string`；emitsText = `(evt: 'update:modelValue', value: string): void`。假设用户的 `<script setup>` 里已经有 `defineEmits<{ click: [] }>()`，那 emits 类型被整节点改写为：
 
 ```ts
-// demo.mjs —— 跑法：node demo.mjs
-
-// ─── 演透原理用的假运行时 ───
-// emit：子组件往上的「喊话通道」，调一次就是通报一次
-const emit = (event, value) =>
-  console.log(`  [emit] ${event} <- ${JSON.stringify(value)}`)
-
-// ─── 用户真正想写的：一份类型 ───
-const modelType = '{ modelValue: string }'
-
-// 【原理点1】从泛型字面量抽字段，得到「字段名 → {类型, 事件名}」的卡片表
-function extractFields(typeSrc) {
-  const map = {}
-  for (const seg of typeSrc.replace(/[{}]/g, '').split(',')) {
-    const m = seg.match(/\s*(\w+)\??\s*:\s*(.+)/)
-    if (m) map[m[1]] = { type: m[2].trim(), event: `update:${m[1]}` }
-  }
-  return map
-}
-const fields = extractFields(modelType)
-
-// 【原理点2】双向展开：一张卡片表 → props 文本 + emits 文本
-function expand(map) {
-  const propsText = Object.entries(map)
-    .map(([k, f]) => `${k}: ${f.type}`).join('; ')
-  const emitsText = Object.entries(map)
-    .map(([k, f]) => `(evt: '${f.event}', value: ${f.type}): void`).join(' ')
-  return { propsText, emitsText }
-}
-const { propsText, emitsText } = expand(fields)
-console.log('props 文本 :', propsText)
-console.log('emits 文本 :', emitsText)
-
-// 【原理点3】类型交集叠加：不替换，把新字段叠进用户原有的类型
-const userPropsType = '{ foo: number }'
-console.log('注入后 props:', `(${userPropsType}) & { ${propsText} }`)
-
-// 【粘合A · runtime 模式】写它即触发 emit 的可写代理（一个带开关的盒子）
-function writableProxy(props, key) {
-  return {
-    get value() { return props[key] },
-    set value(v) { emit(`update:${key}`, v) },
-  }
-}
-const fakeProps = { modelValue: 'init' }
-const mv = writableProxy(fakeProps, 'modelValue')
-console.log('\n[runtime] 读 mv.value =', mv.value)
-mv.value = 'hi' // 用户必须写 .value，setter 替你 emit
-
-// 【粘合B · reactivity 模式】把赋值语句静态改写成「发事件」
-// （声明语句被删、改为从 props 解构的部分此处省略，只演赋值改写）
-function rewriteAssign(code, map) {
-  let out = code
-  for (const k of Object.keys(map)) {
-    out = out.replace(
-      new RegExp(`\\b${k}\\s*=\\s*([^;]+);`),
-      `emitHelper(emit, 'update:${k}', $1);`,
-    )
-  }
-  return out
-}
-// emitHelper：发完事件后返回所赋的值，保住赋值表达式的返回语义（链式/传参才不断）
-function emitHelper(fn, key, value, ...rest) {
-  fn(key, value)
-  return rest.length > 0 ? rest[0] : value
-}
-const userCode =
-  `let { modelValue } = $defineModels<{ modelValue: string }>();\nmodelValue = 'hi';`
-console.log('\n[reactivity] 改写后:')
-console.log(rewriteAssign(userCode, fields))
+({ click: [] }) & { (evt: 'update:modelValue', value: string): void }
 ```
 
-跑一下你会看到：`modelValue = 'hi'` 这句被换成了 `emitHelper(emit, 'update:modelValue', 'hi')`，而 `mv.value = 'hi'` 触发了同一次 emit——两种粘合殊途同归，最后都落到「向上喊一嗓子」上。
+如果用户没写 `defineEmits`，就**就地生成**一个 `const emit = defineEmits<{ ... }>()`。
 
-## 7. 小结
+**第三步：声明语句改写。** `let { modelValue } = $defineModels<{ modelValue: string }>()` 被整段删除，改成 `let { modelValue } = defineProps<{ modelValue: string }>()`。本地 `modelValue` 现在是 props 的解构别名。
 
-`defineModels` 把「双向绑定字段」从一个协议层的拆分（prop 加 event 两半），变回用户心智里的「一个字段」：编译期用一份类型同时合成 props 和 emits（类型交集叠加，事件名按硬约定拼），运行时再用两种粘合之一把这个字段变可写。
+**第四步：赋值表达式改写。** walkAST 走到 `modelValue = 'hi'` 这条 AssignmentExpression。查作用域：左侧 `modelValue` 对应的声明节点正好落在已登记的 model 标识符集合里 → 命中改写条件。这行被改写为：
 
-两条粘合路的取舍是这一章真正要带走的东西：**runtime 模式用可写代理换来了标准 ref 和赋值语义的透明，代价是 `.value`；reactivity-transform 模式用编译期改写赋值换来了最简语法，代价是赋值语义被侵入、变量也不是真变量。** 选哪条，取决于你更在意「所见即所得」还是「少敲几个字符」。
+```ts
+emitHelper(emit, 'update:modelValue', 'hi')
+```
 
-在 `defineModels` 这里，类型只在编译期被展开成 props/emits 的形状、运行时并不校验它。下一章 **better-define** 恰恰换了个方向：把这份 TS 类型**降级成运行时真的会去校验的对象**——让类型成为运行时校验的唯一真相来源。
+**结果关键点**：这一句**赋值**变成了**向父组件的通报**。本地 `modelValue` 这个「变量」其实只是 props 的解构别名——你给它赋值并不会让本地的 `modelValue` 真的变成 `'hi'`，解构是值快照、丢失响应性。宏的契约是：「赋值」在 reactivity-transform 模式下只完成「上行通报」这一件事，不完成「修改本地副本」这件事。这是它和真变量最根本的区别。
+
+## 7. 教学简化说明
+
+本章演示故意省略了：`ModelOptions<T, Options>` 包装类型（值类型 + 运行时选项的双层表达）、`withDefaults` 穿透、接口形式类型、解构重命名（`{ modelValue: visible }`）、作用域比对识别同名变量遮蔽、复合赋值（`+=`）与后缀自增（`++`）的算式还原、`emitHelper` 对链式赋值返回值的语义保真、sourcemap、偏移修正、虚拟模块的 resolveId/load 机制（第 3 章已演）、SFC 解析（第 1 章已演）。
+
+## 8. 小结
+
+双向绑定的协议成本（成对登记、双向同步）被宏从开发者眼前挪到了编译期：一份类型双向展开是给协议看的，两种粘合是给开发者用的。runtime 与 reactivity-transform 之争不是风格偏好，而是「`.value` 与赋值侵入」这对不可调和矛盾的两端选择。
+
+下一章我们看 better-define 怎么把这些宏在编译期擦除掉的 TS 类型，**反向**降级成运行时校验对象。
