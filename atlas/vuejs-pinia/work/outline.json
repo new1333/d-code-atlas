@@ -1,0 +1,190 @@
+{
+  "repo": "vuejs-pinia",
+  "generatedAt": "2026-08-11T02:46:53.110Z",
+  "chapters": [
+    {
+      "slug": "subscription-scope-cleanup",
+      "title": "随作用域清理的发布订阅",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "packages/pinia/src/subscriptions.ts"
+      ],
+      "summary": "用一个 Set 存回调、触发时遍历调用，并借助 onScopeDispose 让订阅随所在作用域自动回收；detached 选项让订阅脱离组件生命周期独立存活——这套小原语是 $subscribe 与 $onAction 共同的底座，关键权衡是『自动清理换便利、detached 换长生命周期』。"
+    },
+    {
+      "slug": "pinia-container-state-tree",
+      "title": "Pinia 容器与集中式状态树",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [
+        "packages/pinia/src/createPinia.ts",
+        "packages/pinia/src/rootStore.ts"
+      ],
+      "summary": "createPinia 用一个 effectScope 托管所有 store 的响应式副作用、用一个 ref 把全部 store 的状态聚成单棵集中状态树，再以 Vue 插件的 install 注入应用并用 provide 暴露；整个容器须 markRaw 避免自身被响应式化，收益是副作用可整体回收、状态可整树序列化（SSR 与 $patch 都依赖这点）。"
+    },
+    {
+      "slug": "active-pinia-pointer",
+      "title": "活跃实例指针：在任意上下文找回 Pinia",
+      "layer": "composite",
+      "dependsOn": [
+        "pinia-container-state-tree"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/rootStore.ts"
+      ],
+      "summary": "用一个模块级变量记住『当前正在使用的 Pinia』，让 action、getter、setup 外调用都能定位到所属实例；getActivePinia 优先走依赖注入、回退到该全局变量——权衡是全局变量换来了跨上下文寻址的便利，代价是 SSR 下存在跨请求污染风险，故服务端渲染后必须主动清空。"
+    },
+    {
+      "slug": "define-store-lazy-init",
+      "title": "defineStore 的懒装配与循环引用破解",
+      "layer": "composite",
+      "dependsOn": [
+        "pinia-container-state-tree",
+        "active-pinia-pointer"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/store.ts"
+      ],
+      "summary": "defineStore 仅返回一个 useStore 工厂，首次调用时才真正创建 store，并在运行 setup 之前先把半成品登记进注册表，从而让相互引用的多个 store 不会陷入死循环；懒创建还附带让未被使用的 store 可被摇树优化——关键权衡是『先登记后装配』换来循环安全，代价是实例化时机推迟到首次调用。"
+    },
+    {
+      "slug": "setup-store-runtime-classify",
+      "title": "Setup Store 的运行时自动分流",
+      "layer": "composite",
+      "dependsOn": [
+        "define-store-lazy-init",
+        "subscription-scope-cleanup"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/store.ts"
+      ],
+      "summary": "组装引擎遍历 setup 返回的每个属性，用响应式特征探测（是否为 ref、reactive、或带 effect 的 computed）把值自动归入状态、计算属性、动作三类，再把状态同步回集中状态树、用 reactive 包成 store；关键权衡是用运行时探测换取 setup 写法的灵活自由，代价是无法在类型层面预先约束每类成员。"
+    },
+    {
+      "slug": "options-store-three-way",
+      "title": "Options Store：声明式三分与统一组装",
+      "layer": "composite",
+      "dependsOn": [
+        "setup-store-runtime-classify"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/store.ts"
+      ],
+      "summary": "Options Store 把 state/getters/actions 的声明式三分『翻译』成等价的 setup 返回值（state 转 toRefs、getters 转 computed、actions 原样），再复用同一组装引擎，getter 借 computed 与活跃指针实现相互访问；因状态形状预先已知而原生支持 $reset——权衡是用声明式易用性换取 setup 的灵活性，代价是 Setup Store 无法自动实现 $reset。"
+    },
+    {
+      "slug": "mutation-dual-pipeline",
+      "title": "状态变更的双管道：动作拦截与批量合并",
+      "layer": "composite",
+      "dependsOn": [
+        "setup-store-runtime-classify",
+        "subscription-scope-cleanup"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/store.ts",
+        "packages/pinia/src/subscriptions.ts"
+      ],
+      "summary": "改状态有两条管道——调用动作时由包裹层设置活跃指针、并触发前置/后置/出错订阅，$patch 则暂停监听、深合并（普通对象递归、ref 与 reactive 整体替换、Map 与 Set 特殊处理）后手动通知订阅、把多次修改合并为一次事件；关键权衡是『批量合并换性能』，代价是须用 nextTick 与监听开关手动管控通知时机。"
+    },
+    {
+      "slug": "consume-store-in-component",
+      "title": "在组件中消费 Store：解构与映射",
+      "layer": "composite",
+      "dependsOn": [
+        "options-store-three-way",
+        "setup-store-runtime-classify"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/storeToRefs.ts",
+        "packages/pinia/src/mapHelpers.ts"
+      ],
+      "summary": "store 是 reactive 对象、直接解构会丢响应性：storeToRefs 遍历原始 store、只把状态与计算属性转成 ref 而主动跳过动作；mapHelpers 则为 Options API 组件生成延迟到渲染期才调用 useStore 的计算属性与方法——两者都依赖 store 的三分结构，却分别走了运行时探测与生成包装函数两条路。"
+    },
+    {
+      "slug": "plugin-extension-bus",
+      "title": "插件扩展总线",
+      "layer": "system",
+      "dependsOn": [
+        "setup-store-runtime-classify"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/createPinia.ts",
+        "packages/pinia/src/rootStore.ts",
+        "packages/pinia/src/store.ts"
+      ],
+      "summary": "pinia.use 收集插件，在每个 store 组装完毕时按注册顺序调用、并把返回值合并进 store；插件运行于 store 自身的副作用域内（扩展随 store 一并回收）——关键权衡是统一的扩展点带来了强大定制力（devtools、testing、持久化都基于此），代价是插件顺序敏感、且返回非响应式扩展会被诊断警告。"
+    },
+    {
+      "slug": "hmr-identity-preservation",
+      "title": "热更新与 Store 身份保持",
+      "layer": "system",
+      "dependsOn": [
+        "setup-store-runtime-classify",
+        "define-store-lazy-init"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/hmr.ts",
+        "packages/pinia/src/store.ts"
+      ],
+      "summary": "开发期热更新时，acceptHMRUpdate 用旧 store 实例去调用新模块的 useStore，把新的状态、计算属性、动作迁移到原对象上而保持其引用不变、状态则递归合并；关键权衡是『保持对象身份』换取组件无需重新挂载、代价是迁移逻辑须区分 Options 与 Setup 两种定义风格的差异。"
+    },
+    {
+      "slug": "devtools-observability",
+      "title": "开发者工具的可观测性接入",
+      "layer": "system",
+      "dependsOn": [
+        "plugin-extension-bus",
+        "mutation-dual-pipeline"
+      ],
+      "sourceFiles": [
+        "packages/pinia/src/devtools/plugin.ts",
+        "packages/pinia/src/devtools/formatting.ts",
+        "packages/pinia/src/devtools/utils.ts"
+      ],
+      "summary": "以插件形式接入 Vue DevTools，注册组件状态、检查器树与时间线，复用 $subscribe 与 $onAction 把每次变更推成时间线事件；为把动作执行期间的多次状态变更归到同一动作，用 Proxy 包裹 store、在访问期间标记当前动作——权衡是复用既有订阅管道换取运行时可观测，代价是这套机制仅存于开发构建、生产环境整块裁除。"
+    },
+    {
+      "slug": "ssr-state-transfer",
+      "title": "服务端渲染的状态传递",
+      "layer": "system",
+      "dependsOn": [
+        "pinia-container-state-tree",
+        "active-pinia-pointer"
+      ],
+      "sourceFiles": [
+        "packages/nuxt/src/module.ts",
+        "packages/nuxt/src/runtime/plugin.ts",
+        "packages/nuxt/src/runtime/payload-plugin.ts"
+      ],
+      "summary": "Nuxt 模块自动导入并注册运行时插件：插件在服务端把整棵集中状态树序列化进 payload、在客户端再注入水合，并用 skipHydrate 在序列化时剔除不需水合的字段、渲染后主动清空活跃指针——关键权衡是借 payload 桥接服务端与客户端两端，代价是须严防全局活跃指针的跨请求污染。"
+    },
+    {
+      "slug": "testing-mock-via-plugin",
+      "title": "测试替身：借插件实现 Mock",
+      "layer": "system",
+      "dependsOn": [
+        "plugin-extension-bus"
+      ],
+      "sourceFiles": [
+        "packages/testing/src/testing.ts"
+      ],
+      "summary": "createTestingPinia 复用插件扩展点，把动作、$patch、$reset 替换为 spy（默认不执行原逻辑），并让计算属性可被手动覆写、初始状态可注入；用一个内部标志让开发者工具跳过动作分组以免覆盖 mock——关键权衡是『完全不侵入核心』换取测试隔离，代价是 mock 插件必须排在插件链末尾才能真正生效。"
+    }
+  ],
+  "topoOrder": [
+    "subscription-scope-cleanup",
+    "pinia-container-state-tree",
+    "active-pinia-pointer",
+    "define-store-lazy-init",
+    "setup-store-runtime-classify",
+    "options-store-three-way",
+    "mutation-dual-pipeline",
+    "consume-store-in-component",
+    "plugin-extension-bus",
+    "hmr-identity-preservation",
+    "devtools-observability",
+    "ssr-state-transfer",
+    "testing-mock-via-plugin"
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "atlas-site",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "docs:dev": "vitepress dev",
+    "docs:build": "vitepress build",
+    "docs:preview": "vitepress preview"
+  },
+  "devDependencies": {
+    "vitepress": "^1.0.0",
+    "vitepress-mermaid-renderer": "^1.1.28",
+    "mermaid": "^11.0.0"
+  }
+}

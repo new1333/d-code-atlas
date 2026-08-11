@@ -31,6 +31,7 @@ import {
   STAGE_ORDER,
   type Manifest,
   type StageName,
+  type StageState,
   type SourceInfo,
 } from "./lib/manifest.ts";
 import { manifestPath, runDir, ensureDir, pathExists } from "./lib/io.ts";
@@ -182,6 +183,41 @@ function applyForceReset(
 }
 
 // ---------------------------------------------------------------------------
+// formatStageDiagLines：把 stage 失败诊断格式化成逐行串（供控制台打印）
+// ---------------------------------------------------------------------------
+
+/**
+ * 把 stage 失败的诊断信息（exitCode/error/stderr）格式化成逐行字符串数组，
+ * 供 orchestrator 在控制台直接打印（design §15 失败终止时）。
+ *
+ * 背景：此前只打印一句 `xxx failed`，真正的失败原因只躺在 manifest.json 里
+ * （典型：assemble failed 实为 claude 子进程 spawn 抛 EUNKNOWN，但 stderr 只记在
+ * manifest，控制台看不到）。这里把诊断吐到控制台，失败一眼可见。
+ *
+ * 三字段互补：
+ *   - exitCode：子进程退出码（126=spawn 失败；124=超时）；
+ *   - error：一句话摘要（如「site 结构校验失败」）；
+ *   - stderr：原始末段输出（编译/运行错误常在末尾），取末 2000 字防刷屏。
+ * cmd 字段含完整 prompt（可能数千字），不打到控制台（在 manifest 里可查）。
+ */
+function formatStageDiagLines(st: StageState): string[] {
+  const lines: string[] = [];
+  if (st.exitCode !== undefined) lines.push(`exitCode=${st.exitCode}`);
+  if (st.error && st.error.trim() !== "") {
+    lines.push(`error: ${st.error.trim().slice(0, 500)}`);
+  }
+  if (st.stderr && st.stderr.trim() !== "") {
+    lines.push("stderr:");
+    const s = st.stderr.trim();
+    const tail = s.length > 2000 ? s.slice(-2000) : s;
+    for (const ln of tail.split(/\r?\n/)) {
+      lines.push(`  ${ln}`);
+    }
+  }
+  return lines;
+}
+
+// ---------------------------------------------------------------------------
 // runPipeline：顶层无状态循环（AC-1 / AC-3 / design §1 / §9 / §15）
 // ---------------------------------------------------------------------------
 
@@ -306,6 +342,13 @@ export async function runPipeline(
     // 防重入处理）；这里主要拦截 acquire/survey/outline/assemble/build 的 failed。
     if (newM.stages[stageName].status === "failed") {
       log(`[atlas] ${key} ${stageName} failed`);
+      // 输出详细诊断（exitCode/error/stderr），让失败原因直接可见于控制台。
+      // 此前只打印一句 `xxx failed`，真正原因（如 claude 子进程 spawn 失败的
+      // EUNKNOWN、或 site 结构校验失败）只躺在 manifest.json 里，用户必须 atlas show
+      // 或翻 json 才能定位——这正是「assemble failed 但不知为何」的根因。
+      for (const line of formatStageDiagLines(newM.stages[stageName])) {
+        log(`[atlas]   ${line}`);
+      }
       log(`[atlas] ${key} halted: ${stageName} failed`);
       return { ok: false, key };
     }

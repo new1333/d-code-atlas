@@ -240,6 +240,27 @@ function quoteEscape(s: string): string {
 // ---------------------------------------------------------------------------
 
 /**
+ * 视为「瞬时、可重试」的 spawn 错误 errno。
+ * 背景：Windows + Bun.spawn 并发拉起 claude.exe 时，偶发 libuv `uv_spawn` 抛
+ * EUNKNOWN（vuejs-pinia run 里 13 章 research/write 连续被它打挂）。这类 OS 级
+ * 错误往往持续几秒~几十秒后自愈；而 runClaude 的重试是「背靠背」无间隔的，
+ * 来不及等 OS 恢复就全部失败。defaultSpawn 内部对这类 errno 做带退避的几次
+ * 重试，给 OS 一个恢复窗口，再用尽后交回 runClaude 兜底。
+ * 注意：ENOENT（二进制/cwd 真不存在）是配置错误，**不**在此列——不重试，
+ * 直接返回结构化失败，保持原有可诊断行为。
+ */
+const SPAWN_RETRY_CODES = new Set(["EUNKNOWN", "EAGAIN", "EBUSY", "ENOMEM", "ETIMEDOUT"]);
+
+/**
+ * 退避序列（毫秒）。逐次拉长：第一次给 OS 短喘息，后续给足恢复时间。
+ * 总退避上限 ≈ 9.3s；配合 runClaude 自身重试，足够覆盖秒级~几十秒级的瞬时故障。
+ */
+const SPAWN_BACKOFF_MS = [800, 2500, 6000];
+
+/** setTimeout 的 Promise 包装（退避用）。 */
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
  * 默认 spawn 实现：用 Bun.spawn 拉起 claude 子进程，收集 stdout/stderr，
  * 到 timeoutMs kill，返回结构化结果。超时 exitCode=124。
  *
@@ -266,28 +287,47 @@ export const defaultSpawn: SpawnFn = async (args, opts) => {
     }
   }
 
-  // spawn 本身可能抛错（Windows 上 libuv 的 ENOENT/EINVAL 等）。用 try/catch 包住，
-  // 翻译成结构化 ClaudeResult（ok=false），保持「非 0 退出/超时不抛」契约（design §15）。
-  // 否则未捕获异常冒泡到顶层，给出误导信息（如 `uv_spawn 'claude'`）。
+  // spawn 本身可能抛错（Windows 上 libuv 的 ENOENT/EINVAL/EUNKNOWN 等）。
+  // 对瞬时 OS 级 errno（SPAWN_RETRY_CODES）做带退避的几次重试，给 OS 恢复窗口；
+  // 用尽或遇到不可重试 errno（如 ENOENT 配置错误）则翻译成结构化 ClaudeResult
+  // （ok=false），保持「非 0 退出/超时不抛」契约（design §15）。否则未捕获异常
+  // 冒泡到顶层，给出误导信息（如 `uv_spawn 'claude'`）。
   // 注：用 `Bun.Subprocess<"pipe","pipe","pipe">` 精确标注（stdout/stderr = ReadableStream），
   //   而非 `ReturnType<typeof Bun.spawn>`——后者是重载联合，会把 stdout 推为
   //   `number | ReadableStream | undefined`，导致 `new Response(proc.stdout)` 类型不兼容。
-  let proc: Bun.Subprocess<"pipe", "pipe", "pipe">;
-  try {
-    proc = Bun.spawn({
-      cmd: [CLAUDE_BIN, ...args],
-      cwd,
-      env,
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-  } catch (spawnErr) {
-    const e = spawnErr as NodeJS.ErrnoException;
+  let proc: Bun.Subprocess<"pipe", "pipe", "pipe"> | null = null;
+  let lastErr: NodeJS.ErrnoException | null = null;
+  let retriesUsed = 0;
+  for (let attempt = 0; attempt <= SPAWN_BACKOFF_MS.length; attempt++) {
+    try {
+      proc = Bun.spawn({
+        cmd: [CLAUDE_BIN, ...args],
+        cwd,
+        env,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      break; // 成功拿到 proc。
+    } catch (spawnErr) {
+      lastErr = spawnErr as NodeJS.ErrnoException;
+      const code = lastErr.code ?? "";
+      // 仅瞬时 OS 级 errno 退避重试；ENOENT（二进制/cwd 真不存在）等不重试。
+      if (!SPAWN_RETRY_CODES.has(code)) break;
+      retriesUsed = attempt + 1;
+      if (attempt < SPAWN_BACKOFF_MS.length) {
+        await sleep(SPAWN_BACKOFF_MS[attempt]);
+      }
+    }
+  }
+
+  if (!proc) {
+    const e = lastErr!;
+    const retried = retriesUsed > 0 ? `，已退避重试 ${retriesUsed} 次仍失败` : "";
     return {
       exitCode: 126,
       stdout: "",
       stderr:
-        `defaultSpawn: 启动 claude 子进程失败（${e.code ?? "UNKNOWN"}）。\n` +
+        `defaultSpawn: 启动 claude 子进程失败（${e.code ?? "UNKNOWN"}${retried}）。\n` +
         `CLAUDE_BIN=${JSON.stringify(CLAUDE_BIN)} cwd=${JSON.stringify(cwd)}\n` +
         `原始错误: ${(e.message ?? String(e)).slice(0, 500)}\n` +
         `排查：① 终端确认 \`claude --version\` 可用；` +
