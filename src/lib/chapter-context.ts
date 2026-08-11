@@ -34,6 +34,8 @@ export interface ChapterContext {
   position: number;
   /** 全书章数（= topoOrder.length）。 */
   total: number;
+  /** 本章标题（outline 的 title 字段，作为正文 H1 唯一权威）。 */
+  thisTitle: string;
   /** 前驱章标题（topoOrder 前一项），首章或位置未知时为 null。 */
   prevTitle: string | null;
   /** 后继章标题（topoOrder 后一项），末章或位置未知时为 null。 */
@@ -101,6 +103,7 @@ export function buildChapterContext(outline: Outline, slug: string): ChapterCont
   return {
     position,
     total: order.length,
+    thisTitle: chapter.title,
     prevTitle,
     nextTitle,
     depTitles,

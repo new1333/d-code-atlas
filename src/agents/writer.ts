@@ -70,6 +70,7 @@ function buildChapterContextBlock(ctx: ChapterContext): string {
     "",
     "## 章节上下文（stage 已算好，请据此做章首承上、跨章去重与章末预告对齐）",
     `- 你是全书第 ${ctx.position + 1}/${ctx.total} 章。`,
+    `- **本章正文 H1 必须逐字等于**：${ctx.thisTitle ?? "（见 outline.json 本章 title）"}（不得改写、不得自拟——见 system prompt §3/§7）。`,
     `- 紧邻上一章：${ctx.prevTitle ?? "（首章，无前驱）"}`,
     `- 紧邻下一章：${ctx.nextTitle ?? "（末章，无后继）"}`,
     "- 本章 dependsOn 的前置章及核心主题（写关键权衡前先比对，避免重演前置章已讲透的原理）：",
