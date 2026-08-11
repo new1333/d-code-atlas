@@ -27,9 +27,11 @@ jobs:
         uses: oven-sh/setup-bun@v2
 
       - name: Build all atlas sites
-        # publish-sites.mjs 会从 GITHUB_REPOSITORY（CI 天然提供）推导出子路径前缀
-        # （如 /d-code-atlas/）并注入各站点 base；若用自定义域名，设 ATLAS_PAGES_BASE 环境变量覆盖。
+        # 已启用 GitHub Pages 自定义域名，站点部署在域名根下，资源 base 不再带 /d-code-atlas/ 前缀；
+        # 通过 ATLAS_PAGES_BASE="/" 覆盖 publish-sites.mjs 默认推导出的项目子路径。
         run: bun scripts/publish-sites.mjs
+        env:
+          ATLAS_PAGES_BASE: "/"
 
       - name: Deploy to GitHub Pages (gh-pages branch)
         uses: peaceiris/actions-gh-pages@v4
