@@ -1,200 +1,187 @@
 # DevTools 集成：作为 Pinia 插件的可观测层
 
-你在 Vue DevTools 里调试一个 store，随手点了一下 `increment`，时间线立刻蹦出一串：`increment 起飞`、`count 从 0 变成 1`、`doubleCount 重新算了`。看着挺全，可你盯着它们会犯嘀咕——后面这几条状态变化，到底是不是前面那个动作引起的？万一是另一个定时器改的呢？动作是一条线，状态变化是另一条线，两条线各跑各的，对不上号。
+> 本章属于 system 层。前置：插件系统、订阅系统、状态变更模型。
+> 学完你能用一句话讲清：整套可观测层为什么不侵入核心、靠什么把动作和状态变更缝合成因果、又怎么在生产里整体消失。
 
-更要命的是另一头：这套能看见「谁在什么时候改了什么」的调试设施，到了生产环境你一行都不想要。它不能拖大你的包，也不能拖慢运行时。
+## 1. 为什么需要它（设计动机）
 
-这两个看似无关的诉求——「调试时把动作和状态对上号」和「生产时整套消失」——Pinia 用同一个设计一起解决了：**DevTools 自己就是一个插件**。
+上一章把热更新讲完——dev 下 store 怎么就地换实现而不丢状态。可一旦你想在面板里追问「刚才那个 state 是被哪一次调用改的」，热更新帮不上忙。本章接的就是这个问题：调试时怎么把一个 store 在干什么「看见」。
 
-## 核心思想：蹲在频道旁边的偷听者
+调试一个 store，最容易撞上两个空白。第一，状态被改了，你不知道是哪一次调用改的——`count` 从 1 变成 2，时间线上只有一条孤立事件，没人告诉你它是谁动的。第二，你刚触发了一个动作，紧接着状态变了一片，但这两条流——动作流和状态流——是独立播出的，对不上号；时间线上看像两部不相干的电影。
 
-DevTools 和你在 `pinia.use(myPlugin)` 里写的那些插件没有任何特权区别。它不往核心里塞一行代码，而是蹲在核心对外的两个订阅频道旁边「偷听」：
+再加上一个硬约束：核心一直追求「最小可用、可 tree-shake」，调试代码不能焊死进核心。一旦焊死，生产包体被这部分代码永远拖大，运行时也要为每条 mutation 付一次录制的代价——而生产用户根本不需要这套东西。
 
-- 一个频道播报**状态变更**（`$subscribe`，深度监听 state）
-- 一个频道播报**动作调用**（`$onAction`，包裹每次 action）
+于是这套设施被做成一个普通插件——和用户自己写的插件走同一条装配通路、无任何特权。它要解决的就是：在「不侵入核心」的前提下，把动作流和状态流缝合回因果链，并且能在生产期被整体剔除。
 
-这两个频道是前置章「订阅系统」搭好的，DevTools 只是它们的订阅者，把核心事件翻译成时间线事件。但光偷听还不够——两条频道各播各的，DevTools 真正要做的、也是本章唯一的新活儿，是给每个动作套一层代理，把散落的状态变更重新「缝」回到引发它们的那个动作上，让两条线对上号。
+## 2. 核心思想
 
-频道本身怎么收发、暂停监听怎么协调，前面章节已讲透，这里不重讲。本章只看：这两条独立流怎么被缝合成因果关系，以及整套偷听设施怎么被一个开关整体抹掉。
+DevTools 是核心的**旁观者**：不直接读 store 内部、也不轮询状态，而是复用核心对外的两个订阅频道去听事件，再把事件翻译成时间线。但订阅频道只告诉你「动作发生了」「状态变了」——它不知道两者间的因果。所以可观测层还得再做一件事：在动作执行的那段窗口里给所有冒出来的状态变更事件打上同一个分组号，把原本散落的事件重新缝合成「这次变更由这次动作引起」。
 
-## 它怎么活下来：分两段注册
+## 3. 心智模型
 
-想象一下应用刚装好 Pinia 的那一刻——还没人调用过 `useStore()`，所以一个 store 都不存在。但 DevTools 面板得先在那里（不然用户打开面板看到一片空白，会以为坏了）。这就催生了两段注册：
+数据上一共四样东西：
+- 一个**时间线层**（mutations layer），每个事件带 `groupId`；
+- 一个**检视器**（inspector），展开 store 树、可编辑 state；
+- 一个**模块级可变指针** `activeAction`，记录「当前正在跑哪个动作」，没跑就是 `undefined`；
+- 一个**录制开关** `isTimelineActive`，告诉订阅回调「现在该不该把事件上时间线」。
 
-```
-app.use(pinia)                              每个 store 首次 useStore()
-     │                                            │
-     ▼                                            ▼
-registerPiniaDevtools()              addStoreToDevtools(store)
-建好空的时间线层 + 检视器空壳         给这个 store 挂上监听
-（还没有任何 store，先把位置备好）     （订阅它的两个频道）
-```
+装配分两段。第一段在 `app.use(pinia)` 时——此刻还没任何 store，但面板得先存在；于是建好时间线层 + 检视器的空壳、登记复制/粘贴/导入/导出这些全局动作。第二段在每个 store 装配时——插件被装配通路调用，拿到这个新生的 store；这时给它挂上 `$onAction` 和 `$subscribe` 两个 **detached** 订阅（detached 是因为 store 是长生命周期对象，订阅不能被某个临时作用域带走），同时给它的每个 action 套一层代理。
 
-全局层在「还没有任何 store」时就建好时间线和检视器的空壳，让面板一安装就可见；per-store 层等每个 store 出生时再给它挂监听。
+之后流程是：用户调 action → 代理进入、设 `activeAction = n` → action 体改 state → `$subscribe` 频道触发、事件带 `groupId = n` → action 同步返回、`activeAction` 清空。用户在面板里编辑 state 时，编辑入口先把 `isTimelineActive` 关掉再写、写完再开；订阅回调首行 `if (!isTimelineActive) return` 把这次自激回响吞掉。
 
-那 DevTools 凭什么能「正好赶上每个 store 的出生」？因为它是个普通插件。前置章「插件系统」讲过：每个 store 装配时，核心会把自己经手的插件挨个跑一遍，把 `{ store, app, pinia, options }` 喂给它们。DevTools 就是利用这个钩子，拿到每一个新生的 store——它走的装配通路和你自己写的插件一模一样，没有任何后门。
+最后整个注册被一个编译期常量 `__USE_DEVTOOLS__` 门控；生产构建里它是 `false`，整段注册就是死代码，被打包器整体剔除。
 
-## 它怎么旁观：复用两个现成频道
+## 4. 关键权衡
 
-拿到 store 之后，DevTools 不会自己去轮询状态（轮询既慢又抓不到「谁改的」）。它直接订阅核心已经搭好的两个频道：
+### 把可观测层做成插件，而不是核心内置
 
-- `store.$subscribe(cb, { detached: true, flush: 'sync' })`：状态一变就被通知。`detached` 让这个订阅不随组件销毁（store 活得久），`flush: 'sync'` 让变更即时上时间线。
-- `store.$onAction(cb)`：每次动作被调就被通知，还附送 before/after/onError 钩子。
+DevTools 想感知状态与动作，但选择**不**在核心里给它开专用接口、**不**让它在装配通路里享有特权——它就是一个普通插件，经 `pinia.use(devtoolsPlugin)` 入队、和用户插件排同一个队列，装配时拿到的就是标准的 `{ app, store, options }` 上下文。
 
-说人话就是：核心早就把「状态变了」和「动作被调了」两个广播频道架好了，DevTools 只是按个收音机收听，再把听到的翻译成时间线上的事件。频道怎么收发、订阅怎么自动清理，是前置的「订阅原语」「订阅系统」两章的事，这里不重复。
+换来两件事：一是核心与可观测彻底解耦——核心代码里看不到一处「为 devtools 留的钩子」，删掉这个插件，核心行为不变；二是整个可观测层可以被生产构建 tree-shake 掉，只要那个编译期常量是 `false`，整套代码就消失。
 
-## 本章的主菜：把两条流缝合成因果
+代价是它想感知什么，只能复用核心**对外的**订阅频道——表达力被频道能提供什么所限。它问不出「这个变更属于哪个 action」，因为订阅频道根本没提供这种信息；这正是为什么下面还要再造一层因果归因。
 
-偷听到了两条流，但它们是各跑各的。调一次 `increment()`，动作频道播一条「increment 被调了」，状态频道紧接着播一条「count 变了」——可没有任何东西告诉你，第二条是第一条引起的。如果这一刻还有别的代码也在改 state，你根本分不清哪条状态变化归哪个动作。
+**本质矛盾**：核心要「干净、最小、可剔除」 vs. 调试要「看穿一切细节」——这两个需求在生命周期上永远打架。把它做成插件、再用编译期门控切成两份代码，是这一族矛盾的通解骨架（React DevTools、Vue DevTools 都是同一招）。
 
-DevTools 的解法是给每个动作套一层代理（`patchActionForGrouping`）：
+### 给动作套代理，把两条独立流缝合成因果
 
-```
-动作进入
-  │  activeAction = 5   ← 给这次调用盖一个「订单号」
-  ▼
-动作体执行（改 state）
-  │  状态频道触发 → 事件带上 groupId = 5   ← 状态变化盖上同一个号
-  ▼
-动作同步返回
-     activeAction = undefined   ← 订单号清空
-```
+`$onAction` 告诉你「动作开始了」、`$subscribe` 告诉你「状态变了」，但两边的事件**没有共同键**能把它们关联起来。要让时间线上「increment 起飞」和「count 变更」折叠成一组，得自己造一个共同键。
 
-就像快递分拣：每个动作是一个订单号，动作里改的每个状态都盖同一个号。最后按号分堆，面板就能把「increment 起飞」和「count 变更」折叠进同一组，一眼看出因果关系。
+办法是给每个 action 外层套一层 wrapper（option store 进一步包成 Proxy）：进入时令模块级 `activeAction = n`，状态订阅事件就带 `groupId = n`；动作同步返回时清空 `activeAction`。这样同一个动作引发的所有状态变更事件，都带同一个 `groupId`，时间线就能折叠显示。
 
-这里有两个不显眼但关键的设计抉择：
+代价是这层包裹是**侵入式**的——它替换了用户写的 action、改了 `this` 的指向。对 setup store 更尴尬：它的 action 是闭包、不经 `this` 访问 state，Proxy 拦不到内部访问，所以干脆不套、只直接设 `activeAction`。更尖锐的代价是**异步归因失效**：`await` 之后的 state 变更发生时，`activeAction` 已经被清空——因为包裹器在动作同步返回那一刻就 reset 了它，跨不过微任务边界。源码注释直说，要等 tc39 的 async-context 提案落地才能精确归因。
 
-**为什么只给 option store 套 `new Proxy`，setup store 不套？** option store 的动作体里写的是 `this.count++`，靠 `this` 访问其他属性；Proxy 能在每次属性访问时顺手刷新一下 `activeAction`，保证标记在动作执行的每一刻都活着。而 setup store 的动作是闭包，根本不经 `this`，Proxy 拦不到内部访问，套了也白套，索性不套（代码注释里写明这要等 TC39 的 async-context 提案才能真正解决）。
+**本质矛盾**：「想给一次动作调用画边界」 vs. 「动作可能是异步的、边界会延后到 `await` 之后」——这是所有「动作追踪」族问题在 JS 异步模型下的共同限制。
 
-**为什么跨不过 `await`？** 动作同步返回的那一刻，`activeAction` 就被清空了。如果动作体里有 `await`，那么 `await` 之后再改 state，标记早就没了，这条状态变化归不到这个动作头上。这是被明明白白接受下来的代价——异步动作的归因不精确。
+### 编辑状态时暂停录制，避免面板改自己
 
-## 编辑时防自激：录一会儿，停一会儿
+用户在检视器里改 state，这次写操作会流经 `$subscribe` 频道。如果不处理，会触发一条假的「状态变更」事件：面板刚改完，时间线上立刻多一条「用户改了状态」，让人无法分辨哪些事件是代码触发的、哪些是面板触发的——回环噪音。
 
-还有个绕不开的麻烦：你在面板里直接改了 `count` 的值。这次编辑也会改 state，于是也会流经状态频道——不处理的话，面板自己改的状态又被面板当成一条「变更」事件记下来，形成回环噪音（你改一下，时间线多一条；多这条又像是别人改的）。
+办法是编辑入口前后成对切换录制开关：改之前 `isTimelineActive = false`，调 `payload.set` 写状态，改之后 `isTimelineActive = true`。订阅回调首行 `if (!isTimelineActive) return` 把这次回响吞掉。
 
-解法是前置章「状态变更模型」「订阅系统」已经讲透的那个协调族——「改之前暂停、改完恢复」——在可观测侧的镜像：
+**本质矛盾**：和第 5 章「打补丁期间暂停 watcher」、第 6 章「补丁期间关掉监听」是**同一族**——「自己内部要触发一次通知」 vs. 「不希望这次通知被订阅者当成外部事件」。「暂停 → 操作 → 恢复」是这一族的通解骨架，本章只看它在可观测侧的镜像，不重讲协调机制本身。
 
-```
-面板编辑入口：
-  isTimelineActive = false       ← 关掉录制
-  payload.set(...)               ← 改 state，触发状态频道
-  isTimelineActive = true        ← 重新打开
+代价薄到一句话点过：每条编辑入口必须成对维护这个开关（漏一处就回环），且要接受「编辑期间的订阅通知被静默丢弃」这一约定——它不是被延迟，是真的丢了。
 
-状态频道回调开头：
-  if (!isTimelineActive) return  ← 录制关着就把这次通知吞掉
-```
+### 用编译期开关换生产期整体消失
 
-「暂停监听、事后再恢复」这套协调思想前面章节已展开，这里不重讲原理；本章只看它在可观测侧的样子：编辑期间暂停时间线录制，让面板自己的编辑不被记成新的变更事件。代价是每条编辑入口前后都要成对维护这个开关，并且要接受「编辑期间的订阅通知被静默丢弃」这个约定。
+`__USE_DEVTOOLS__` 是个编译期常量，由构建配置定义为 `(__DEV__ || __VUE_PROD_DEVTOOLS__) && !__TEST__`；生产默认 `false`。注册入口写成 `if (__USE_DEVTOOLS__ && IS_CLIENT) pinia.use(devtoolsPlugin)`，整段在 prod 是死代码、被整体剔除。
 
-## 生产时整套消失：一个编译期开关
+换来零体积、零运行时开销——生产用户既不为这套代码付包体，也不为它付「每次 mutation 都被录制」的运行时代价。
 
-调试设施再好，生产环境也不该带着跑。Pinia 的做法是用一个编译期常量 `__USE_DEVTOOLS__` 把整段注册门控起来：
+代价是要在构建配置里维护这个常量的多份目标取值（不同产物给不同值），源码里凡涉及 devtools 的地方都要成对写守卫判断，条件分支的维护成本不低。
+
+**本质矛盾**：「调试期要尽可能多埋观测点」 vs. 「生产期要尽可能干净」——把这两个需求用一个编译期开关切成两份代码，是这类「可观测性」问题的通用骨架。
+
+## 5. 最小原理演示
+
+下面这段几十行的脚本只演透两条核心权衡——**因果缝合指针**与**录制开关防自激**。它故意不接 Vue、不接 devtools-api 宿主，只用普通对象和回调假扮订阅频道，让因果归因和防自激这两件事能直接读出来。复制进 `node`/`bun` 就能跑。
 
 ```ts
-// 不是运行时 if，是编译期常量
-if (__USE_DEVTOOLS__ && IS_CLIENT && typeof Proxy !== 'undefined') {
-  pinia.use(devtoolsPlugin)
-}
-```
-
-构建配置里，这个常量被定义为 `(__DEV__ || __VUE_PROD_DEVTOOLS__) && !__TEST__`——开发期是 `true`，生产期默认 `false`。于是在生产构建里，上面这整个 `if` 连同 `devtoolsPlugin` 的全部代码都成了死代码，被打包器整体剔除：零体积、零运行时开销。你想在生产也开 DevTools，就显式把 `__VUE_PROD_DEVTOOLS__` 设成 `true`。
-
-## 原理演示：几十行演透因果缝合与防自激
-
-本章机制依赖 Vue DevTools 宿主，强求真跑扩展不现实。下面这段脚本用普通对象模拟核心的两个频道，**存成 `.js` 用 `node` 跑、或用 `bun` 跑 `.ts` 都行**，专演两件事：代理怎么把动作和状态缝进同一个 `groupId`，开关怎么吞掉自激事件。
-
-```ts
-// devtools-mini.ts —— 演透「因果缝合」与「编辑防自激」两条核心权衡
-// 不依赖 Vue / devtools-api，bun run devtools-mini.ts 即可
-
-// ============ 核心侧：最小 store（对外暴露两个订阅频道）============
-function createStore($id, initial, fns) {
-  const state = { ...initial }
-  const stateSubs = new Set()    // 频道①：状态变更
-  const actionSubs = new Set()   // 频道②：动作调用
-  const store = { $id, state }
-  store.$subscribe = (cb) => (stateSubs.add(cb), () => stateSubs.delete(cb))
-  store.$onAction  = (cb) => (actionSubs.add(cb), () => actionSubs.delete(cb))
-  // 核心写 state 的统一入口：写完触发状态频道
-  store._write = (key, val) => {
-    state[key] = val
-    for (const cb of stateSubs) cb({ store: $id, key, val })
+// 极简 store：state + 两个对外订阅频道（动作 / 状态变更）
+function makeStore() {
+  let count = 0
+  const actionListeners: Array<(e: any) => void> = []
+  const stateListeners: Array<(e: any) => void> = []
+  return {
+    state: { get count() { return count } },
+    $onAction(fn: any) { actionListeners.push(fn) },
+    $subscribe(fn: any) { stateListeners.push(fn) },
+    // 原始 action：它和可观测层没有任何耦合
+    increment() {
+      actionListeners.forEach(fn => fn({ name: 'increment', phase: 'before' }))
+      count++
+      stateListeners.forEach(fn => fn({ newValue: count }))
+      actionListeners.forEach(fn => fn({ name: 'increment', phase: 'after' }))
+    },
+    // 直接改 state 的旁路：演「面板编辑入口」时用
+    _writeCount(v: number) {
+      count = v
+      stateListeners.forEach(fn => fn({ newValue: count }))
+    },
   }
-  // 装配动作：调用时先触发动作频道
-  for (const name of Object.keys(fns)) {
-    store[name] = (...args) => {
-      for (const cb of actionSubs) cb({ name, args })
-      return fns[name].call(store, ...args)
+}
+
+// 因果缝合指针：进入动作时设值，事件带它当 groupId
+let runningActionId = 0
+let activeAction: number | undefined
+// 录制开关：编辑期间关掉，吞掉自激事件
+let recording = true
+
+function attachDevtools(store: ReturnType<typeof makeStore>) {
+  const timeline: any[] = []
+
+  // 听动作频道：每次调用 ++ 出一个新 id，挂在 runningActionId 上
+  store.$onAction(({ name, phase }: any) => {
+    if (phase === 'before') {
+      runningActionId++
+      timeline.push({ kind: 'action start', data: { name }, groupId: runningActionId })
     }
-  }
-  return store
-}
-
-// ============ 可观测侧：DevTools 插件 ============
-let activeAction               // ← 当前正在运行的动作 id（缝合用）
-let actionSeq = 0              // 动作 id 计数器
-let isTimelineActive = true    // ← 录制开关（防自激用）
-const timeline = []
-let eventSeq = 0
-const record = (type, data, groupId) =>
-  timeline.push({ type, eventId: ++eventSeq, groupId, data })
-
-function attachDevtools(store) {
-  // ① 订阅动作频道：发「动作起飞」事件（groupId 取代理③设好的 activeAction）
-  store.$onAction((e) => record('action', { name: e.name }, activeAction))
-  // ② 订阅状态频道：每条事件带上当前动作作分组号；录制关着就丢弃
-  store.$subscribe((e) => {
-    if (!isTimelineActive) return              // ← 吞掉自激事件
-    record('mutation', { key: e.key, val: e.val }, activeAction)
   })
-  // ③ 代理包裹每个动作：进入时打标记，同步返回时清空
-  for (const name of Object.keys(store)) {
-    if (name[0] === '$' || name[0] === '_' || typeof store[name] !== 'function') continue
-    const raw = store[name]
-    store[name] = (...args) => {
-      activeAction = ++actionSeq               // ← 进入：盖订单号
-      try { return raw(...args) }
-      finally { activeAction = undefined }     // ← 返回：清空（await 后归因失效）
-    }
+
+  // 听状态频道：事件带「当前正在跑的动作」当 groupId；编辑期间直接吞掉
+  store.$subscribe(({ newValue }: any) => {
+    if (!recording) return
+    timeline.push({
+      kind: 'state change',
+      data: { count: newValue },
+      groupId: activeAction,
+    })
+  })
+
+  return timeline
+}
+
+// 把 action 替换成 wrapper：把 $onAction 发的号同步到 activeAction 指针，
+// 让随后由 state 变更触发的事件能带上同一个 groupId
+function patchActionForGrouping(store: any) {
+  const original = store.increment
+  store.increment = function (...args: any[]) {
+    activeAction = runningActionId  // 复用 $onAction 刚 ++ 出来的号
+    const ret = original.apply(this, args)
+    activeAction = undefined  // 同步返回后清空——这就是「await 之后归因失效」的根源
+    return ret
   }
 }
 
-// ============ 跑起来 ============
-const counter = createStore('counter', { count: 0 }, {
-  increment() { this._write('count', this.state.count + 1) },
-})
-attachDevtools(counter)
+// 演示用例
+const store = makeStore()
+const timeline = attachDevtools(store)
+patchActionForGrouping(store)
 
-console.log('场景 A：调 counter.increment()，看因果缝合')
-counter.increment()
+store.increment()  // 用户调 action
+store.increment()
+recording = false; store._writeCount(99); recording = true  // 面板编辑入口
+
 console.log(timeline)
-// 输出：action(eventId=1, groupId=1) + mutation(eventId=2, groupId=1)
-// → 动作与它引发的状态变更共享 groupId，面板可折叠显示因果
-
-console.log('\n场景 B：面板直接编辑 count，看防自激')
-const before = timeline.length
-isTimelineActive = false                        // 编辑前关录制
-counter._write('count', 99)                     // 改值，流经状态频道
-isTimelineActive = true                         // 编辑后恢复
-console.log('编辑期间新增时间线事件（应为 0）：', timeline.length - before)
+// 输出：每条 state change 都和某条 action start 共享同一个 groupId；
+//      _writeCount(99) 触发的状态事件被吞，timeline 里没有它。
 ```
 
-跑一下：场景 A 里你会看到动作事件和它引发的状态变更事件**共享同一个 `groupId`**——这就是因果缝合；场景 B 里编辑期间时间线一条都没长——这就是自激被吞。两段代码加起来不到 50 行，每一行都对应下面某条权衡。
+读这段代码时盯住三行：`runningActionId++`（动作频道发号）、`activeAction = runningActionId`（包裹器把号同步到指针）、`if (!recording) return`（开关吞自激）。其他都是为了让这三行能跑而存在的脚手架。
 
-## 关键权衡
+## 6. 执行轨迹
 
-本章机制集中在「旁观 + 缝合 + 自抹除」这条链上，逐一展开这 4 条；它们之间互为前提，合起来才回答了开篇那两个诉求。
+输入：用户在组件里调 `store.increment()`，动作体里 `count++`。
 
-**1. DevTools 即插件，而非核心内置。** 选择把整套可观测层做成一个普通插件、走与用户插件同一条装配通路 → 换来核心与可观测彻底解耦（核心零侵入：连 `_isOptionsAPI` 这种「我是不是 option store」的标记，都是 DevTools 自己写进 store 的，核心装配逻辑里根本没这个字段）+ 生产期可整体 tree-shake → 代价是它想感知状态与动作时不能直捣核心内部，只能复用核心对外的订阅频道，**表达力被频道能播什么卡死了**：频道没播的，它就看不见；想多看点，就得等核心先把那件事也广播出来。
+1. **动作频道触发**——核心装配时建的 `$onAction` 包裹器先入，回调里 `runningActionId++`（变成 1），推入「action start」事件，`groupId = 1`。
+2. **包裹器进入**——`patchActionForGrouping` 替换后的 `increment` 被调，第一行 `activeAction = runningActionId`——此刻 `runningActionId` 是 1，所以 `activeAction = 1`。
+3. **原 action 体执行**——`count++`，store 内部走到 `$subscribe` 触发点。
+4. **状态订阅回调被调**——先看录制开关：`recording` 是 `true`，继续；构造事件 `{ kind: 'state change', data: { count: 1 }, groupId: activeAction }`——此刻 `activeAction` 还是 1，所以事件的 `groupId` 就是 1。
+5. **事件入时间线**——和第 1 步的「action start」事件并排躺着，**同一个 `groupId = 1`**。
+6. **原 action 返回**——包裹器最后一行 `activeAction = undefined`，指针清空。
+7. **动作频道的 after 钩子触发**——同样清空 `activeAction`（双保险）。
 
-**2. 用代理包裹动作，重建「动作→变更」因果。** 选择在每个动作外层套一层代理、进入时打一个「当前动作」标记（递增的 `activeAction`）→ 换来时间线里能把一次动作引发的所有状态变更归因、折叠到同一组（靠 `groupId` 缝合，演示的场景 A 就是它）→ 代价有两个：一是对动作做了侵入式代理包裹，要小心绕开响应式追踪的副作用、还要在测试桩（`@pinia/testing`）和热更新边界上各打一个补丁；二是对 setup store 的**异步动作**归因根本不精确——标记在动作同步返回时就被清空，`await` 之后的 state 变更跨不过去，归不到任何动作头上，只能等语言层面的 async-context 提案落地。
+最终时间线上：「action start (groupId=1)」「state change (groupId=1)」两条事件被同一 `groupId` 折叠成一组，UI 上能看到「increment 起飞 → count 变更」这条因果链。
 
-**3. 编辑状态时暂停时间线录制，以防自激。** 选择在面板编辑状态期间关掉录制开关、事后再恢复（演示的场景 B 就是它）→ 换来「用户在面板手动改状态」不会被记成一条新的变更事件，避免「我改一下 → 时间线多一条 → 看着像别人改的」这种回环噪音 → 代价是每条编辑入口前后都要成对维护这个开关，漏一处就会漏录或多录，并且要接受一个约定：编辑期间流经状态频道的订阅通知会被静默丢弃——也就是「编辑的那一瞬，别处的订阅者其实没收到通知」。
+对比：如果动作里写了 `await delay(); count++`，第 3 步先同步返回（包裹器立刻清空 `activeAction`），后面的 `count++` 发生在微任务里——此刻 `activeAction` 已是 `undefined`，状态变更事件的 `groupId` 也是 `undefined`，归因失效。这就是上面权衡里说的「跨不过 `await`」。
 
-**4. 编译期开关换取生产期整体剔除。** 选择用一个编译期常量 `__USE_DEVTOOLS__` 门控整段注册 → 换来生产包里完全不包含这套代码（连 `if` 判断本身都被剔除，真正的零体积、零运行时开销）→ 代价是要在构建配置里维护该常量的多份目标取值（dev / test / prod 各一份，prod 还要留一个 `__VUE_PROD_DEVTOOLS__` 给「我就是想在生产开 DevTools」的人），并在源码各处成对写守卫判断，增加条件分支的维护成本——换来的是「默认安全，想开的人显式 opt-in」。
+## 7. 教学简化说明
 
-## 小结
+本章演示故意省略了：真实的 Vue 响应式（用普通 getter 替代 ref/reactive）、真实的 devtools-api 宿主对接（用 `console.log` 替代 `api.addTimelineEvent`）、检视器 UI 与状态格式化（`_custom` 包装、option store vs setup store 的 state 展开差异）、复制/粘贴/导入导出（直接读写根状态的实现）、`$onAction` 提供的 `before/after/onError` 三段钩子（演示里只用了 before/after）、Proxy 在 option store 中的额外作用（每次属性访问刷新 `activeAction`）、HMR 与 @pinia/testing 边界处理，以及编译期开关的构建配置。这些都不服务于「演透原理」，裁掉。
 
-DevTools 没有任何特权：它是个普通插件，蹲在核心两个订阅频道旁偷听，再用一层动作代理把两条独立流缝合成「动作→变更」的因果关系。面板自己改 state 时靠录制开关防自激，生产环境靠编译期开关整套抹掉。这四件事合起来，正好回答了开篇那两个诉求——调试时对得上号，生产时整套消失。
+## 8. 小结
 
-值得一提的是，全局的复制 / 粘贴 / 导入 / 导出状态这些操作，全都直接读写那一个 `pinia.state.value`——所有 store 的状态都收在它底下。顺着这条「单一根状态」的线索，下一章《SSR 与状态水合：单一根状态的序列化契约》会讲：服务端怎么把这一个根状态序列化交给客户端，客户端又怎么把它原样灌回每个 store。
+整套可观测层的灵魂是「旁观而不侵入」：复用对外的订阅频道听事件、用动作包裹把因果缝回去、用录制开关挡住面板自激、用编译期常量让生产里整套消失。任何一个状态库想做可观测层，落到最后都是这四件事的某种变体。
+
+下一章离开 dev 视角、转向另一个「全局性」约束：服务端渲染时，那一个根状态怎么序列化、又怎么在客户端水合回各 store。

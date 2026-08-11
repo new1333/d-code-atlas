@@ -1,188 +1,213 @@
 # mapHelpers：组合式 store 到 Options API 的适配层
 
-## 这一章要解决的别扭
+> 本章属于 composite 层。前置：defineStore、Store 装配、Pinia 实例。
+> 学完你能：用一句话讲清「为什么这层适配器把组合式 store 翻译成 Options API 能消费的形态，又没有另起一套实例化路径」。
 
-想象你接手一个老项目，组件还在用 Options API 写：状态放 `data`，方法放 `methods`，计算放 `computed`。你照着 Pinia 官方示例想用 store，结果发现一个尴尬事——文档里的 store 永远是在 `setup()` 里 `useXxxStore()` 取出来的。可你这个组件根本没有 `setup()`，那 store 该从哪儿冒出来？
+## 1. 为什么需要它（设计动机）
 
-更别扭的是，如果为了照顾 Options API 单独给 store 造一套「在 `data` 里实例化」的专用路径，那同一个 store 就有了两种诞生方式，行为迟早分叉。你真正想要的其实很朴素：在 `computed: { ... }` 和 `methods: { ... }` 里展开几下，就能像访问本地数据一样用 store，而且行为和 `setup()` 里一模一样。
+上一章讲了插件如何用上下文注入增强 store，那条路走的是 setup 装配。可是在 Options API 风格的组件里（`data/methods/computed` 那种写法），根本没有 `setup()`，这条路接不上。
 
-`mapHelpers` 就是来解决这个别扭的。它提供的四个函数（`mapState`、`mapWritableState`、`mapActions`、`mapStores`）干的事可以用一句话讲完：**不取值、不建 store，只造一批「被读到那一刻才去解析 store」的访问器壳**，把实例化推迟到 Vue 真正求值的时候。
+矛盾具体长这样：你有一份 store，按惯例要用 `useXxxStore()` 才能拿到实例，而它只能在 `setup()` 里调。项目里又有一批老组件是 Options API 写的，没有 setup。三种解法各有问题：
 
-说人话就是：它是个**适配层**，把组合式的 store 翻译成 Options API 能消化的 `computed`/`methods` 形态，但底下走的还是 `setup()` 那同一条实例化路径。
+- 单给 Options API 造一条实例化路径，同一份 store 两套行为，维护和心智都翻倍。
+- 强制把项目全改成 setup，不现实。
+- 让 store 同时挂两套，装配复杂度爆炸。
 
-## 核心思想：发券不发货
+mapHelpers 解掉这个矛盾的方式很轻：它**不参与 store 装配、不创建 store**，只是产出一批「延迟求值的访问器壳」，把这些壳展开进 Options API 组件的 `computed` 或 `methods` 字段。Vue 在求值那一刻才走回那条已经在第 3、4 章建好的组合式实例化路径。
 
-这里有个关键抽象要先点透：**访问器壳**。
+这一层适配换来「同一份 store、同一条实例化路径、在两种作者语法下行为完全一致」。
 
-打个比方。`mapHelpers` 发出来的不是货物，而是一张**提货券**。发券（也就是你调 `mapState(...)`）的那一刻，货物——也就是 store 实例——压根还没生产出来。券上不写货，只写一句**取货指令**：「拿着这张券、到 `this.$pinia` 这个窗口、去提 `useCounter` 这件货」。
+## 2. 核心思想
 
-等到你真去兑换（Vue 渲染时求值这个 `computed`）的那一刻，工厂才开工，把 store 做出来。而且取货指令里写死了「走 `this.$pinia`」——也就是当前组件实例上注入的那个 pinia，不是去翻全局找个随便哪个活跃的 pinia。这一点后面讲权衡时会反复用到。
+把「找 store」这件事，从写代码那一刻推迟到 Vue 自己求值那一刻。
 
-所以 `mapHelpers` 的函数体里，你看不到任何「创建 store」的动作，它只是用 `reduce` 把一批取货指令攒成一个对象。store 永远在求值时才诞生。
+mapHelpers 不是新机制，是借了 Vue 自己的求值时机来承载解析。壳子本身什么也不做，只是一个待执行的闭包；等 Vue 渲染要它了，它才用组件实例上注入的 pinia，调一次解析闭包。换句话说，mapHelpers 把「什么时候解析 store」这件事，外包给了 Vue 的 computed/method 求值钩子。
 
-## 时序全景：map 调用时什么都没发生
+## 3. 心智模型
 
-把整条链路摊开看，最直观的是「谁先动、谁后动」：
+数据结构上有三种壳：
 
-```
-你写组件定义                          Vue 挂载组件
-     │                                     │
-     ▼                                     ▼
-调 mapState(useCounter, ['count'])    首次求值 this.count（渲染需要）
-     │                                     │
-     ▼                                     ▼
-reduce 出 getter 壳 { count: fn }      触发 fn 执行，此时 this = 组件实例
-     │                                     │
-     ▼                                     ▼
-store 此时【不存在】                   fn 里读 this.$pinia，传给 useCounter
-                                           │
-                                           ▼
-                                     首次调用 → 创建 store 并缓存进注册表
-                                           │
-                                           ▼
-                                     返回 store.count
-```
+- **getter 壳**：一个普通函数，被 Vue 当作只读 computed 求值。`mapState` 和 `mapStores` 产这种。
+- **可写壳**：一个 `{get, set}` 对，Vue 当作可写 computed 求值。`mapWritableState` 产这种。
+- **方法壳**：一个转发参数的普通函数，放进 `methods` 字段。`mapActions` 产这种。
 
-几个关键节点连起来读：
+所有壳都以组件实例为 `this`，因为 Vue 求值 computed 时就是这么调的。壳函数体里固定有一句 `useStore(this.$pinia)`，把注入的 pinia 作为显式参数传给解析闭包。
 
-1. **写定义时**：调 `mapState(...)` 只 `reduce` 出一批壳（函数或 `{get,set}` 对），组件还没挂载，store 还没创建。
-2. **挂载求值时**：Vue 渲染需要 `this.count`，于是调用对应的壳函数，`this` 指向组件实例。
-3. **壳执行时**：壳函数体读 `this.$pinia`（组件实例上注入的 pinia），把它当参数传给 `useCounter` 这个解析闭包。
-4. **解析闭包**：首次调用就创建 store 并缓存进注册表，之后命中缓存——这条解析闭包的逻辑第 3 章已展开，本章只看它「被壳包了一层、在求值时触发」这个新侧面。
-5. **取值/转发**：壳从拿到的 store 上读属性、写属性，或把方法调用转发给 action。
+不变量：调映射函数时 store **尚未创建**；壳被求值时才创建。同一个 store 无论被多少个壳消费，注册表里只有一份实例（解析闭包的缓存语义保证）。
 
-因为「取 store」永远发生在求值时、永远经注入的 `this.$pinia` 解析，Options API 和 `setup()` 走的是同一条实例化路径，行为天然一致——这正是适配层的意义。
+A → B → C 流程：
 
-## 三种壳，各吃 store 的哪一块
+1. 你写 `computed: { ...mapState(useCounterStore, ['count']) }`。
+2. `mapState` 此时只是 reduce 出一个 `{ count: ƒ }`，啥也没解析。
+3. 组件挂载，Vue 渲染时求值 `this.count`，于是壳函数被调，`this` 是组件实例。
+4. 壳内 `useStore(this.$pinia)` 被调，注入的 pinia 显式传入。
+5. 解析闭包首次创建 counter store、塞进注册表、`setActivePinia` 设为当前活跃。
+6. 壳从 store 上读 `count`，返回给 Vue。
+7. 下一次求值时，注册表命中缓存，直接返回同一个 store。
 
-`mapHelpers` 一共发三种形状的券，分别对应 store 上三类东西（store 的 state/getter/action 三分结构第 4 章已讲透，这里只是它的消费者）：
+## 4. 关键权衡
 
-| 来源类型 | 用哪个函数 | 壳的形状 | 放进组件的哪个字段 |
-|---|---|---|---|
-| 只读来源（state、getter） | `mapState` | 一个 getter 函数 `() => store[key]` | `computed` |
-| 可写来源（state） | `mapWritableState` | 一个 `{ get, set }` 对 | `computed` |
-| 动作（action） | `mapActions` | 一个转发参数的函数 `(...args) => store[key](...args)` | `methods` |
+### 壳被读时才求值，而非映射时一次性绑定
 
-外加一个特例：`mapStores` 不映射某个属性，而是把**整个 store 实例**当成一个 getter 暴露出来，键名直接拿 store 的 `id` 加个后缀拼出来（比如 `counter` → `counterStore`），这样你在 Options API 里写 `this.counterStore` 就能拿到完整实例。
+选择：让每个壳的函数体每次被 Vue 求值时都重新走一次 `useStore(this.$pinia)`，而不是在 mapHelpers 调用时一次性把 store 取出来、闭包到壳里。
 
-这三种壳长得不一样，但内核完全相同——函数体里都是那句 `useStore(this.$pinia)`。差别只在「拿到 store 之后读什么」：getter 壳读属性、方法壳转发调用、get-set 壳多了个 set。
+换来：与「惰性创建 + 按调用选 pinia」完全对齐。mapHelpers 被调用那一刻 store 压根还没创建，只有壳被求值那一刻才存在解析的可能。整条链路从定义到求值，时机统一。
 
-## 原理演示：手写一个求值器，看壳何时才执行
+代价：每次 Vue 求值都要重新解析一次。解析本身命中注册表缓存、开销极小，但概念上是「每次访问都解析」而非「映射时绑定一次」。
 
-下面这段脚本不依赖真实 Vue——正因为本章机制不靠响应式系统，用一个「手写求值器」模拟 Vue 求值 `computed` 的瞬间，反而最能看清「壳在被读时才执行」这个时序（真实 Vue 会把时序藏在响应式里，反而不直观）。
+本质矛盾：早期绑定更省更快，但要复制一份解析逻辑、跨时机共享 store，等于打开「两套实例化时机、两套行为」的口子。Pinia 选了「与已有解析时机的一致性」，宁可每次求值多一次缓存命中。
 
-```js
-// ===== 极简解析闭包：第 3 章讲的 useStore，这里只要它「首次创建并缓存」这一面 =====
-const _s = new Map() // 注册表（对应 pinia._s）
+### 靠注入的 $pinia 显式传参，而不是依赖模块级 activePinia 兜底
 
-function defineStore(id, makeState) {
-  // 返回的是「解析闭包」：被调用时才创建 store
-  return function useStore(pinia) {
-    if (_s.has(id)) return _s.get(id)            // 命中缓存直接返回
-    console.log(`    [首次创建] 实例化 store "${id}"`)
-    const store = makeState()
-    _s.set(id, store)                              // 缓存进注册表
+选择：壳体内固定写 `useStore(this.$pinia)`，把当前组件实例上注入的 pinia 作为显式参数传给解析闭包；解析闭包的解析顺序也是「传入参数优先」。
+
+换来：每个组件实例用各自 app 注入的 pinia。多 app 场景下各走各的，SSR 下也不会跨请求串态。
+
+代价：壳强依赖宿主框架把 `$pinia` 注入到每个组件实例。没 `app.use(pinia)` 的话，求值时拿不到 pinia，dev 下直接报错。这层适配器没法脱离 Vue 组件上下文独立工作，它是一个必须插在 Options API 插座上的「翻译插头」。
+
+本质矛盾：精确性（按 app、按请求隔离）与通用性（脱离框架也能用）打架。Pinia 选了精确——第 1 章讲过模块级 `activePinia` 兜底的 SSR 串态风险，这里既然能精准就精准。
+
+### 只读来源与可写来源拆成两套映射
+
+选择：`mapState` 返回 getter 函数（Vue 只读 computed 字面形态），`mapWritableState` 返回 `{get, set}` 对（Vue 可写 computed 字面形态）。两个独立函数，不靠标志位区分。
+
+换来：可写映射支持 `v-model` 双向绑定。getter 是只读计算属性，本就不能写；只有 state 才能写。两个函数的「可写性」边界对作者一目了然。
+
+代价：维护两个函数，作者要自己区分何时用哪个。可写映射只接受 state（getter 永远只读）。还有一条隐含代价：`mapWritableState` 的 set 是直接给 store 属性赋值，不经 `$patch` 那条批处理主路径。这种赋值仍能被 `$subscribe` 捕获，靠的是 store state 的深度监听，那是第 6 章主题。
+
+本质矛盾：API 简洁（一个函数 + 标志位）与对齐 Vue computed 的两种字面形态（getter 函数 vs. `{get,set}` 对）。Vue 自己就用两种字面形态区分只读/可写 computed，mapHelpers 顺着分，作者在两边写法上得到的体验就和 Vue 原生 computed 一致。
+
+### 整个 store 实例也作 computed 暴露，键名用 id 自动拼后缀
+
+选择：`mapStores` 把整个 store 实例包成一个 computed，键名 = `useStore.$id + mapStoreSuffix`（默认后缀是 `'Store'`）。所以 `useCounterStore` 的实例在组件里通过 `this.counterStore` 就能拿到。
+
+换来：零配置自动命名。作者不必手写别名，直接展开就能在 `this` 上拿到实例。
+
+代价：命名由 store 的 id 决定，存在跨 store 撞名风险；后缀本身是模块级可变全局（可被 `setMapStoreSuffix` 改、也可置空），TS 下要拿到准确类型还得手动扩展 `MapStoresCustomization` 接口。
+
+本质矛盾：零配置便利与命名空间控制。这是 Options API 整套设计的取舍：它假设作者会自己避免撞名，换取少写代码的便利。
+
+## 5. 最小原理演示
+
+下面这段从零搭一个最小可跑的演示，演透三件事：**壳被读时才求值、经注入的 pinia 解析、get/set 分离**。模拟 Vue 求值 computed 用一个手写的 `壳.call(组件实例)`，反而比真跑 Vue 更能看清「壳在被读那一刻才执行」这个时序。
+
+```ts
+// 解析闭包：接收 pinia 参数、首次创建并缓存 store（极简形态详见第 3 章）
+type StoreCtor = (pinia: any) => any
+const registry = new Map<string, any>()
+
+function defineStore(id: string, setup: () => any): StoreCtor & { $id: string } {
+  const useStore = function (pinia: any) {
+    if (!pinia) throw new Error('没有 pinia，请检查 app.use(pinia)')
+    if (registry.has(id)) return registry.get(id)
+    const store = setup()
+    registry.set(id, store)
     return store
+  } as StoreCtor & { $id: string }
+  useStore.$id = id
+  return useStore
+}
+
+// 一个示例 store：state/getter/action 三分（详见第 4 章）
+const useCounterStore = defineStore('counter', () => {
+  let count = 0
+  return {
+    get count() { return count },
+    set count(v: number) { count = v },
+    double() { return count * 2 },
+    inc(n = 1) { count += n },
+  }
+})
+
+// getter 壳：被读时才解析 store
+function mapState(useStore: StoreCtor, keys: string[]) {
+  return keys.reduce((acc: Record<string, () => any>, key) => {
+    acc[key] = function (this: any) {
+      return useStore(this.$pinia)[key]
+    }
+    return acc
+  }, {})
+}
+
+// 可写壳：get/set 分离，set 直接给 store 属性赋值（不经 $patch）
+function mapWritableState(useStore: StoreCtor, keys: string[]) {
+  return keys.reduce((acc: Record<string, any>, key) => {
+    acc[key] = {
+      get(this: any) { return useStore(this.$pinia)[key] },
+      set(this: any, v: any) { useStore(this.$pinia)[key] = v },
+    }
+    return acc
+  }, {})
+}
+
+// 方法壳：转发参数到 store 的 action
+function mapActions(useStore: StoreCtor, keys: string[]) {
+  return keys.reduce((acc: Record<string, (...a: any[]) => any>, key) => {
+    acc[key] = function (this: any, ...args: any[]) {
+      return useStore(this.$pinia)[key](...args)
+    }
+    return acc
+  }, {})
+}
+
+// 整个实例作为一个 getter 壳，键名 = id + 'Store'
+function mapStores(useStore: StoreCtor & { $id: string }) {
+  return {
+    [useStore.$id + 'Store']: function (this: any) {
+      return useStore(this.$pinia)
+    },
   }
 }
 
-const useCounter = defineStore('counter', () => ({
-  count: 1,                       // 可写来源（state）
-  double: 2,                      // 只读来源（伪 getter，演示足够）
-  inc(n = 1) { this.count += n }, // 动作
-}))
-
-// ===== 模拟「组件实例 + 注入的 pinia」（第 1 章：app.use(pinia) 时注入到每个组件）=====
-function makeComponent() {
-  return { $pinia: '本组件注入的 pinia 句柄' }
+// 极简组件实例：$pinia 是 app.use(pinia) 注入的，其余字段就是 Options API 写法
+const component: any = {
+  $pinia: { /* 模拟注入的 pinia */ },
+  computed: {
+    ...mapState(useCounterStore, ['count']),
+    ...mapWritableState(useCounterStore, ['count']),
+    ...mapStores(useCounterStore),
+  },
+  methods: {
+    ...mapActions(useCounterStore, ['inc']),
+  },
 }
 
-// ===== 三个映射函数：只 reduce 出壳，全程【不碰 store】=====
-function mapState(useStore, keys) {
-  return keys.reduce((out, key) => {
-    out[key] = function () { return useStore(this.$pinia)[key] } // ① getter 壳
-    return out
-  }, {})
-}
-function mapWritable(useStore, keys) {
-  return keys.reduce((out, key) => {
-    out[key] = {                                                 // ② get/set 壳
-      get() { return useStore(this.$pinia)[key] },
-      set(v) { useStore(this.$pinia)[key] = v },
-    }
-    return out
-  }, {})
-}
-function mapActions(useStore, keys) {
-  return keys.reduce((out, key) => {
-    out[key] = function (...args) { return useStore(this.$pinia)[key](...args) } // ③ 方法壳
-    return out
-  }, {})
-}
-
-// ===== 把壳展开进组件（模拟展开进 computed / methods）=====
-const vm = makeComponent()
-Object.assign(vm,
-  mapState(useCounter, ['double']),
-  mapWritable(useCounter, ['count']),
-  mapActions(useCounter, ['inc']),
-)
-// 注意：到这里 store 仍未创建，只是多了几个壳
-
-// ===== 手写求值器：模拟 Vue 渲染时读字段、触发对应壳 =====
-console.log('① 读 vm.double —— 这一刻 store 才被创建：')
-console.log('   =', vm.double.call(vm))      // getter 壳：当函数调
-
-console.log('② 读 vm.count —— 命中缓存，不再创建：')
-console.log('   =', vm.count.get.call(vm))   // get/set 壳：调 .get
-
-console.log('③ 调 vm.inc(10) —— 转发到 action：')
-vm.inc.call(vm, 10)                           // 方法壳：当函数调，转发参数
-console.log('   再读 vm.count =', vm.count.get.call(vm))
-
-console.log('④ 给 vm.count 赋值 99 —— 触发 set：')
-vm.count.set.call(vm, 99)
-console.log('   再读 vm.count =', vm.count.get.call(vm))
+// Vue 求值 this.xxx 时，相当于调 component.computed.xxx.call(component)
+console.log(component.computed.count.call(component))   // 0：首次解析、创建并缓存 counter store
+component.methods.inc.call(component, 2)                // 转发为 store.inc(2)
+console.log(component.computed.count.call(component))   // 2：方法壳转发成功
+component.computed.count.set.call(component, 10)        // 可写壳的 set，直接赋值给 store.count
+console.log(component.computed.count.call(component))   // 10
+console.log(component.computed.counterStore.call(component) === component.computed.counterStore.call(component))
+// true：两次求值命中同一个缓存的 store 实例
 ```
 
-跑出来的轨迹会把「延迟求值」讲得很清楚：
+## 6. 执行轨迹
 
-```
-① 读 vm.double —— 这一刻 store 才被创建：
-    [首次创建] 实例化 store "counter"      ← store 在这里才诞生
-   = 2
-② 读 vm.count —— 命中缓存，不再创建：      ← 注意没有「首次创建」那行
-   = 1
-③ 调 vm.inc(10) —— 转发到 action：
-   再读 vm.count = 11
-④ 给 vm.count 赋值 99 —— 触发 set：
-   再读 vm.count = 99
-```
+输入：一个 Options API 组件，computed 和 methods 字段里展开映射。
 
-关键就看 ①和②的对比：发券（map）和展开（Object.assign）时控制台静悄悄，直到 ① 真去读 `vm.double`，那行「首次创建」才打印出来；到 ② 已经命中缓存，再不创建。store 从头到尾只诞生一次，而且诞生时机完全由「求值」决定。
+- `computed: { ...mapState(useCounterStore, ['count']), ...mapStores(useCounterStore) }`
+- `methods: { ...mapActions(useCounterStore, ['inc']) }`
 
-## 关键权衡
+时序：
 
-这四个映射函数看着简单，每个选择背后都有一笔明确的账。
+1. 模块加载时调 mapHelpers，reduce 出壳对象。**此时注册表里没有 counter store**，`pinia._s` 是空的。
+2. 组件挂载、Vue 渲染要算 `this.count`，触发 `component.computed.count.call(component)`。
+3. 壳函数体执行：读 `this.$pinia`，把它传给 `useCounterStore(this.$pinia)`。
+4. 解析闭包「传入参数优先」拿到 pinia；查 `pinia._s` 没命中，调 setup 创建 counter store，缓存进注册表。
+5. 壳从 store 上读 `count`（值 0），返回给 Vue。
+6. 用户点按钮触发 `this.inc(2)`：方法壳把参数转发为 `store.inc(2)`，store 内部 state 变为 2。
+7. 下次渲染求 `this.count`，壳再次执行，`useStore` 命中注册表缓存，直接返回同一个 store，读到 2。
+8. 模板里用 `this.counterStore`：触发 `mapStores` 包出来的那个壳，同样经解析拿到整个 store 实例。
 
-**权衡一：返回「延迟求值的访问器壳」，而不是「store 的值」。**
-这是最核心的一笔。`mapState` 大可以直接在 reduce 里就 `useStore()` 把实例取出来、把属性值摆好。但它偏不——它返回的是壳，求值时才解析。换来的是什么？是和「惰性解析闭包」「按调用选 pinia」完全对齐：在 map 调用的那一刻，store 根本不存在（定义是零副作用、可 tree-shake 的），就算想取值也无处可取。壳这个形态正好接住了「延迟」这件事。代价是：每次 Vue 求值 `computed` 都要重新走一次解析（拿到 `this.$pinia`、调 `useStore`）。好在解析本身命中缓存、开销极小，但概念上确实是「每次访问都解析」而不是「map 时绑定一次」。
+输出：`this.count` 始终等于 `store.count`，响应式跟随；`this.counterStore === store`，是同一个实例；`this.inc(2)` 转发为 `store.inc(2)`；可写映射的 set 直接给 store 属性赋值。
 
-**权衡二：靠「组件实例上注入的 `$pinia`」显式传给解析闭包，而不是省掉参数去吃模块级全局活跃 pinia。**
-你大概注意到了，所有壳体里统一写的是 `useStore(this.$pinia)`，而不是图省事写 `useStore()`。后者也能跑——解析闭包在拿不到显式参数时会回落到注入、再到全局活跃 pinia 兜底（这条解析顺序第 3 章、注入机制第 1 章都讲过）。但 `mapHelpers` 偏要每次显式传 `this.$pinia`，目的是让每个组件实例都用**自己 app 注入的 pinia**：多 app 场景下各自正确，SSR 下也更安全（不会因为全局串态而把 A 请求的状态漏给 B 请求）。代价是这套适配层**强依赖宿主框架把 pinia 注入到每个组件实例**——要是忘了 `app.use(pinia)`，`this.$pinia` 就是 `undefined`，求值时直接抛「没有活跃 Pinia」。换句话说，这些映射函数没法脱离 Vue 组件上下文独立工作。
+## 7. 教学简化说明
 
-**权衡三：把「只读来源」和「可写来源」拆成两个映射函数，而不是用一个带标志位的函数。**
-`mapState` 返回 getter 函数，`mapWritableState` 返回 `{get, set}` 对。为什么不合并？因为 Vue 的 `computed` 字面就有两种形态：一种是纯 getter 函数（只读），一种是 `{get, set}` 对（可写）。store 上的 getter 本身是只读的计算属性，根本没法 set；只有 state 这种可写来源才配得上 set。所以干脆**按可写性分函数**最自然，`mapWritableState` 也只接受可写的来源。换来的能力是 `v-model` 双向绑定——没有 set，可写来源就没法双向。代价是用户得自己判断：要 `v-model` 的用 `mapWritableState`，只展示的用 `mapState`，两套函数得维护、得记。
+演示故意省略：对象形态的 key 映射（值可以是字符串或自定义函数，自定义函数以组件实例为 `this` 调用）、后缀可配置（`setMapStoreSuffix`）、误用诊断告警（`PINIA_R1001`）、完整 TS 重载与 `_StoreObject/_Spread/_MapStateReturn` 等映射类型推导链。
 
-顺带一提，`mapWritableState` 的 set 是**直接给 store 属性赋值**（`store[key] = value`），不走 `$patch` 那条批处理主路径。变更之所以还能被 `$subscribe` 捕获，靠的是 store state 的深度监听——这点和第 5 章的状态变更模型正好成对照，这里不展开。
+## 8. 小结
 
-**权衡四：把「整个 store 实例」也当成一个 computed 暴露，键名用 id 自动拼后缀。**
-`mapStores` 不需要你写任何别名，传几个 `useStore` 进去，它就按 `id + 后缀` 自动生成键名（`useCounter` → `counterStore`），你在 Options API 里 `this.counterStore` 直接拿到完整实例。换来的是**零配置的自动命名**，省掉手写一长串别名。代价有两层：一是命名完全由 store 的 `id` 决定，两个 store 的 id 撞了，键名就撞了；二是这个后缀本身是个模块级可变全局（默认 `'Store'`，能改、能置空），改了之后类型侧还得手动扩展声明才能拿到准确类型提示。另外 `mapStores` 收到数组（误用，比如把几个 store 塞数组里传进来）时，dev 下会弹一条诊断提示，叫你把 store 展开传参——因为这种写法在 prod 会直接失败。
+这一层不发明新机制，是已有机制的「翻译插头」：把组合式 store 的解析时机，挂到 Vue 求值 computed 的钩子上。读者写 `...mapState(...)` 时，背后只是注册了一批待执行的闭包，等 Vue 来敲门那一刻才走回那条已经在第 3、4 章建好的实例化路径。正因为它只是个适配层，它消费 store 的 state/getter/action 三分结构、消费注入的 `$pinia`，而不是另起一套。
 
-这四笔账合在一起，就是「适配层」的全部代价：为了让 Options API 用上组合式的 store，`mapHelpers` 选择只造壳、永远经注入的 `this.$pinia` 解析、按可写性分函数、自动拼名——既不另起一条实例化路径，也不依赖全局兜底，代价是它彻底依附于「Vue 组件实例」这个运行环境。
-
-## 小结
-
-一句话收束：`mapHelpers` 是组合式 store 到 Options API 的一层翻译，它自己**不创造任何实例化逻辑**，只发一批「被读时才解析」的访问器壳。这些壳统一靠组件实例上注入的 `this.$pinia` 取货，于是同一个 store 在两种作者语法下走的是完全相同的诞生路径，行为天然一致——这就是它「只是适配层、不是第二条路径」的本质。
-
-写完本章，你已经知道 store 在求值时如何被解析出来、`$pinia` 怎么喂给解析闭包。下一章我们换一个角度：当开发模式下一份 store 的源码被热替换，**已经创建好的、带着运行时状态的 store 该如何就地更新而不丢状态**——那就是 HMR 要解决的问题。
+下一章 HMR：保留状态的就地热更新，会看 store 在不重建身份的前提下，怎么把新版 state/getter/action 原地搬进既有实例。

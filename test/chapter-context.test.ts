@@ -158,6 +158,7 @@ describe("buildChapterContext · 边界与健壮性", () => {
     const expected: ChapterContext = {
       position: 1,
       total: 2,
+      thisTitle: "b 章标题",
       prevTitle: "a 章标题",
       nextTitle: null,
       depTitles: ["a 章标题"],

@@ -1,200 +1,196 @@
----
-title: "突破单 script setup 的 SFC 结构扩展"
----
-
 # 突破单 script setup 的 SFC 结构扩展
 
-## 一、Vue 钉死的那条铁律，和它带来的两个不便
+> 本章属于 composite 层。前置：SFC 解析与增量 AST 编辑、编译期注入虚拟 helper 模块。
+> 学完你能：用一句话讲清「为什么 setup-component 要把内联函数抽成虚拟 `.vue` 再 import 回来、为什么注入要用延迟闭包而不是立即快照」。
 
-写 Vue 写久了，你会觉得有一条规矩天经地义：**一个组件 = 一个 `.vue` 文件 = 一个 `<script setup>`**。多数时候这没什么问题，但有两类场景会让你觉得别扭。
+## 1. 为什么需要它
 
-第一类：你想在一个父组件里**就地**捏一个一次性的小子组件——它要有自己的 props、emits、生命周期，还得能直接用父作用域里的变量。按规矩，你只能新建一个文件，再用 props 把状态一点点搬过去。说人话就是：组合的粒度，被「文件边界」卡死了。
+上一章把 `$ref/$()` 标记的变量读写静默改写成 `.value` 访问。那个改写始终局限在一个 `<script setup>` 内部、在表达式层面打转。Vue 还有另一条更隐形的铁律：一个 `.vue` 文件恰好等于一个 `<script setup>` 块。本章要撬开的就是这条文件级的形状约束。
 
-第二类：有些脚本天生就只是一段 setup（比如一段纯渲染逻辑），却非得套上 `<template>` / `<script setup>` 这一套标签，写一堆样板。
+这条规则平时没什么不便，但有两个场景会卡住。
 
-vue-macros 用三个宏来松开这条铁律。它们不是随便长的，而是排成一条**侵入度递增**的谱系：最轻的只动几个标签，中等的把整份脚本包一层，最重的才跨文件去造一个虚拟组件。下面自底向上，一档一档讲。
+场景一：想在父组件里**内联**定义一个一次性子组件。某个对话框只在 `Dashboard.vue` 里用一次，按惯例得另起一个 `DashboardDialog.vue`，再把父组件想用的状态用 props/emits 一份份搬过去。组合粒度被文件边界卡死——你想就近写，规则却逼着你拆。
 
-## 二、最轻一档：给 `.vue` 多加一个 `<setup>` 块
+场景二：有些脚本天然就只是一段 setup。比如纯渲染脚本，整个文件就是一段 `export default () => <JSX />`，却被 `<template>/<script>` 双块结构绑架，明明没有模板，还得写一堆样板标签才能让它跑起来。
 
-先从最轻的说起。有时候你只想在 `.vue` 里再开一块独立的 setup 逻辑，又懒得纠结它和 `<script setup>` 的关系——`setup-block` 这个宏让你直接写一个 `<setup>` 块，它在编译期把标签**改名**成 `<script setup>`：
+根上的问题是同一个：SFC 的形状被钉死了。vue-macros 的 setup-block / setup-sfc / setup-component 三个宏，分别从轻到重地松动这条规则。前两个只是文本层面的改名和包裹，真正的难题在第三个：怎么让"在父组件里写一个内联子组件"这件事跑通。
 
+## 2. 核心思想
+
+把"一个函数体"在编译期升级成"一个完整的虚拟 `.vue` 文件"，让它走一遍 Vue 编译流水线（props/emits/HMR/类型工具/JSX 全套能力都拿到），再用一枚**延迟求值的闭包**当子弹，把外层作用域里的变量射穿 ES module 的 import 边界、注射进这个虚拟文件。
+
+换句话说：把组合的边界从「文件」退回到「函数」。文件是死的、不能跨边界共享局部变量；函数是活的、自然带闭包。让一个内联组件既能享受正经 SFC 的全部待遇，又能像普通函数那样直接用父作用域里的变量。
+
+## 3. 心智模型
+
+三个宏按侵入度递增构成一条谱系：
+
+| 宏 | 干什么 | 是否跨文件 | 是否需要闭包子弹 |
+|---|---|---|---|
+| setup-block | 把 `<setup>` 标签改写成 `<script setup>` | 否 | 否 |
+| setup-sfc | 把整份 `.setup.[tj]sx` 文件用一个 `<script setup>` 包起来 | 否 | 否 |
+| setup-component | 把内联组件函数体抽成虚拟 `.vue` 子模块再 import 回来 | 是 | 是 |
+
+前两个是 setup-component 的退化子集：setup-block 只做标签的文本替换（用 `@vue/compiler-dom` 的 parse + magic-string 偏移改写，把 `<setup>` 和 `</setup>` 改成 `<script setup>` 和 `</script>`）；setup-sfc 只做单文件包裹（找到 `export default <expr>`，追加 `defineRender(<expr>)` 并删除原 export，然后把全文包进 `<script setup lang="...">`）。
+
+setup-component 才是这章的硬骨头，六步流转：
+
+1. **扫描**：在源文件里找出所有内联组件函数体（按 `defineSetupComponent(...)` 调用或 `: SetupFC` 类型注解识别），同时沿作用域链上溯收集每个调用点此刻**全部可见**的变量名。
+2. **改写调用点**：函数体擦除，换成 `导入名(() => ({ 可见变量 }))`，一枚返回变量快照的延迟闭包；文件顶部追加一行 import，指向一个不存在的虚拟 `.vue` 路径。
+3. **拦截虚拟模块**：打包器来加载这个虚拟文件时，load 钩子现场合成内容：把原函数体用 `<script setup>` 包起来，并在顶部插一行 `const { 外层变量 } = ctx()` 把闭包解包成本地变量。
+4. **渲染接管**：把函数体里的 `return <JSX>` 改写成 `defineRender(...)`，渲染语义由下游的 define-render 宏消费。
+5. **Vue 二次编译**：合成的 SFC 字符串流回 Vue 编译器，被正常编成 `export default 组件工厂`。
+6. **编译后穿针**：Post 钩子在 Vue 产物上把 `export default 工厂` 改成 `(ctx) => 工厂`，于是步骤 2 传进来的那枚延迟闭包，在这里经工厂调用接到了 setup 内部。父作用域的变量穿过 import 边界，注入完成。
+
+setup-block 和 setup-sfc 是这条链的子集：前者停在第 1 步的标签文本替换，后者停在第 3 步的单文件包裹，它们都不跨文件、不需要闭包子弹。
+
+## 4. 关键权衡
+
+### 把函数体抽成虚拟 `.vue` 子模块，而不是直接编译成内联渲染函数
+
+选择：把内联组件函数体抽成一个虚拟 `.vue` 子模块，靠 `import` 拉回来。
+换来：子组件走完整 Vue 编译流水线，被工具链识别为正经组件，props/emits/JSX/HMR/Volar 类型提示全套能力都拿得到。
+代价：必须用 `scan / transform / load / postTransform` 四个阶段跨 Pre 与 Post 两个 enforce 钩子协调，每个组件还要伪造一个唯一虚拟路径 `<原id>-setup-component-<i>.vue`。
+
+背后化解的本质矛盾是：组件作者想要"一次性、就近写"的轻量，工具链又要求正经组件必须经过 Vue 编译器的完整流水线。抽虚拟子模块把这对矛盾外包给打包器的 resolveId/load：你写一个普通函数，宏在打包器眼里伪造一个 SFC 文件，Vue 编译器甘心情愿地接管它。
+
+### 用延迟求值闭包，而不是立即拷一份值
+
+选择：注入的是 `() => ({ a, b, c })` 这种延迟求值的闭包，而不是 `{ a, b, c }` 立即快照。
+换来：能捕获**尚未初始化**的变量。最典型的两种是 `var baz`（提升但还没赋值）和自引用的导出名 `App`（在调用求值时压根还没绑定）。换成立即快照，前者读到 `undefined`、后者直接抛 `ReferenceError`；换成延迟闭包，等 setup 真正运行时再读，外层的真值已就绪。
+代价：注入的是一个"现读现取"的快照函数，外层重赋值会渗透进子组件——读者看到一行 `ctx()` 调用，没法一眼推出里面是什么、会不会变。
+
+背后化解的本质矛盾是：编译期就要决定注入什么变量，但有些变量到运行时才有真值。延迟闭包把"决定注入谁"和"实际取值"拆开：前者编译期写死在变量列表里，后者推迟到 setup 真正运行的那一刻。
+
+### 调用点自动收集全部可见声明，而不是让用户手写依赖列表
+
+选择：在调用点沿作用域链自动上溯收集全部可见声明，load 时再扣掉子组件自身声明的变量。
+换来：用户写起来和普通函数一样自然，不用像 React 的 `useCallback([deps])` 那样手列依赖。
+代价：会把**用不上的变量**也打进闭包；依赖作用域分析正确识别块作用域（块作用域里的 `let/const` 不能被错误提升进闭包列表）。
+
+背后化解的本质矛盾是：手写依赖太啰嗦容易漏，自动收集又必然过度。过度（多打几个用不上的变量）远比遗漏（漏一个就 bug）安全。这条权衡在所有"自动依赖收集"机制里都看得到，从 Vue 的 `computed` 自动追踪到 React 早期的 `useEffect` 手列之争，本质都是同一个天平。
+
+### 把作用域参数注入拆进 Post 钩子，而不是一次 transform 到底
+
+选择：作用域参数注入（把 `export default 工厂` 改成 `(ctx) => 工厂`）拆到 Post 插件，而不是和调用点改写一起在 Pre 完成。
+换来：注入能精确发生在"Vue 把 setup 编成组件工厂之后"——此时 Vue 产物的 `export default _export_sfc(_sfc_main, [...])` 这种结构化形态刚好可以挂钩，那枚延迟闭包经 `_sfc_main(ctx)` 调用一路接到 setup 内部。
+代价：一个宏被迫占据 Pre 和 Post 两个 enforce 槽位；Post 还得同时处理两种产物 id——主入口 `.vue` 用 `(ctx)` 包 `_sfc_main`，`?vue&type=script` 脚本子块用 `(__MACROS_ctx)` 包 `defineComponent`，两层参数名不一致是 Vite 拆分 SFC 产生的历史演进，但传递的是同一枚闭包。
+
+背后化解的本质矛盾是：调用点改写必须**先于** Vue 编译（不先擦掉函数体，Vue 编译器看到的就不是合法 SFC）；作用域参数注入又必须**后于** Vue 编译（拿不到 `export default 工厂` 这种结构化产物就无处可挂）。一个宏因此被 Vue 编译这道流水线切成两半：Pre 阶段改源码、Post 阶段改产物。
+
+## 5. 最小原理演示
+
+下面这段演示只演 setup-component 的核心思想：调用点覆写 + load 合成 + Post 穿针，跑通「外层变量穿过 import 边界」这件事。**不演示**多组件索引、HMR、真 Vue 编译、Post 的双分支差异、resolveId 的子模块相对 import 处理。
+
+```ts
+// 演透「虚拟 SFC + 闭包子弹」：调用点覆写 → load 合成 → Post 穿针
+// 输入：内联组件函数体、调用点沿作用域链收集的可见变量、子组件自身声明的局部变量
+
+function transformInlineComponent(
+  body: string,
+  visible: string[],
+  rootVars: string[],
+) {
+  const importName = '__MACROS_setupComponent_0'
+
+  // Pre·transform：调用点覆写成「导入名(() => ({ 可见变量 }))」
+  // 用延迟闭包而非立即快照，让 var 提升 / 自引用导出也能在 setup 运行时取到真值
+  const callSite = `${importName}(() => ({ ${visible.join(', ')} }))`
+
+  // Pre·load：现场合成虚拟 SFC，把函数体包进 <script setup>，顶部插 ctx() 解包
+  // 扣掉子组件自身声明的变量，避免覆盖局部变量
+  const injected = visible.filter((n) => !rootVars.includes(n))
+  const virtualSfc = [
+    '<script setup>',
+    `const { ${injected.join(', ')} } = __MACROS_ctx();`,
+    body,
+    '</script>',
+  ].join('\n')
+
+  // 模拟 Vue 编译 + Post 穿针：
+  // 工厂被包成 (ctx) => defineComponent(...)，setup 内的 ctx() 解包出外层变量
+  // 调用点那枚 () => ({...}) 闭包经工厂调用传入，外层变量穿透 import 边界
+  const finalFactory = `export default (__MACROS_ctx) => defineComponent({
+  setup() {
+    const { ${injected.join(', ')} } = __MACROS_ctx();
+    ${body}
+  }
+})`
+
+  return { callSite, virtualSfc, finalFactory }
+}
+
+// 跑一遍：验证外层 foo / baz / App 都穿过了 import 边界
+const r = transformInlineComponent(
+  'console.log(foo, baz, App)',
+  ['foo', 'baz', 'App'],  // 调用点沿作用域链收集
+  [],                     // 子组件没有自身局部变量
+)
+console.log('【调用点覆写】\n' + r.callSite)
+console.log('\n【load 合成的虚拟 SFC】\n' + r.virtualSfc)
+console.log('\n【二次编译 + Post 穿针】\n' + r.finalFactory)
 ```
-改写前                          改写后
-<setup>                  →     <script setup>
-  let count = 0                  let count = 0
-</setup>                  →     </script>
-```
 
-它的做法很直白：用编译器的 SFC 模式解析整个文件，但特意告诉解析器「除了 `<template>`，顶层那些不认识的标签（比如 `<setup>`）就当原始文本，别报错」；然后对 `<setup>` 这个子节点做**基于偏移的标签串改写**——把开标签 `<setup` 换成 `<script setup`，把闭标签 `setup>` 换成 `script>`。
+跑出来的三段产物连起来读：调用点那枚 `() => ({ foo, baz, App })` 是一颗延迟闭包，先被打包器视作「对虚拟 `.vue` 文件的 import」路由到 load 钩子；load 现场拼出一份带 `ctx()` 解包语句的合法 SFC；Vue 编译器接过这份 SFC 编成组件工厂；最后 Post 把工厂包成 `(ctx) => 工厂`——闭包在这里真正求值，setup 内的 `ctx()` 拿到的就是父作用域此刻的真值。
 
-这里用到的「按偏移改文本、保留 sourcemap」的手法，第 1 章「SFC 解析与增量 AST 编辑」已经讲透了。本章只看它一个**新侧面**：那套增量编辑工具在这里干的不是「setup 内部某个表达式的改写」，而是**整块标签的文本级拼装与改名**——纯字符串层面的活，连 AST 都不用深挖。这一档因此最便宜，也最没争议。
+## 6. 执行轨迹
 
-## 三、中间一档：整份脚本就是一个 setup
-
-再上一档。有的文件从头到尾就是一段 setup 逻辑，配一个 `export default` 指明渲染来源，仅此而已。`setup-sfc` 让这类文件以 `.setup.ts(x)` 结尾，免去所有包裹标签：
-
-```
-改写前（文件全部内容）              改写后（合成出的 SFC）
-const App = () => <div/>      →   <script setup>
-export default App                   const App = () => <div/>
-                                     defineRender(App);
-                                    </script>
-```
-
-它做的事是三步文本拼装：找到 `export default <表达式>`，在文件末尾追加一句 `defineRender(<表达式>);`，然后把原来那行 export 删掉，最后把**文件剩下的全部内容**用 `<script setup lang="...">` ... `</script>` 包起来。
-
-注意一个细节：它没有自己去解释「`App` 怎么变成渲染函数」，而是把这件事**甩给** `defineRender`——也就是写成一句带标记的调用，由下游另一个宏去落地真正的渲染语义。本章产出的是「打了标记的 SFC」，渲染这件本事由别人消费。这种跨宏接力后面还会再出现。
-
-这一档同样不跨文件、不需要传变量，所以也没有什么精巧的设计可讲。真正有意思的，是最重的那一档。
-
-## 四、最重一档：就地定义一个子组件
-
-### 4.1 障碍：import 边界会切断闭包
-
-想象你在父组件里想这么写：直接定义一个一次性子组件，它能享受完整的 Vue 编译（props 校验、JSX、HMR、类型补全全都有），还能**直接读**父作用域里的变量，不用 props 传。
-
-```
-const theme = { color: 'red' }
-export const App = defineSetupComponent(() => {
-  // 这个子组件想直接用 theme，而不是靠 props 收
-  return () => <div style={theme}>hi</div>
-})
-```
-
-拦在面前的，是 ES module 的一条铁律：**import 边界天然切断闭包**。一旦你把子组件抽成单独的文件，那个文件就读不到父文件里的局部变量 `theme`——这就好比两间屋子中间堵了一堵墙，隔壁拿不到你这屋的东西。
-
-要让它「享受完整 Vue 编译」，子组件又必须是一个正经的 `.vue` 文件、走一遍 Vue 编译流水线。于是矛盾就摆在这：**既要独立成文件（为了被编译），又要能拿到父作用域变量（文件又拿不到）**。
-
-### 4.2 绕开的招：虚拟文件 + 闭包子弹
-
-`setup-component` 的解法分两步走，正好踩在前置两章的地基上：
-
-**第一步，造一个不存在的虚拟文件。** 它不真的在磁盘上建文件，而是给每个内联组件伪造一个路径（比如 `App.vue-setup-component-0.vue`），让源码顶部 `import` 指向它。等打包器来加载这个路径时，`load` 钩子**现场拼出**文件内容。这套「拦截虚拟 id + 现场返回模块代码」的机制，第 3 章「编译期注入虚拟 helper 模块」已经讲透了。本章只看它一个**新侧面**：那里 `load` 返回的是单个 helper 函数模块；而这里 `load` 返回的是一段**完整的合成 SFC**，而且这段 SFC 还会**流回 Vue 编译器被二次编译**——它不是终点，是中转。
-
-**第二步，用一枚延迟求值的闭包当「子弹」，把外层变量射穿那堵墙。** import 边界不让对象直接过去，但它拦不住「一个函数」。所以调用点生成的不是 `{ theme, ... }` 这样的值对象，而是 `() => ({ theme, ... })` 这样一个**现调现取**的函数——这就是那枚子弹。子组件在自己的 setup 里调用它，把外层变量解包出来：
-
-```
-调用点（父文件）        →   子组件内部（虚拟文件 setup）
-(() => ({ theme }))    →   const { theme } = __MACROS_ctx()   // 解包子弹
-```
-
-打个比方：import 边界那堵墙不让搬货过去，但允许你递一张**「凭票即取」的提货单**过去。子组件拿着单子，在 setup 运行那一刻才回头去取货——取到的还是父作用域里**当时**的真实值。
-
-### 4.3 一次完整流转：六步心智模型
-
-把上面两步合起来，一个内联组件从被写出来到真正跑起来，要经历六个阶段。记住这条链，整章就通了：
-
-```
-① 扫描：找出所有内联组件函数体，同时记下每个调用点此刻可见的全部变量名
-② 改写调用点：函数体擦掉，换成「导入名( () => ({ 可见变量 }) )」；文件顶部加虚拟 import
-③ load 合成：把原函数体用 <script setup> 包起来，顶部插一行解包语句
-④ 渲染接管：函数体里的 return () => <JSX> 改写成 defineRender(...)，交给下游
-⑤ Vue 二次编译：合成出的 SFC 流回 Vue 编译器，被正常编成组件工厂
-⑥ 编译后穿针：把「export default 工厂」改成「(ctx) => 工厂」，让工厂接住第②步传来的子弹
-```
-
-说人话就是：**先把组件抽成虚拟文件让它走完编译（①②③⑤），再用一枚延迟闭包在编译后把父作用域变量接进去（⑥）**。前五步是「让它成为正经组件」，第六步是「再把变量还给它」。
-
-谱系里另外两个宏，都是这条链的子集：`setup-block` 停在第①步的文本改名，`setup-sfc` 停在第③步的单文件拼装——它们都不跨文件，更不需要这枚闭包子弹。这也解释了为什么三个宏能排成「侵入度递增」的谱系：它们吃的是同一套底层件，只是吃到了链条的哪一节不同。
-
-### 4.4 最容易被忽略的细节：为什么子弹必须延迟求值
-
-整章最关键、也最容易被一眼扫过去的一句话是：调用点生成的是 `() => ({ theme })`，**不是** `{ theme }`。少这对括号，整个机制就垮了。
-
-来看真实会出现的两种变量。假设调用点长这样：
+拿一段具体输入走一遍。源码：
 
 ```ts
 const foo = 'foo'
-var baz                              // var 会提升，此刻还没赋值
-export const App = defineSetupComponent(() => { /* 想读 foo、baz、还有 App 自己 */ })
+var baz
+export const App = defineSetupComponent(() => {
+  console.log(foo, baz, App)
+})
 ```
 
-- `baz` 是 `var` 声明，会被**提升**到作用域顶部，但在「创建子弹」那一刻它还是 `undefined`（真正赋值在后面）。
-- `App` 是这个组件自身的导出名——在「创建子弹」那一刻，`App` **根本还没被定义**（我们正处在定义它的赋值表达式里），它处于暂时性死区。
+注意 `baz` 是 `var`（提升但调用时尚未赋值）、`App` 是组件自身导出（求值时还没绑定），这两个引用是延迟闭包价值的试金石。
 
-如果子弹是**直接拷值**的对象 `{ foo, baz, App }`，求值发生在创建那一刻：`baz` 会被冻成 `undefined`，而 `App` 会直接撞上死区报错，整段代码崩掉。
+**步骤 1（扫描）**：识别 `defineSetupComponent(...)` 调用，沿作用域链收集可见声明，结果是 `{foo, baz, App}`。
 
-但子弹是 `() => ({ foo, baz, App })`——求值被推迟到**子组件 setup 真正运行**的那一刻。那时 `baz` 早赋了值、`App` 也早就定义好了，函数一调用，读到的全是就绪后的真实值。**延迟这一下，换来的是「捕获那些创建时还不存在的变量」的能力。**
+**步骤 2（Pre·transform）**：调用点覆写为：
 
-代价也很直白：因为它是现调现取，外层要是中途重新赋了值，子组件读到的就是新值——这不是某刻的固定快照，而是实时穿透。这一点对使用者并不透明，留到权衡那节再展开。
+```ts
+import __MACROS_setupComponent_0 from 'app.tsx-setup-component-0.vue'
 
-## 五、关键权衡
+const foo = 'foo'
+var baz
+export const App = __MACROS_setupComponent_0(() => ({ foo, baz, App }))
+```
 
-讲完了「怎么转」，回头看看这套设计到底换来什么、又赔了什么。这一节的篇幅故意比演示还长——「学原理」真正要交付的就是这几条选择。
+此时 `() => ({ foo, baz, App })` 这枚闭包**没有立即求值**，所以 `baz` 的"未赋值"和 `App` 的"未绑定"都不构成问题，引用本身活着。
 
-**权衡 1：把组件抽成虚拟子模块，而不是留在原地当普通函数。**
-做这个选择，是为了让它走完整的 Vue 编译流水线。换来的是：props 校验、emits、JSX 渲染、HMR、IDE 类型工具全都把它当**正经组件**对待，而不是一个「返回 vnode 的普通函数」。代价是：得用 scan / transform / load / postTransform **四个阶段**来协调，而且前三步必须在 Vue 编译**之前**（pre 钩子），最后一步必须在 Vue 编译**之后**（post 钩子）——一个宏因此被硬生生拆成了两个 enforce 钩子。还要给每个组件伪造一条唯一的虚拟路径。
+**步骤 3（Pre·load）**：打包器要加载 `app.tsx-setup-component-0.vue`，load 钩子现场合成：
 
-**权衡 2：用延迟闭包当子弹，而不是直接拷值对象。**
-这条上一节已经预演过。换来的是：能捕获那些「创建子弹时还没就绪」的变量——`var` 的提升、组件自身的自引用导出名，全都能在 setup 运行时取到真值；直接拷值则会读到 `undefined`，甚至直接报错崩溃。代价是：注入的是一个「现读现取」的快照函数，外层的重新赋值会渗透进子组件——读到的不是某刻的固定值，而是 setup 运行那一刻的实时值。语义因此不透明：使用者得心里有数，这些变量是被「实时穿透」进来的。
+```vue
+<script setup>
+const { foo, baz, App } = __MACROS_ctx();
+console.log(foo, baz, App)
+</script>
+```
 
-**权衡 3：在调用点自动收集全部可见声明，而不是让用户手写依赖列表。**
-宏会从当前作用域沿父级一路上溯，把此刻能看到的变量名全都收进闭包。换来的是**零配置**：写内联组件时想用哪个外层变量就直接用，宏自动替你带上。代价有二：一是会把子组件**其实用不上**的变量也一起打进闭包（闭包里多塞了几个名字）；二是它依赖作用域分析能正确识别块作用域——分析若有偏差，要么漏带、要么带错。它还会特意**扣掉**子组件函数体自己声明的局部变量，免得覆盖掉局部名字。
+**步骤 4–5（Vue 二次编译）**：合成 SFC 流回 Vue 编译器，编出 `export default defineComponent({ setup() {...} })`。
 
-**权衡 4：把「作用域参数注入」这一步放到 Vue 编译之后单独做。**
-合成虚拟 SFC 时明明可以一次性把变量塞进去，为什么偏要留到编译后？因为注入必须发生在「Vue 已经把 setup 编成了组件工厂」之后——只有那时，才能稳稳地把 `export default 工厂` 改成 `(ctx) => 工厂`，让工厂接住那枚子弹。换来的是注入位置的**精确性**。代价是：一个宏占了 pre 和 post 两个槽位，而且 Post 还得同时认得 Vite 产出的两种形态——主入口 `.vue` 和 `?vue&type=script` 脚本子块——两层连参数名都不一样，得分支处理。
+**步骤 6（Post·穿针）**：Post 钩子把工厂包成接收 `ctx` 的箭头函数：
 
-## 六、原理演示
-
-光说不动手。下面这段脚本不依赖 Vue、也不依赖任何打包器，纯字符串模拟打包器各阶段看到的产物，再用真实闭包证明子弹真能穿透。把它存成 `demo.js`，`node demo.js` 就能跑：
-
-```js
-// === 演示：虚拟 SFC + 延迟闭包子弹，穿透 import 边界 ===
-
-const body = 'console.log("setup 读到:", foo, baz, App)'   // 用户写的函数体
-const scopes = ['foo', 'baz', 'App']                        // 调用点此刻可见的变量
-
-// ①② Pre：调用点覆写为「导入名( 延迟闭包 )」+ 注入虚拟 import
-const callSite = `__MACROS_setupComponent_0(() => ({ ${scopes.join(', ')} }))`
-console.log('[1] 调用点改写后:')
-console.log(`    import __MACROS_setupComponent_0 from 'App-setup-component-0.vue'`)
-console.log(`    export const App = ${callSite}`)
-
-// ③ load：把函数体包成虚拟 SFC，顶部插一行解包语句
-const sfc =
-  `<script setup>\n` +
-  `  const { ${scopes.join(', ')} } = __MACROS_ctx();\n` +
-  `  ${body}\n` +
-  `</script>`
-console.log('\n[2] load 合成的虚拟 SFC:')
-console.log(sfc)
-
-// ⑤⑥ Post：Vue 编出的工厂被包成接收 ctx 的箭头函数
-console.log('\n[3] Post 穿针后（伪代码）:')
-console.log('    export default (ctx) => defineComponent({ setup(){ const {...} = ctx(); ... } })')
-
-// ---- 真正跑一遍，证明子弹真能穿透 ----
-console.log('\n=== 执行结果 ===')
-function makeFactory (ctxGetter) {
-  return function () {
-    const { foo, baz, App } = ctxGetter()   // 子组件 setup 内：解包闭包子弹
-    console.log('setup 读到:', foo, '|', baz, '|', typeof App)
+```ts
+export default (__MACROS_ctx) => defineComponent({
+  setup() {
+    const { foo, baz, App } = __MACROS_ctx();
+    console.log(foo, baz, App)
   }
-}
-;(function userFile () {
-  const foo = 'foo'
-  var baz                                   // var 提升，此刻是 undefined
-  const bullet = () => ({ foo, baz, App })  // App 此刻还在死区，但闭包没调用就不报错
-  const App = makeFactory(bullet)           // 这一行之后，App 才真正存在
-  baz = 'baz-later'                         // 之后才赋值
-  App()                                     // setup 运行——远晚于子弹创建
-})()
+})
 ```
 
-最后一行输出是整段演示的点睛：
+回到调用点：`__MACROS_setupComponent_0(() => ({ foo, baz, App }))` 现在调用的是一个 `(ctx) => 工厂` 的箭头函数，那枚延迟闭包作为 `ctx` 传进去。setup 内的 `__MACROS_ctx()` 现读现取：此刻外层的 `foo === 'foo'`、`baz` 已经赋过值、`App` 也已绑定到工厂产物，三个值全部正确穿过 import 边界。
 
-```
-setup 读到: foo | baz-later | function
-```
+## 7. 教学简化说明
 
-`baz` 读到的是 `'baz-later'`（在子弹创建之后才赋的值），`App` 读到的是一个函数（子弹创建那一刻它还不存在）。如果子弹是直接拷值的 `{ foo, baz, App }`，`baz` 会冻成 `undefined`，`App` 更会直接撞死区报错。**这对括号 `() =>` 就是权衡 2 的全部代价与回报。**
+本章演示故意省略：多组件索引（一个文件里多个内联组件各自下标）、HMR（`hotUpdate` 递归收集子模块做失效）、作用域链上溯的完整实现（依赖 rollup 的 `attachScopes`）、真 props/JSX 编译（Vue 编译器如何处理合成 SFC 内的 JSX）、Post 的主入口 `.vue` 与 `?vue&type=script` 脚本子块两种产物 id 的参数名分支、resolveId 里 rollup/vite 专属的「子模块相对 import 回主模块 resolve」逻辑。这些都是工程必要但与核心思想无关的实现细节。
 
-演示故意省略了多组件索引、HMR、作用域链上溯的完整实现，以及 Post 对「主入口」与「脚本子块」两种产物形态的分支差异——它们是工程细节，不改变上面的主干原理。
+## 8. 小结
 
-## 七、小结
+这一章把「一个组件 = 一个 `.vue` 文件」撬开了三种松紧不同的口子。最重的 setup-component 用「虚拟子模块 + 延迟闭包」把组合边界从文件退回到函数，代价是一个宏横跨 Pre/Post 两阶段、四步骤协调，闭包的"现读现取"语义也让读者看 `ctx()` 时要多想一层。
 
-这一章把 Vue 那条「一个组件 = 一个文件 = 一个 script setup」的铁律松开了。三个宏按侵入度排成一队：`setup-block` 只改标签、`setup-sfc` 整文件包一层、`setup-component` 跨文件造虚拟组件——它们共用第 1 章的增量编辑和第 3 章的虚拟模块两块地基，只是各自吃到链条的不同节点。
-
-最重的 `setup-component` 用一个精巧的组合回答了「既要独立成文件、又要拿到父作用域变量」这个矛盾：**把函数体抽成虚拟 `.vue` 让它走完整编译，再用一枚延迟求值的闭包，在编译之后把外层变量射穿 import 边界**。延迟这一下，换来的是能捕获那些创建时还不存在的变量，代价是语义变得不透明。
-
-顺带提一句衔接：本章的 `setup-sfc` 和 `setup-component` 都把渲染来源写成了 `defineRender(...)`，当这个渲染来源是 JSX 时，紧邻的下一章「在 JSX 里镜像 Vue 模板指令」会接手——它负责把 `v-if` / `v-for` / `v-model` 这些模板指令，在编译期翻译成等价的 JSX 表达式。
+下一章换条路继续松动 SFC 的形状约束：在 JSX 里镜像 Vue 模板指令，把 `v-if/v-for/v-model` 这些原本只在 `<template>` 里有效的能力，原样搬进 JSX 写法。

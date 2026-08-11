@@ -1,251 +1,224 @@
-# CLI 层：从混乱的命令行表面到一张纯参数表
+# CLI 层：从命令行表面到 ydl_opts 与声明式流水线
 
-## 一、问题先于方案：命令行表面为什么需要一道清洗工序
+> 本章属于 system 层。前置：『YoutubeDL 编排器：贯穿各阶段的 info_dict 主管线』、『声明式后处理流水线与链式 info 变换』。
+> 学完你能：用一句话讲清"为什么核心下载器从不直接碰命令行——所有脏活都被前置到一道独立的清洗工序里"。
 
-想象一个常见的早晨：你敲下 `yt-dlp --extract-audio --no-embed-subs -f best <URL>`，看起来就一行命令。但你没注意到的是——`~/.config/yt-dlp/config` 里你还留着一句 `--embed-metadata`，便携版的 `yt-dlp.conf` 里写了个 `--format best`，而公司机器的系统级配置里管理员又加了一条"忽略用户配置"。再加上几十个历史遗留的废弃开关、一整套为了兼容老工具 `youtube-dl` 而保留的旧开关、还有用户自己造的命令行别名（`--mp3` 其实是一串长开关的缩写）。
+## 1. 为什么需要它（设计动机）
 
-这些来源彼此覆盖、彼此打架、还随版本演进。如果让核心下载逻辑直接面对这一团乱麻，它会立刻被无穷的 `if/else` 兼容分支淹没，永远没法被当作一个干净的库调用。
+上一章把 YoutubeDL 讲成一个胖协调器——它把同一个 info_dict 贯穿提取、下载、后处理五六个阶段，独占所有横切关注点。但它有一个隐藏前提没交代：它接受的入参 `ydl_opts` 是一张**已经干净、已校验、已归一化**的大字典，里面没有命令行字符串、没有冲突开关、没有兼容垫片。这张干净的字典从哪来？这就是本章要接住的口子。
 
-所以这一层做了一件很关键的事，一句话就能点透：**CLI 层不是核心的一部分，而是一道独立的"前台清洗工序"——它把混乱多源的命令行表面，洗成一张干净、已校验、已变成结构化数据的纯参数表（`ydl_opts`），再交给一个对终端一无所知的核心。** 核心只读这张表，就像医生只读一份已经洗白、格式统一的体检报告，而不需要去翻你乱七八糟的原始化验单。
+想象一下用户面对的东西：数百个开关、四五份配置文件（便携版/家目录/用户级/系统级）、一堆为兼容 youtube-dl 留下的老选项、还有用户自己写的 `--alias` 命令行宏。这些来源彼此覆盖、互斥、还会随版本演进。如果核心下载器直接吃这种原始命令行，里面会立刻被无穷的 `if 兼容老行为 else if 转码 else if 嵌字幕` 淹没，永远无法被当作库干净调用。
 
-这张表是怎么洗出来的？整道工序是一条单向流水线，顺序固定、不可调换：
+于是整套机制被前置到一道独立工序里：把多源输入分层合并、把字符串解析成结构化数据、把兼容/弃用项翻译成新选项默认值、把互斥开关的冲突解决掉、把一堆布尔开关展开成一条有序的加工流水线——最后产出的那张纯参数表，才是核心的唯一入口。
 
-```
-收集(多源分层合并) → 预解析重写(别名展开) → 解析(回调把字符串变结构)
-   → 兼容垫片(老开关翻译成新默认) → 校验清洗(互斥裁决/数值归整) 
-   → 翻译流水线(布尔开关展开成有序加工步骤) → 组装纯参数表 → 交给核心
-```
+## 2. 核心思想
 
-下面自底向上，从最底层的"输入怎么并到一起"开始拆。
+**命令行层是一道独立的"脏活清洗器 + 翻译器"，不是核心的一部分。** 它把混乱多源的命令行表面压成一张纯参数表，让核心与终端彻底解耦。
 
-> 关于跨章衔接：这条流水线最后两步——"开关怎么被翻译成后处理步骤"和"核心怎么消费这张参数表"——分别属于第 8 章（声明式后处理流水线）和第 12 章（YoutubeDL 编排器）的领地，本章只看它们的**入口侧**，不重复展开流水线内部和核心内部。
+关键的抽象动作是：清洗层把核心的输入接口从"原始命令行"上移到了"纯参数表"。换句话说，"用户怎么表达意图"和"核心怎么执行意图"被拆到了两个不相干的层——命令行层负责把所有表达方式（命令行/配置文件/兼容老工具/别名）翻译成同一种参数表，核心只负责执行那张表。两边可以各自演进：清洗层重构不影响核心，核心重写内部不触动清洗层。
 
-## 二、第一块基本件：多源输入怎么并到一起——配置分层累积
+## 3. 心智模型
 
-先说输入。一个开关的值可能来自五六个地方，怎么合？
-
-答案是把它们当成一层一层的"配置层"依次叠上去，**后者覆盖前者**。载入顺序是写死的：
+命令行清洗是一条单向五步流水线，顺序固定不可调换：
 
 ```
-Portable(可执行文件旁边) → Home(家目录) → User(用户配置目录) → System(系统级)
-   ↑ 命令行参数早在最前面就作为"最高优先级层"加进去了
+收集 → 预处理重写 → 解析 → 兼容垫片 → 校验 → 翻译流水线 → 组装
+ (分层累积)  (别名展开)  (回调转结构)  (老→新默认)  (冲突/归一化)  (开关→PP)  (搬进 ydl_opts)
 ```
 
-关键在最后两层：**System 是配置文件里最后载入、优先级最高的一层**，而不是最低。正因为系统级是最后说话的，管理员才能在系统级配置里写一句"忽略配置文件"，把优先级更低的**用户级配置整层否定掉**——这不是覆盖某个值，而是直接掐断那一层的载入。
+**配置层** 是"收集"这一步的单位。命令行本身只是其中一层，且优先级最高；下面还有便携/家/用户/系统四层，每层都是一份选项文件。"忽略配置"开关甚至能反向阻断更低层的载入——系统级配置可以决定"用户级配置不要加载"，而非仅仅覆盖值。
 
-说人话就是：覆盖是"我改你的值"，反向阻断是"我让你根本不被读进来"。后者比前者狠得多，也只有在"系统级晚于用户级载入"这个顺序下才成立。
+**回调三件套** 是"解析"这一步的核心：选项解析器不直接产出最终值，而是借助三个回调（变列表、变集合、变字典）把字符串就地转成核心能直接消费的结构化数据。
 
-```python
-# 配置分层累积：便携 → 家 → 用户 → 系统，逐层 append（命令行更早加入、优先级最高）
-def load_configs():
-    yield not ignore_config_files          # 全局短路：若设了忽略，配置文件载入整体跳过
-    yield add_config('Portable', get_executable_path())
-    yield add_config('Home', ...)
-    yield add_config('User', func=get_user_config_dirs)
-    yield add_config('System', func=get_system_config_dirs)   # 最后载入 = 配置文件里最高优先级
-```
+**互斥冲突解决器** 是"校验"这一步的统一出口：当某个"解锁开关"（如 `--allow-unplayable-formats`）启用时，成批与之冲突的开关（嵌元数据/字幕/缩略图、抽取音频、转码等）一律被静默置回默认值，并产"被忽略"警告。
 
-合完之后，命令行永远是最高优先级——它和配置文件根本不是一个性质的东西，配置文件的"忽略"开关管不到它。
+**翻译表** 是"翻译流水线"这一步的产物：一张有序的"开关→加工步骤"表，按固定顺序 yield 出步骤字典；步骤间的先后依赖靠 yield 的物理顺序 + 作者注释保证（没有显式依赖图）。
 
-## 三、第二块基本件：字符串表面怎么变成结构——选项回调三件套
+最后**组装** 把清洗过的字段逐个手工搬进一张约 160 键的大字典，连同那条流水线整体塞进去，交给核心。
 
-光把值合并还不够。命令行传进来的通通是字符串：`--sub-langs en,zh` 是一串、`--colors always` 是一串、`--postprocessor-args "FFmpeg:-bsf:a aac_adtstoasc"` 也是一串。可核心要的是列表（字幕语言）、集合（颜色策略）、字典（每个加工器的参数）。
+## 4. 关键权衡
 
-中间这道翻译，靠的是三个回调函数，它们在声明每个开关时就地把字符串**改写进解析器的值对象**（`parser.values`），而不是返回一个值让别人去接——这是为了迁就底层选项解析库"回调没有返回值、靠改对象生效"的老规矩。三件套各有分工：
+### 4.1 脏活前置换核心与终端彻底解耦
 
-- `_list_from_options_callback` → 列表（支持追加、前置、去空）
-- `_set_from_options_callback` → 集合（带一张允许值表、一张别名表、还有一个 `all` 通配）
-- `_dict_from_options_callback` → 字典（`KEY:VAL` 文法，支持多键、默认键、分桶追加）
+清洗层把所有兼容、归一化、冲突解决、翻译都揽在自己身上，核心只认一份"已干净的参数表"。
 
-这样解析一结束，参数表里就直接是核心能立刻用的结构，不用再做一轮"字符串→对象"的转换。代价是：解析逻辑被打散散落在几百个开关的声明里，而不是集中在一个校验函数里——你很难一眼看全"某个开关到底被解析成了什么"。
+- **换来**：同一个核心能跑命令行、能当库被 import、能被 GUI 前端调用，三种入口对核心完全等价。
+- **代价**：必须维护一张上百字段、手工逐字段搬运的"选项→参数"映射表；新增一个开关要改声明、校验、映射、流水线多处。
+- **本质矛盾**：这是"外部表现自由度"与"内核纯净度"的对立——清洗层把外部表现的所有复杂度吸收掉，内核才能保持单一可推理形态。任何想让内核能被多种前端平等复用的系统都会撞上这道取舍，路径几乎只有这一条：在中间加一道清洗层。
 
-## 四、老开关和新开关怎么和平共处——兼容垫片与弃用吸收
+### 4.2 配置分层累积而非整体覆盖
 
-开关还分新旧。`yt-dlp` 沿用了老工具 `youtube-dl` 的一批开关名，但内部早换了新实现。怎么让老脚本能跑、又不让两套开关打架？
+配置文件按便携→家→用户→系统的顺序逐层 append 进累加器，命令行最后作为最高优先级层叠加，合并时按层序逐字段覆盖。
 
-底层先铺了一块地基：解析器构造时设了 `conflict_handler='resolve'`，意思是**同一个目标字段（dest）若被多条选项声明（新开关、它的兼容版、它的否定版）都指过，按"后写的覆盖先写的"解析**。这是新老开关能共存的底层前提——它们指向同一个 dest，最终只有一个值留下来。
+- **换来**：多级配置可叠加共存（系统级配置 + 用户偏好 + 一次命令行临时覆盖可以三层都生效）；并且能在系统级配置里用"忽略配置"开关反向阻断用户级配置的载入。
+- **代价**：合并语义复杂，肉眼难以判断"某个值到底从哪一层来"，只能靠详细模式打印分层追溯排查。
+- **本质矛盾**：这是"多主体各自主张"与"最终单一决策"的对立——管理员、用户、当前命令各想各的，最后必须坍缩成一份。累积式合并是允许各层都"留个脚印"的最弱约束合并；与之对立的是整体覆盖（后者简单但失去分层表达力）。任何多源配置系统都绕不开这个取舍。
 
-在这块地基之上，兼容垫片 `set_compat_opts` 做的是**翻译**，而不是直接驱动行为：每一个兼容老开关，都被翻译成"对新选项默认值的一次覆盖"。规则很精细——
+### 4.3 字符串就地解析成结构化数据
 
-- 如果启用了某兼容项，**且用户没有显式设置对应的新选项**：就把新选项设成老工具的行为值；
-- 如果用户**已经显式设置了**新选项：那这个兼容项就失效了，系统给它名字前面打个 `*` 标记，表示"已不再生效"。
+解析阶段不直接产出最终值，而是借助"回调三件套"把字符串开关当场转成列表/集合/字典。
 
-这条垫片必须跑在**校验之前**。原因很实在：如果垫片在校验之后跑，它翻译出来的默认值就会被当成"用户显式设置的值"参与互斥裁决，得出完全错误的结论。
+- **换来**：参数表里直接就是核心能用的结构（加工器参数是字典、字幕语言是列表、颜色策略是集合），校验层和核心都不需要再做语法解析。
+- **代价**：回调函数签名古怪（要适配老选项解析库"无返回值、靠改 parser.values 生效"的约定），解析逻辑分散在选项声明里而非集中在校验处，阅读选项声明时必须同时读懂其回调。
+- **本质矛盾**：这是"语法处理位置"的对立——集中校验 vs 边解析边结构化。集中校验的好处是一处看全、坏处是字符串必须先以原始形态流过整个校验链；就地解析让 token 一读到就立刻定型，省去后续反复解析，但逻辑被打散到声明里。任何要把一堆命令行 token 变成程序参数的系统都站在这条分叉口。
 
-至于真正被废弃、连兼容都不想留的开关，处理得更安静：它们被注册成"只记一下自己的名字、帮助文本标记为隐藏"，运行时啥也不干，只是把名字累计进一个列表，留到校验阶段统一转成一条弃用警告，然后从选项对象上把自己删掉。老脚本因此不会因为一个废弃开关而崩，但代价是这张弃用清单只增不减，是一条长期维护债。
+### 4.4 别名靠"塞回待解析队列"实现零侵入宏
 
-## 五、打架的开关听谁的——互斥裁决与校验聚拢
+`--alias` 在声明期动态造出新选项；触发时把别名代表的原始开关串（经 shell 分词）塞回待解析队列头部，相当于在解析前重写了命令行。预设别名（mp3/aac/mp4/mkv/sleep）走同一通道。
 
-有些开关天生不能同时为真。比如开了 `--allow-unplayable-formats`（允许拿到不可播放的原始格式），那么"嵌入元数据 / 嵌字幕 / 抽取音频 / 转码"这一整批加工动作就都失去了意义——你拿的是原始流，往上嵌东西也嵌不进去。
+- **换来**：别名机制零侵入核心解析逻辑——别名可以引用任何已有开关、连参数占位都支持，本质就是"命令行宏"。
+- **代价**：别名展开发生在解析之前、且可自我递归（别名 A 展开成包含别名 B 的串），必须设触发次数上限防爆；同时别名的实际效果对用户不透明，错误排查需手动展开。
+- **本质矛盾**：这是"宏展开位置"的经典对立——前置重写（宏在词法层就展开）vs 后置翻译（宏在语义层才翻译）。前置重写让宏与现有指令完全等价，代价是失去语义校验时机、必须单独防递归。这套取舍和 C 预处理器、shell alias 走的是同一条路。
 
-裁决它们的是一个统一的互斥解决器 `report_conflict`，套路是"守卫开关 + 成批冲突项"：
+### 4.5 弃用选项静默吸收而非报错
 
-```python
-def report_conflict(arg1, opt1, arg2='--allow-unplayable-formats', opt2='allow_unplayable_formats', ...):
-    if not val2:        # 守卫开关没开 → 根本没有冲突，直接返回
-        return
-    if val1:
-        warnings.append(f'{arg1} is ignored since {arg2} was given')
-    setattr(opts, opt1, default)   # 冲突项被静默置回默认值 + 产一条"被忽略"警告
-```
+弃用开关被注册为只调一个记录回调、且帮助文本标记为隐藏；触发时不报错，只把自身名字累计进一个列表，校验层再统一转成"弃用警告"。
 
-它的态度很明确：**宁可警告，也不强行改写用户的明确意图**。冲突项不是报错退出，而是悄悄置回默认并告诉用户"我没理你这个开关"。同样的成对冲突还有"播放列表反转 vs 随机""日期范围上下界""转码 vs 重封装"等。
+- **换来**：向后兼容与平滑迁移——老脚本不会因为某个被废弃的开关而崩，用户有时间逐步迁移。
+- **代价**：弃用开关列表只增不减，是长期维护债；兼容老工具（youtube-dl）的整套"兼容选项"还要在校验前另垫一层翻译（把兼容项翻译成新选项默认值覆盖，用户若已显式设置则把该兼容项标记为"已失效"）。
+- **本质矛盾**：这是"接口稳定性"与"代码精简度"的对立——保留旧入口永远不碎、但旧代码越积越多；激进删除让代码精简、但破坏既有脚本。任何长生命周期 CLI 工具都会被这条取舍拽住，常见折中就是"静默吸收 + 隐藏帮助 + 弃用警告"。
 
-除了互斥，所有"需要把字符串变成机器值或结构"的活——限速/缓冲/分片大小（字节量）、重试次数（支持 `inf`）、重试睡眠表达式（线性/指数）、输出模板、章节时间区间、浏览器 cookie 串、地理伪装——全都被**聚拢到同一个校验函数**里集中处理，校验失败统一抛 `ValueError`，由上层转成解析器报错。这样字符串到机器值的转换只发生在一处，不会散落各处各自实现一遍。
+## 5. 最小原理演示
 
-## 六、一堆布尔开关怎么排成一条流水线——翻译表与注释化顺序
-
-清洗到最后一步，还要把一堆布尔开关排成一条**有序的后处理流水线**。这一步靠的是 `get_postprocessors`——它本质上是一张"开关 → 加工步骤"的**有序翻译表**，按固定顺序一条条产出步骤字典：用户显式加的 → 元数据解析 → SponsorBlock → 字幕/缩略图格式转换 → 音频提取 → 视频重封装 → 视频转码 → 嵌字幕 → 章节裁剪 → 写元数据 → 嵌缩略图 → ……
-
-这里有个容易被忽略的设计：**步骤之间的先后依赖，没有用一张显式的依赖图来表达，而是靠产出的物理顺序 + 作者注释来保证。**
-
-```python
-# ModifyChapters must run before FFmpegMetadataPP          ← 顺序约束写在注释里
-if opts.remove_chapters or sponsorblock_query:
-    yield {'key': 'ModifyChapters', ...}
-# FFmpegMetadataPP should be run after FFmpegVideoConvertorPP and
-# FFmpegExtractAudioPP as containers before conversion may not support metadata ...
-if opts.addmetadata or opts.addchapters or opts.embed_infojson:
-    yield {'key': 'FFmpegMetadata', ...}
-```
-
-比如"裁剪章节必须早于写元数据""写元数据必须晚于音频提取和视频转码（因为转换前的容器可能根本不支持元数据）""扩展属性必须晚于一切可能改文件内容的步骤"。这些约束全部以注释形式钉在代码里。这正是第 8 章所讲"正确顺序依赖作者硬编码的注释化约束"在**入口侧**的体现——流水线内部如何链式传递、如何自动挂进度钩子，第 8 章已展开，这里不重复。
-
-> 一个边界细节值得点一下：这张翻译表并非纯函数——它在翻译过程中会顺手**回写**选项（比如开启"嵌字幕"时把"写字幕"也打开）。所以它必须在参数表组装之前调用，好让这些回写被忠实地搬进最终参数表。
-
-## 七、把五步串成一条线——入口流水线与纯参数表组装
-
-把上面这些步骤按固定顺序串起来，就是 CLI 的真正入口。顺序不能调换，每一步都卡着下一步的前提：
-
-1. **兼容垫片必须在校验之前**——否则垫片翻译出的默认值会被当成"用户显式设置"，污染互斥裁决；
-2. **流水线展开必须在校验之后**——因为展开依赖的是校验修正过的开关值。
-
-校验完成后，最后一步是**组装**：把清洗过的字段逐个、手工搬进一张大字典（约 160 个键），同时把上一步那张流水线列表整体塞进其中一个键。搬运过程中还有少量"二次派生"——比如根据转码/音频格式推导出最终文件扩展名，再比如"模拟模式"不是纯开关：若用户没显式指定，则当"仅打印""取字段"这类开关任一为真时，自动推导成模拟模式。
-
-组装完这张纯参数表，入口才构造核心对象 `YoutubeDL(ydl_opts)`。核心如何消费这张表、如何让同一个 `info_dict` 贯穿提取→选格式→下载→后处理各阶段，是第 12 章的内容，这里不展开。从 CLI 的视角看，它的工作到此结束：**交出一张干净表，转身走人。**
-
-## 八、最小演示：一个能跑的迷你清洗器
-
-把上面四块基本件压成一个几十行的 TS 清洗器，演透"分层合并 + 反向阻断 + 互斥裁决 + 翻译流水线 + 纯参数表交给核心"。
+下面这段 TS 演示清洗层的核心四步：分层合并 → 冲突校验 → 翻译流水线 → 组装纯参数表交给核心。它对应权衡 4.1（脏活前置）、4.2（分层累积）、4.3（结构化产出）。
 
 ```ts
-// mini-cli-cleaner.ts —— 迷你命令行清洗器
-// 演：多源分层合并 → 互斥裁决 → 开关翻译成有序流水线 → 产出纯参数表交给核心
+type Layer = 'portable' | 'home' | 'user' | 'system' | 'cli'
 
-type Layer = {
-  label: string;                       // 便携 / 家 / 用户 / 系统 / 命令行
-  flags: Record<string, unknown>;
-  ignoreLower?: boolean;               // 本层声明"忽略更低级别的配置文件层"
-};
+// 一层配置 = 一组开关，命令行只是其中最高优先级的一层
+type RawOpts = {
+  extractAudio?: boolean
+  embedSubs?: boolean
+  embedMetadata?: boolean
+  format?: string
+  ignoreConfig?: boolean
+  allowUnplayable?: boolean
+}
 
-const warnings: string[] = [];
+// 加工步骤声明式：只声明 key 与参数，不携带行为
+type PPStep = { key: string; when?: 'pre' | 'post'; [k: string]: unknown }
 
-// ① 分层合并：便携 → 家 → 用户 → 系统，后者覆盖前者；命令行最后、最高优先级
-function mergeLayers(layers: Layer[]): Record<string, unknown> {
-  const merged: Record<string, unknown> = {};
-  for (const layer of layers) {
-    if (layer.ignoreLower) {
-      // 高级别（如系统级）写了一句"忽略配置"：否定此前所有配置文件层，本层自身仍生效
-      for (const k of Object.keys(merged)) delete merged[k];
+// 核心只读这张纯参数表，从不接触原始开关
+type YdlOpts = {
+  format: string
+  extractAudio: boolean
+  postprocessors: PPStep[]
+  simulate: boolean
+}
+
+// 假核心：只读纯参数表
+function core(opts: YdlOpts) {
+  return { received: opts }
+}
+
+// 分层合并：按层序逐字段覆盖，命令行最后写胜
+function mergeLayers(layers: { layer: Layer; opts: RawOpts }[]): RawOpts {
+  const ordered = ['portable', 'home', 'user', 'system', 'cli'] as const
+  const sorted = [...layers].sort(
+    (a, b) => ordered.indexOf(a.layer) - ordered.indexOf(b.layer),
+  )
+  const merged: RawOpts = {}
+  for (const { layer, opts } of sorted) {
+    // "忽略配置"层能反向阻断更低层载入，分层累积特有的表达力
+    if (opts.ignoreConfig && layer !== 'cli') continue
+    Object.assign(merged, opts)
+  }
+  return merged
+}
+
+// 互斥冲突解决：解锁开关启用时，成批冲突开关静默置默认
+function validate(opts: RawOpts): { opts: RawOpts; warnings: string[] } {
+  const warnings: string[] = []
+  if (opts.allowUnplayable) {
+    for (const k of ['embedSubs', 'embedMetadata', 'extractAudio'] as const) {
+      if (opts[k]) {
+        warnings.push(`--${k} is ignored since --allow-unplayable was given`)
+        opts[k] = false
+      }
     }
-    Object.assign(merged, layer.flags);   // 同名键后者覆盖前者
   }
-  return merged;
+  return { opts, warnings }
 }
 
-// ② 互斥裁决：守卫开关开启时，成批冲突项静默置默认 + 产警告
-function reportConflict(
-  flags: Record<string, unknown>,
-  arg: string, key: string,
-  guard: string, guardKey: string, def: unknown,
-): void {
-  if (!flags[guardKey]) return;          // 守卫没开 → 无冲突
-  if (flags[key]) {
-    warnings.push(`${arg} is ignored since ${guard} was given`);
-    flags[key] = def;
+// 翻译流水线：开关→有序加工步骤，先后约束靠 yield 顺序 + 注释固化
+function buildPostprocessors(opts: RawOpts): PPStep[] {
+  const steps: PPStep[] = []
+  if (opts.extractAudio) {
+    steps.push({ key: 'FFmpegExtractAudio' })
   }
+  // 写元数据必须晚于音频提取：转换前的容器可能不支持元数据
+  if (opts.embedMetadata) {
+    steps.push({ key: 'FFmpegMetadata' })
+  }
+  return steps
 }
 
-// ③ 开关 → 有序加工步骤（顺序约束靠注释 + 物理顺序保证）
-type PP = { key: string };
-function toPipeline(flags: Record<string, unknown>): PP[] {
-  const steps: PP[] = [];
-  // 【顺序约束】裁剪章节必须早于写元数据：
-  if (flags.removeChapters) steps.push({ key: 'ModifyChapters' });
-  // 【顺序约束】写元数据必须晚于音频提取/转码（转换前的容器可能不支持元数据）：
-  if (flags.addMetadata) steps.push({ key: 'FFmpegMetadata' });
-  return steps;
-}
-
-// ④ 组装纯参数表（真实约 160 个键，这里只示意几个）
-function buildYdlOpts(flags: Record<string, unknown>, pipeline: PP[]) {
+// 组装：把清洗过的字段逐个搬进纯参数表
+function assemble(opts: RawOpts, postprocessors: PPStep[]): YdlOpts {
   return {
-    format: flags.format ?? 'best',
-    extractAudio: !!flags.extractAudio,
-    postprocessors: pipeline,
-  };
+    format: opts.format ?? 'bestvideo*+bestaudio/best',
+    extractAudio: opts.extractAudio ?? false,
+    postprocessors,
+    simulate: false,
+  }
 }
 
-// 假核心：对终端一无所知，只读这张表
-function core(ydlOpts: ReturnType<typeof buildYdlOpts>) {
-  console.log('核心收到纯参数表：', ydlOpts);
+// 入口：串起五步单向流水线，顺序不可调换
+function parseOptions(layers: { layer: Layer; opts: RawOpts }[]): YdlOpts {
+  const merged = mergeLayers(layers)
+  const { opts, warnings } = validate(merged)
+  if (warnings.length) console.warn(warnings)
+  const postprocessors = buildPostprocessors(opts)
+  return assemble(opts, postprocessors)
 }
 
-// —— 跑一遍 ——
-const merged = mergeLayers([
-  { label: '便携', flags: { format: 'best' } },
-  { label: '家',   flags: {} },
-  { label: '用户', flags: { addMetadata: true } },
-  { label: '系统', flags: { removeChapters: true } },
-  { label: '命令行', flags: { format: 'mp4' } },   // 始终最高优先级
-]);
-
-reportConflict(merged, '--embed-metadata', 'addMetadata', '--allow-unplayable', 'allowUnplayable', false);
-const pipeline = toPipeline(merged);
-core(buildYdlOpts(merged, pipeline));
-console.log('警告：', warnings);
+const ydlOpts = parseOptions([
+  { layer: 'user', opts: { embedMetadata: true, format: 'best' } },
+  { layer: 'cli', opts: { extractAudio: true, embedSubs: false } },
+])
+console.log(JSON.stringify(ydlOpts, null, 2))
 ```
 
-最小 `package.json`，能 `bun run start` 或 `npx tsx mini-cli-cleaner.ts` 跑：
+跑出来长这样：
 
 ```json
-{ "name": "mini-cli-cleaner", "scripts": { "start": "bun run mini-cli-cleaner.ts" } }
-```
-
-运行输出（注意 `format` 被命令行覆盖成 `mp4`、流水线按注释约束排好了先后）：
-
-```
-核心收到纯参数表： {
-  format: 'mp4',
-  extractAudio: false,
-  postprocessors: [ { key: 'ModifyChapters' }, { key: 'FFmpegMetadata' } ]
+{
+  "format": "best",
+  "extractAudio": true,
+  "postprocessors": [
+    { "key": "FFmpegExtractAudio" },
+    { "key": "FFmpegMetadata" }
+  ],
+  "simulate": false
 }
-警告： []
 ```
 
-这正好演了本章的核心：**脏活（合并、阻断、裁决、翻译）全在清洗器里做完，核心拿到的就是一张干净表。** 演示里故意省略了真实的选项解析库绑定、几百个开关的完整声明、密码交互、自更新、插件目录加载——那些是工程脚手架，不表达核心思想。
+核心拿到的是一张完全干净、没有冲突、没有字符串待解析的参数表；它根本不知道命令行层发生过什么。
 
-## 九、关键权衡（集中回看）
+## 6. 执行轨迹
 
-本章机制集中，下面五条核心权衡讲清了"为什么这么设计"。
+拿 research 给的具体例子走一遍。
 
-**① 在校验与兼容层把脏活全做完、再交给纯参数驱动的核心。**
-做了"前置一道独立清洗工序"的选择 → 换来核心与终端彻底解耦：同一个核心能跑命令行、能当库 `import`、能被 GUI 前端平等调用，因为它从不接触原始命令行 → 代价是必须维护一张上百字段、手工逐字段搬运的"选项 → 参数"映射表，新增一个开关往往要同时改声明、校验、映射多处。
+**输入**：命令行 `--extract-audio --no-embed-subs -f best`，叠加用户级配置 `--embed-metadata`。
 
-**② 配置文件分层累积（便携 → 家 → 用户 → 系统，逐层叠加、后者覆盖前者；系统级可用"忽略配置"开关反向掐断用户级的载入；命令行始终是最高优先级的一层）。**
-做了"分层叠加而非整体覆盖"的选择 → 换来多级配置能叠加共存（便携打底、家目录补、用户加偏好、系统级最后定夺且可统一否决用户级），让管理员有能力从系统级一刀切断用户的配置 → 代价是合并语义复杂、某个值最终由哪一层决定难以肉眼判断，只能靠详细模式逐层打印来追溯。
+1. **收集**：两层叠加——`{layer: 'user', embedMetadata: true}` + `{layer: 'cli', extractAudio: true, embedSubs: false, format: 'best'}`。
+2. **合并**：按层序逐字段覆盖，得到 `{extractAudio: true, embedSubs: false, format: 'best', embedMetadata: true}`。
+3. **预处理重写**：未命中任何别名（用户没传 `--alias` 也没用 mp3/aac 等预设别名），跳过。
+4. **解析**：所有开关都已是布尔或单值字符串，无需触发回调三件套。
+5. **兼容垫片**：扫一遍兼容项表，无相关项命中（用户没传任何 youtube-dl 兼容开关），跳过。
+6. **校验**：`-f best` 触发"建议性警告"（提示用户改用 `bestvideo*+bestaudio/best`），但不强行改写用户意图；`embedMetadata` 隐含开启 `addchapters`；没有 `allow-unplayable` 故无互斥冲突。
+7. **翻译流水线**：按固定顺序 yield——`extractAudio` 命中，先吐 `FFmpegExtractAudio`；`embedMetadata` 命中，再吐 `FFmpegMetadata`（写元数据必须晚于音频提取，因为转换前的容器可能不支持元数据）。结果是一条两步的有序流水线。
+8. **组装**：把清洗过的字段逐个搬进 `ydl_opts`，`simulate` 由"仅打印/取字段类开关"二次派生为 `false`，流水线整体塞进 `postprocessors` 键。
+9. **交给核心**：`YoutubeDL(ydl_opts).download(urls)`——核心只读这张表，对它经过的清洗工序一无所知。
 
-**③ 用选项回调把字符串就地解析成列表 / 集合 / 字典等结构化数据。**
-做了"在声明阶段就翻译、就地改写解析器值对象"的选择 → 换来参数表里直接就是核心能用的结构（加工器参数是字典、字幕语言是列表、颜色策略是集合），省掉二次转换 → 代价是回调函数签名古怪（无返回值、靠改 `parser.values` 生效，纯属迁就老选项解析库的约定），解析逻辑被打散散落在开关声明里，而不是集中在可一眼看全的校验处。
+整条轨迹的要点是：每一步只做一件确定的事、只读上一步的产物，五步顺序不可调换（兼容垫片必须在校验前，否则兼容翻译出的默认值会被当成"用户显式设置"；流水线展开必须在校验后，因为展开依赖校验修正过的开关）。
 
-**④ 别名（含预设别名 mp3/aac/mp4/mkv/sleep）通过"把展开串塞回待解析队列头部"实现。**
-做了"别名 = 解析前的命令行重写"的选择 → 换来零侵入的命令行宏：别名可以引用任何已有开关、连参数占位都支持，不需要为别名单独写一套分发逻辑 → 代价是别名展开发生在解析之前、可以自我递归（别名引用自己或互相引用），必须对每个别名的触发次数设上限（`ALIAS_TRIGGER_LIMIT`）防爆。
+## 7. 教学简化说明
 
-**⑤ 弃用选项不报错、只静默记录名字并隐藏帮助文本。**
-做了"静默吸收而非报错"的选择 → 换来向后兼容与平滑迁移：老脚本不会因为碰上一个废弃开关而崩，用户能无感升级 → 代价是弃用开关的清单只增不减，是一条长期维护债；而兼容老工具 `youtube-dl` 的那整套兼容选项，还得在校验前额外垫一层翻译（把老开关翻成新默认值，用户已显式设置时还要打 `*` 标记为失效）。
+本章演示故意省略了：选项解析库本身（标准库 optparse 的绑定与对其私有方法的重写）、数百个开关的完整声明、回调三件套的完整签名（带允许值表/别名表/`all` 通配的集合回调、带 `KEY:VAL` 文法与默认键的字典回调）、`--config-location` 引起的二次配置解析、密码交互输入、自动更新逻辑、Windows 双击可执行的特殊处理、插件目录加载、外部下载器参数的 `PP+EXE` 复合键语法。这些是工程脚手架或映射表细节，不表达"清洗层把脏活全揽"这条核心原理。
 
-## 十、小结
+## 8. 小结
 
-回到开头的那个早晨：四五个配置文件、几百个开关、新旧并存、用户别名、废弃开关——这些混乱没有一滴流进核心。CLI 层像一道前置的清洗工序，用"分层合并 + 字符串翻译 + 兼容垫片 + 互斥裁决 + 流水线翻译"把命令行表面洗成一张纯参数表，核心只对着这张表工作。
+把"用户面对的混乱表面"和"核心实际消费的干净参数"之间挖一道独立的清洗工序，是这套 CLI 设计的全部。命令行层不是核心的入口，而是核心的过滤器——它把一切兼容、归一化、冲突、翻译都吃进自己，让核心只面对一张已经定型的纯参数表。于是同一个核心能跑命令行、能当库、能被前端调，三种入口等价。
 
-往回看整条链路：这张表交出去之后，开关翻译出来的那条后处理流水线如何被一条链跑起来、如何在每个加工器之间传递 `info_dict`，是第 8 章的"声明式后处理流水线"；而这张表如何驱动核心贯穿提取→选格式→下载→后处理各阶段，是第 12 章的"YoutubeDL 编排器"。本章是这条链路的**最外层入口**——它决定了"用户到底说了什么"，然后把这句话翻译成机器能干净执行的一份指令。
+至于 YoutubeDL 那个胖协调器为什么从来不直接碰 `sys.argv`——清洗层早就把一切办好了，它根本不需要知道命令行长什么样。

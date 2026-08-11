@@ -1,244 +1,171 @@
 # 滚动位置恢复
 
-## 一个让人牙痒的场景
+> 本章属于 composite 层。前置：History 抽象（栈位置语义）、路由位置与 URL 解析（地址字符串化）。
+> 学完你能：用一句话讲清「为什么滚动恢复要用『栈位置 + 地址』当复合 key、为什么要在导航生命周期的特定时刻存取」。
 
-你在商品列表页往下翻了三屏，滚到第 800 像素，点进一个商品看详情。看完按浏览器后退，本以为页面会停回你刚才看的那一行——结果它"啪"地跳回顶部，你得重新翻。
+上一章把导航守卫串成了一条 promise 链，让「异步、可取消、可重定向」的导航钩子统一成可组合的异步单元——它把**「能不能通过」**这件事讲透了。但守卫管线专注于逻辑门控，不管导航通过之后用户的「视觉状态」怎么接回原处。最显眼的视觉状态就是滚动位置：用户在长列表滚到很深的地方，点进详情，按浏览器后退——本以为会回到原处，结果弹回了顶部。本章就接这个口子。
 
-传统多页网站基本不会有这个毛病：浏览器自己记得每个历史条目的滚动位置，后退时自动还原。但到了单页应用，DOM 是同一套、页面根本没刷新，浏览器的原生记忆要么对不上号、要么干脆失效。所以这件事得由路由框架自己接管。
+## 1. 为什么需要它（设计动机）
 
-Vue Router 的接管方式是提供一个新选项 `scrollBehavior`：你写一个函数，告诉它"导航到新页面后该滚到哪"。听着只是"滚一下"这么简单，可真要把它做对——尤其处理后退/前进时的位置还原——里面藏着三个不那么显然的设计。这一章就拆这三个设计。
+单页应用切换路由时页面并不刷新，DOM 是被持续复用的。这导致浏览器原生的滚动恢复机制要么失效、要么对不上号——原生机制依赖「页面重载」，而 SPA 根本不重载。
 
-## 先认识它的两个基本件
+更隐蔽的坑是：**同一个地址在前进/后退栈里可能出现多次**。比如用户走 A→B→A→B→A，栈里 `/a` 就有三个独立槽位。如果只拿地址当存档的 key，后一次入栈会覆盖前一次，永远恢复不对。
 
-一个滚动位置，说穿了就是两个数：`{ left, top }`，外加一个可选的 `behavior`（要不要平滑滚动）。框架对外还允许你返回"滚到某个元素" `{ el: '#xx' }`，但内部都会换算成坐标。换句话说，无论你说"滚到 800 像素"还是"滚到 #title 这个元素"，最后都变成两个数。
+再叠加一个矛盾：**导航是异步、可中止、可被新导航插队的**。这意味着「存滚动」太晚会丢（守卫跑一半被取消），「取滚动」太早会被随后的渲染冲掉或落到错的新页上。所以问题不只是「存到哪个槽」，还有「在哪一刻存、在哪一刻取」。
 
-这些位置存在哪？一张进程内的 `Map`，`Map<key, 坐标>`。它只在内存里活着，刷新页面就没了。所以它服务的场景很明确：同一次会话、不刷新的前提下，记住你滚到过哪。这两个基本件都很平凡，真正有意思的是那个 `key`。
+## 2. 核心思想
 
-## 为什么不能拿地址当存档槽
+把**栈位置**请进 key，与地址组合成复合 key；把**保存与恢复**绑死在导航生命周期的特定时刻——`popstate` 触发那一刻就抢存，导航确认 + 下一渲染周期后再取。让滚动可见性跟随导航事件，而不是跟随数据什么时候到。
 
-最直觉的做法：拿 URL 当 key。`/list` 滚到 800，就存 `/list → 800`；回到 `/list` 时取出来还原。但这里有个坑，历史栈常常长这样：
+## 3. 心智模型
 
 ```
-位置1: /home
-位置2: /list    ← 滚到 800
-位置3: /detail
-位置4: /list    ← 又滚到 300
+事件              historyStatePos     动作
+──────────────────────────────────────────────────────────────────
+初始              pos=2 在 /list      用户滚到 y=800
+push /detail      pos=3 在 /detail    新压栈，不在此存档
+pop（后退）       pos=2 在 /list      popstate 触发 → 立即抢存 /detail 滚动
+                                        key = (pos − delta):/detail
+                                      守卫管线跑（可能被中止）
+                                      导航确认 → currentRoute 切到 /list
+                                      取 /list 存档：key = (pos − 0):/list
+                                      等下一渲染周期
+                                      校验 /list === currentRoute.value
+                                      滚动到存档位置
 ```
 
-同一个 `/list` 在栈里出现了两次，一次滚到 800、一次滚到 300。如果你只用地址当 key，第二次的 300 会把第一次的 800 盖掉；等你后退回位置 2 的 `/list`，取出来的是 300——错了。
+三个关键不变量：
 
-所以光有地址不够，还得带上"这是栈里的哪一槽"。key 真正的形态是 `栈位置 + 地址`：`2:/list` 和 `4:/list` 是两份互不干扰的存档。
+- **存档表是模块级单例 Map**，key 是 `"栈位置:地址"`，value 是 `{top, left}`。刷新即失，不做持久化。
+- **保存路径与恢复路径用同一公式 `position − delta` 算 key**——保存传 `(from, delta)`，恢复传 `(to, 0)`。两侧对齐靠的是「popstate 后 history.state 已是目标态」这一时序。
+- **存档读后即删**：同一份存档不会被第二次消费，因为页面早已变样。
 
-> 类比一下：这就像寄存柜。你不止认包的名字（地址），还得认它寄存在第几号柜（栈位置）。同一个包名可以进多个柜子，互不覆盖。
+## 4. 关键权衡
 
-"栈位置"这个概念不是本章发明的。前一章（History 抽象）已经在浏览器那个不太靠谱的 history 之上，给每次压栈记了一个递增的 `position`，并在 popstate 时算出"这步跨了几个槽"（步长 `delta`）。那章讲的是**为什么需要 position、它怎么补上方向语义**——这里我们直接拿这个 `position` 来当 key 的第一个维度，不重复展开。地址那段字符串（`/list` 这种 `fullPath`）则来自更前面的"路由位置与 URL 解析"那一章建立的字符串化语义，本章也只取它当 key 的第二段。
+### 栈位置进 key，反推一步对齐存取
 
-## 这把 key 怎么算出来：枢纽在这里
+选择把栈位置请进 key 的第二维度，于是同一个 `/list` 在栈位置 2 与栈位置 5 是两条独立存档；并在 `popstate` 触发后用 `history.state.position − delta` 反推「被影响的那一个栈槽」——保存传 `(from, delta)`、恢复传 `(to, 0)`。
 
-key 的公式看着就一行：
+换来的是「同地址多次入栈可分别留档」加「保存与恢复共用同一把 key」的双重对称：用户在 A→B→A→B→A 来回走，每次的滚动值都能各自恢复，不会互相覆盖。
+
+代价是这把 key 的含义极不直观——「为什么要减 delta？」读者必须先掌握「popstate 发生时历史栈状态已翻到目标」这个时序细节，否则完全看不懂。
+
+**本质矛盾**：用户视角的 URL 同一性 对立于 浏览器后退语义下的物理槽位同一性。同一个 `/list` 在 URL 维度是同一个，在栈维度是多个独立的「访问记录」。把它们叠在 key 里，存档就既不丢同一性、也不混淆不同的访问记录。反推那一步本质是「从事后通知倒推事前的槽位」——popstate 是事后通知，事件触发时历史栈已翻完，但你关心的槽位在过去，只能倒推回去。
+
+### 在下一渲染周期应用滚动，并校验导航未过期
+
+选择把真正的 `scrollTo` 推迟到 `nextTick`（Vue 的 DOM patch 之后）之后，并在执行前再次校验 `to === currentRoute.value`——也就是这次导航的目标仍是当前路由快照。
+
+换来两件事：连点导航时，为旧路由算出的滚动绝不会误投到新路由（校验失败就不滚）；顺带等视图把新路由的 DOM 渲染出来再滚，否则会滚到尚未出现的元素，或被随后的渲染冲掉。
+
+代价是滚动有约一帧的延迟，并且滚动策略函数必须返回可解析的位置（坐标或元素选择器）；返回假值即「本次不滚」——这是用户表达「这次导航我不希望框架替我滚」的逃生口。
+
+**本质矛盾**：滚动是渲染完成后的视觉副作用，而导航是异步状态机。如果在导航一确认就立刻滚，会被随后的 Vue 渲染冲掉；如果在策略 resolve 之前用户又触发了一次新导航，旧导航算出的滚动会落到错的新页上。等一帧解决「视图还没好」，校验解决「导航已被插队」——把滚动的可见性跟导航状态机的稳定时刻绑定，而不是跟数据到达时刻绑定。
+
+### 抢在守卫之前抓存，读出立即消费
+
+选择在 `popstate` 一发生、`navigate` 之前就抢存来源页的当前滚动；取出时立即 `delete`，一次性消费。
+
+换来两件事：即便后续守卫异步中止或重定向，真实滚动位置也已被先一步抓到（守卫跑完再抓就晚了——视图可能已经动过）；同一份存档不会被重复消费，因为下一次访问同样地址时页面早已是另一回事。
+
+代价是存档只活在内存里（刷新即失），需要 history 实现层另设一道「页面将隐藏时把滚动塞进 history.state」的兜底，才能在刷新后粗粒度恢复——那条线属 history 实现层，本章不展开。
+
+**本质矛盾**：事件的瞬时状态（当前滚动值） 对立于 后续异步流程的可中止性。popstate 是个稍纵即逝的瞬时事件，但导航后续可能是几秒级的异步流程；想保住瞬时值就必须在事件触发的那一刻抓走，而不是等流程跑完。
+
+## 5. 最小原理演示
+
+下面这段只演示三件事：栈位置 key 的反推、读后即删、连点导航的过期校验。元素选择器解析、CSS 转义、`scrollTo` 的旧浏览器降级、刷新兜底全部省略。
 
 ```ts
-function getScrollKey(path: string, delta: number): string {
-  const position = history.state ? history.state.position - delta : -1
-  return position + path
-}
-```
+type ScrollXY = { top: number; left: number }
 
-`position + path` 好懂，拼字符串。难懂的是 `position - delta` 这一步——为什么不直接用 `position`，要减一个 `delta`？
+// 模块级单例存档表：key = "栈位置:地址"
+const scrollPositions = new Map<string, ScrollXY>()
 
-答案藏在一个时序细节里：**popstate 触发的时候，浏览器的 history 状态已经翻到目标页了**。也就是说，这行代码此刻读到的 `history.state.position` 是"目标栈位置"，不是"来源栈位置"。
+// 三个由外部（history 抽象层 + 导航主循环）维护的状态
+let historyStatePos = 0                          // popstate 后已是目标栈位置
+let currentRoutePath = ''                        // 当前路由快照
+let currentScroll: ScrollXY = { top: 0, left: 0 }
+const scrollLog: ScrollXY[] = []
+const scrollTo = (p: ScrollXY) => scrollLog.push(p)
 
-- 保存的时候，你要存的是"来源页"的滚动。来源页在目标页的 `delta` 步之外，所以 `目标position - delta` 才反推回来源槽。调用方传的是 `(from.fullPath, delta)`。
-- 恢复的时候，你要取的是"目标页"的存档。目标就在当前位置，`delta` 传 0，`position - 0` 直接就是目标槽。调用方传的是 `(to.fullPath, 0)`。
+// 反推被影响栈槽：保存传 delta 反推来源槽；恢复传 0 直得目标槽
+const getScrollKey = (path: string, delta: number) =>
+  `${historyStatePos - delta}:${path}`
 
-两条路径，一个减 delta、一个不减，恰好对齐到同一把 key 上——存的时候写 `2:/list`，取的时候读 `2:/list`，天衣无缝。这就是整个机制最巧妙的地方。
-
-## 存与取，绑死在导航的特定时刻
-
-key 解决了"存哪、取哪"。接下来是"什么时候存、什么时候取"。整个时序是一条单向流水线：
-
-```
-popstate 响应
-  → 抢存来源页滚动（减 delta 反推来源槽）
-  → 跑守卫管线（可能异步、可能被取消/重定向）
-  → 切「当前路由快照」到目标页
-  → 取目标槽存档（读后即删，取不到降级用兜底）
-  → 等下一帧渲染
-  → 校验「这次导航仍是当前导航」
-  → 真正滚动
-```
-
-**第一步，关掉浏览器的原生恢复。** 只要你提供了 `scrollBehavior`，框架就把 `history.scrollRestoration` 设成 `'manual'`，宣告"这件事我来管，你别插手"，免得两套机制打架。
-
-**第二步，后退/前进时，抢在导航真正开始之前存。** 用户按后退，popstate 一响，框架在跑任何守卫、任何异步逻辑之前，先把来源页当前能看到的滚动位置抓下来存好：
-
-```ts
-// 在 pop 监听里、navigate 之前
-saveScrollPosition(
-  getScrollKey(from.fullPath, info.delta),  // 反推来源槽
-  computeScrollPosition()                    // 当前可见的滚动
-)
-```
-
-为什么要这么急？因为一旦进入守卫管线，导航可能被异步守卫卡住、可能被取消、可能被重定向。等那些都走完，页面可能早就不是来源页了，那时候再想抓"来源页滚到哪了"已经抓不准了。所以一进门就先抢存。
-
-**第三步，导航确认后取出来用，而且读完就删。** 等守卫都通过、当前路由快照切到目标页之后，进入 `handleScroll`：取目标槽的存档，取不到就降级用一份历史栈状态里的兜底位置，都没有就给策略函数传 `null`。取的时候是"读后即删"：
-
-```ts
-function getSavedScrollPosition(key) {
-  const scroll = scrollPositions.get(key)
-  scrollPositions.delete(key)  // 取出即消费，不留到下次
-  return scroll
-}
-```
-
-为什么删？因为这份存档只对"这一次"回到目标页有意义。你已经在目标页了，存档用完就该作废。要是不删，下次再撞上同名 key，会取出一份"上上次的旧位置"，而那时页面早就不是当初那个样子了，滚过去只会错位。
-
-**第四步，等下一帧渲染，并且再次确认导航没过期。** 拿到候选位置后不是立刻滚，而是：
-
-```ts
-return nextTick()                                   // 等视图渲染出新路由
-  .then(() => scrollBehavior(to, from, position))   // 让用户策略算最终位置
-  .then(pos =>
-    to === currentRoute.value && pos && scrollToPosition(pos)  // 再确认一次
-  )
-```
-
-两个保险叠在一起：`nextTick()` 是等新路由的 DOM 真正渲染出来（不然你滚到的元素还没出现，或被随后的渲染顶回原位）；`to === currentRoute.value` 是确认"算这个位置时所依据的那次导航，到现在还是当前导航"——如果中间用户又点了一次导航，`currentRoute` 已经变了，这行条件不成立，旧位置就不会被错误地滚到新页上。
-
-## 关键权衡
-
-这一节是本章真正的交付：把上面那些"为什么这么做"提炼成可复述的取舍。本章机制集中在这几处，逐一展开。
-
-**权衡一：用"当前栈位置 − 步长"反推被影响的那一个槽，而不是直接拿当前栈位置当 key。**
-- **换来**：保存和恢复用的是同一把 key。保存时（pop 已发生、历史栈状态已是目标）用 `目标position - delta` 反推出来源槽；恢复时用 `目标position - 0` 直取目标槽，两侧天然对齐。
-- **代价**：这把 key 的含义很不直观。你必须先理解"popstate 发生时历史栈状态已经是目标态"这个时序细节，否则完全看不懂为什么保存要减 delta、恢复却传 0。它是用"理解成本"换"存取对称"。
-
-**权衡二：滚动恢复放在下一个渲染周期之后，并且应用前再次校验"这次导航的目标是否仍是当前路由"。**
-- **换来**：连点导航时，为旧路由算出的滚动绝不会误投到新路由；顺带等视图把新路由的 DOM 渲染出来再滚，避免滚到还没出现的元素。
-- **代价**：滚动有大约一帧的延迟，而且用户的 `scrollBehavior` 必须返回一个能解析的位置（返回假值就等于"这次不滚"）。是用"一帧延迟 + 策略函数的返回约束"换"不串页"的健壮性。
-
-**权衡三：滚动位置在导航真正开始之前就抢存，取出时"读后即删"。**
-- **换来**：即便后续守卫异步中止或重定向，真实滚动位置也已被先一步抓到；同一份存档不会被重复消费（页面早已变样）。两个保证一次到手。
-- **代价**：存档只活在内存里，刷新就没了。要在刷新后还能粗略恢复，得另设一道"页面即将隐藏时把滚动塞进历史栈状态"的兜底（那属于 history 实现层，这里不展开）。是用"刷新不持久"换"异步安全 + 不重复消费"。
-
-## 最小演示：把三件套跑给你看
-
-下面这段只演示三件事：**栈位置 key 的对称反推、读后即删、导航未过期校验**。它故意省略了元素选择器解析、真实 `scrollTo`、刷新兜底这些枝节，只留原理骨架。
-
-```ts
-// 最小滚动恢复：只演「栈位置 key + 读后即删 + 导航未过期校验」三件套
-
-type ScrollBehavior = (
-  to: string,
-  from: string,
-  saved: number | null
-) => number | null
-
-// 进程内内存表：key = "position:path" → scrollY
-const scrollPositions = new Map<string, number>()
-
-// 模拟「当前历史栈状态」——popstate 后它已是目标态（对应 history.state.position）
-let currentPosition = 0
-// 模拟「当前路由快照」——只有它才是视图真实显示的路由（对应 currentRoute.value）
-let currentRoute = ''
-
-// —— 三件套之一：栈位置 key（枢纽）——
-// currentPosition 此刻是「目标栈位置」：保存时减 delta 反推来源槽，恢复时 delta=0 直取目标槽
-function getScrollKey(path: string, delta: number): string {
-  return `${currentPosition - delta}:${path}`
+// pop 一发生就抢存（在守卫之前）
+function saveOnPop(fromPath: string, delta: number) {
+  scrollPositions.set(getScrollKey(fromPath, delta), { ...currentScroll })
 }
 
-// —— 三件套之二：读后即删 ——
-function save(key: string, y: number) {
-  scrollPositions.set(key, y)
-}
-function take(key: string): number | null {
-  const v = scrollPositions.get(key)
-  scrollPositions.delete(key) // 取出即消费，不留给下一次
-  return v ?? null
+// 取出即删：同一存档只消费一次
+function consumeSaved(targetPath: string): ScrollXY | null {
+  const key = getScrollKey(targetPath, 0)
+  const pos = scrollPositions.get(key) ?? null
+  scrollPositions.delete(key)
+  return pos
 }
 
-function scrollTo(y: number) {
-  console.log(`    scrollTo(${y})`)
+// 用户滚动策略：有存档回存档，无存档回顶
+const userScrollBehavior = (_to: string, _from: string, saved: ScrollXY | null) =>
+  saved ?? { top: 0, left: 0 }
+
+// 核心：等渲染 → 调策略 → 校验导航未过期 → 滚
+async function handleScroll(to: string, from: string, saved: ScrollXY | null) {
+  await Promise.resolve()                        // 模拟 nextTick，等 DOM patch 完
+  const resolved = userScrollBehavior(to, from, saved)
+  if (to === currentRoutePath && resolved) {     // 期间没被新导航插队？
+    scrollTo(resolved)
+  }
 }
 
-// 用户策略：有存档就原样还，没存档滚到顶
-const behavior: ScrollBehavior = (_to, _from, saved) =>
-  saved != null ? saved : 0
+// —— 场景 A：存与取的对称（反推栈槽对齐）——
+// 起点：栈位置=3，在 /detail，滚到 y=500
+historyStatePos = 3
+currentScroll = { top: 500, left: 0 }
+// 后退一步（步长 -1），popstate 把 historyStatePos 翻到目标态 2
+historyStatePos = 2
+saveOnPop('/detail', -1)                          // 反推槽位 = 2 − (−1) = 3，存 '3:/detail'
+console.log(scrollPositions.get('3:/detail'))     // { top: 500, left: 0 }
 
-// 模拟一次 pop 导航：popstate 已发生，currentPosition 已翻到目标
-function pop(to: string, from: string, delta: number, fromScroll: number) {
-  // 1) 导航真正开始之前，抢存「来源页」当前的滚动
-  const fromKey = getScrollKey(from, delta) // 目标槽 - delta = 来源槽
-  save(fromKey, fromScroll)
-  console.log(`  存: key="${fromKey}" → ${fromScroll}`)
+// 一段时间后又前进回 /detail（栈位置=3，步长 +1）
+historyStatePos = 3
+// 取目标存档：delta=0 → key = '3:/detail'，与当年保存的 key 完全一致
+const recovered = consumeSaved('/detail')
+console.log(recovered)                            // { top: 500, left: 0 }
+console.log(scrollPositions.has('3:/detail'))     // false（读后即删）
 
-  // 2) 导航确认，切当前路由快照
-  currentRoute = to
-
-  // 3) 取目标槽（delta = 0），读后即删
-  const toKey = getScrollKey(to, 0)
-  const saved = take(toKey)
-  console.log(`  取: key="${toKey}" → ${saved}`)
-
-  // 4) 等渲染 + 校验「导航未过期」再真正滚
-  return Promise.resolve()
-    .then(() => behavior(to, from, saved))
-    .then(pos => {
-      if (to === currentRoute && pos != null) {
-        console.log(`  校验通过：${to} 仍是当前路由`)
-        scrollTo(pos)
-      } else {
-        console.log(`  校验拦截：${to} 已不是当前路由，丢弃滚动`)
-      }
-    })
-}
-
-// ========== 执行轨迹：后退再前进，看存取对称 ==========
-;(async () => {
-  // 起点：/list（栈位置 2）滚到 800
-  currentPosition = 2
-  currentRoute = '/list'
-
-  console.log('① 按后退 /list(2) → /home(1)，步长 -1')
-  currentPosition = 1 // popstate 已把状态翻到目标
-  await pop('/home', '/list', -1, 800)
-  // 存 "1-(-1)=2:/list" → 800；取 "1:/home" → null（首次，无存档）
-
-  console.log('② 按前进 /home(1) → /list(2)，步长 +1')
-  currentPosition = 2
-  await pop('/list', '/home', +1, 0)
-  // 存 "2-1=1:/home" → 0；取 "2:/list" → 800  ← 与 ① 写入的是同一把 key！
-
-  // —— 三件套之三：连点导航，看「未过期校验」拦截 ——
-  console.log('③ 连点导航：为 /list 算位置的同时，又被导航到 /detail')
-  currentPosition = 3
-  // 开始一次到 /list 的导航，但不 await，让它悬着
-  const stale = pop('/list', '/home', 0, 0)
-  // 在它的滚动落地之前，更新的导航把当前路由改成了 /detail
-  currentRoute = '/detail'
-  await stale // 旧导航算出的滚动会被校验拦截，不会误投到 /detail
-})()
+// —— 场景 B：连点导航，校验阻止旧滚动误投到新页 ——
+scrollLog.length = 0
+currentRoutePath = '/list'
+const pending = handleScroll('/list', '/home', { top: 800, left: 0 })
+// pending 还在等 nextTick 时，用户又点了一次 → currentRoutePath 已切到 /other
+currentRoutePath = '/other'
+await pending
+console.log(scrollLog)                            // [] —— '/list' !== '/other'，没滚
 ```
 
-跑起来你会看到：第 ② 步取出的正是第 ① 步存进去的 800——因为两次的 key 都是 `2:/list`，存取对称了；第 ③ 步里，为旧导航 `/list` 算出的滚动，因为 `currentRoute` 已经变成 `/detail`，被 `to === currentRoute` 拦下，没有错误地滚过去（若没有这道校验，那次滚动就会"串"到 `/detail` 页面上）。
+## 6. 执行轨迹
 
-配一个最小 `package.json`，装上 `tsx` 就能直接 `node`/`bun` 跑：
+把场景 A 走一遍：
 
-```json
-{
-  "name": "scroll-restoration-demo",
-  "private": true,
-  "scripts": { "demo": "tsx demo.ts" },
-  "devDependencies": { "tsx": "^4.0.0" }
-}
-```
+- 用户在 `/list` 滚到 y=800（栈位置=2）。
+- 点进 `/detail`（push，栈位置=3）。push 不在 pop 监听里存档——新页面没有「旧滚动」要记。
+- 用户按浏览器后退。`popstate` 触发，`historyStatePos` 翻到 2，`delta = -1`，`to=/list`、`from=/detail`。
+- 路由器**在调用任何守卫之前**先 `saveOnPop('/detail', -1)`：算 key = `2 − (−1) = 3` → `'3:/detail'`，把当前滚动值（/detail 离开时的滚动）存进表。
+- 守卫管线跑（可能被中止/重定向）。这里假设通过。
+- 导航确认，`currentRoutePath` 切到 `/list`。
+- 滚动处理：`consumeSaved('/list')` 算 key = `2 − 0 = 2` → `'2:/list'`。这一条是用户更早一次访问 /list 时存下的，取出 y=800，`delete`。
+- `await nextTick`（让 Vue 把 /list 的视图 patch 完）。
+- 调用户的滚动策略，得到 `{top: 800}`。
+- 校验 `'/list' === currentRoutePath`（成立）→ `scrollTo({top: 800})`。✓
 
-## 小结
+如果在第 6 步与第 9 步之间用户又点了一次新导航（比如连点到 `/other`），`currentRoutePath` 会先被切到 `/other`；待 `nextTick` resolve 时校验失败，旧滚动就不会误投到 `/other`。
 
-滚动恢复这件事，难点不在"怎么滚"，而在"记准该滚回哪、且别滚错页"。Vue Router 的解法可以浓缩成一句：**用"栈位置 + 地址"当 key 存滚动，把存与取绑死在导航生命周期的特定时刻。**
+## 7. 教学简化说明
 
-它做了三处不太显然的设计：靠 `position - delta` 让存取 key 对称（用一点理解成本换对称）；把恢复推迟到下一帧并校验 `to === currentRoute`（用一帧延迟换"不串页"）；存的时候抢在导航开始前、取的时候读后即删（用"刷新不持久"换异步安全和不重复消费）。
+本章演示故意省略了：元素选择器（`{el: '#xxx'}`）的解析与 CSS 转义、`getBoundingClientRect` 到文档绝对坐标的换算、不支持 `scroll-behavior` 的旧浏览器降级、开发期的诊断码、滚动策略函数多种返回值分支的细节、以及 history 实现层那条「页面将隐藏时塞 `history.state.scroll`」的刷新兜底。这些都不影响讲清「为什么用栈位置当 key 的第二维度、为什么要在导航生命周期的特定时刻存取」。
 
-值得注意的是，这套机制是"挂在"导航生命周期上的：它依赖一个会随导航推进而切换的"当前路由快照"、依赖一个在 popstate 时算出步长的 history 监听、依赖守卫跑完之后的那个"导航确认"时刻。这些"当前路由快照怎么来、导航什么时候才算确认、连点导航怎么被取消"——正是下一章"Router 核心与导航主循环"要拆的：那是一个把 matcher、history、guards、scroll 拼到一起的可取消异步导航状态机，本章的滚动恢复只是挂在它生命周期上的一个小部件。
+## 8. 小结
+
+让滚动位置跟「栈槽位」对齐，而不是跟「URL 字符串」对齐——同一个地址多次入栈也各有各的存档。让滚动的存取跟导航事件对齐，而不是跟数据到达对齐——`popstate` 一发生就抓、`nextTick` 之后再消费，中间夹一道「导航是否仍是最新」的校验。下一章「Router 核心与导航主循环」把 matcher、history、guards 加上本章这套 scroll 机制组装成完整的导航状态机，看它怎么用 `pendingLocation` 让任何阶段都能被新导航作废。

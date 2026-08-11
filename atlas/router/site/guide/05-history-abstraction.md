@@ -1,198 +1,246 @@
+---
+title: History 抽象：URL 模型的可导航可监听接口
+---
+
 # History 抽象：URL 模型的可导航可监听接口
 
-路由器要驱动「守卫 → 视图 → 滚动恢复」这一整套流程，得先回答四个问题：这次是前进还是后退？从哪来？到哪去？上一次滚到哪了？可偏偏这四个问题的答案，浏览器一个都不直接告诉你。
+> 本章属于 primitive 层。前置：路由位置与 URL 解析。
+> 学完你能：用一句话讲清「上层 router 完全不碰 `window.history`，三套底层策略透明可换」是怎么做到的——为什么要在不透明 state 上叠一层方向账本、为什么 hash 能零成本复用 html5、为什么内存栈也能跑同一套路由。
 
-## 浏览器自带的那套历史接口，为什么不能直接用
+## 1. 为什么需要它（设计动机）
 
-想象你站在路由器的位置，伸手去摸 `window.history`。你会摸到这么几样东西：
+上一章把「一次导航失败」拆成可恢复的位标志，中止、取消、重定向各有各的"形状"。但失败的"主体"（一次导航）从哪里发起、又是怎么被上层 router 感知的，还没人答。这条最底层的口子，正是本章的入口。
 
-- `history.state` —— 一个不透明的黑盒，你往里塞什么它就存什么，但它**自己没有任何结构**。它不会告诉你「上一站是哪」「下一站是哪」。
-- `history.length` —— 一个整数，但它是**栈里条目的总数**，不是「我现在站在第几格」。你退后了三步，这个数可能一个字都不变。
-- `history.back()` / `forward()` / `go()` —— 能移动指针，但移动完**不告诉你往哪个方向移了、移了几格**。
-- 相邻的两条历史记录，**根本读不出来**。
+想象一下你直接对 `window.history` 编程。`history.state` 是个不透明的单值；`history.length` 只给你栈的总条数，相邻条目读不到；更糟糕的是没有「方向」概念——用户点了后退按钮、代码主动 `push`、还是前进？这三类来源在原生 API 里是同一副面孔。上层路由要驱动守卫、视图、滚动恢复，每一件都得知道这次「是前进还是后退、从哪来、到哪去、上一次滚到哪」。直接用这套底层 API，上层就得反复猜。
 
-说人话就是：浏览器把整段浏览历史藏在一条你看不见、摸不着的栈里，只给你一个能往前挪往后挪的摇杆，连「我现在在第几层」都不报数。路由器要是直接用这套接口，上层代码就得不停地猜：刚才那个 popstate 是前进还是后退？滚动能恢复吗？我是不是已经在这个位置了？
+矛盾就摆在这：**浏览器的历史 API 状态隐式、无方向、不可信任；上层路由却需要确定的方向/位置/滚动语义**。于是需要一个中间层，把这套低级又不可靠的 API 包成一块「自己重新记账」的深模块——这就是 History 抽象。
 
-于是需要一块中间层：**在浏览器这套靠不住的接口之上，自己重新记一本带「方向」和「位置序号」的账本**，对外只露一个窄窄的、可以换底层实现的接口。这就是本章要讲的东西。
+## 2. 核心思想
 
-## 一块谁都能看见的窄接口
+**在不可靠的浏览器历史 API 之上，自己重新记一本带方向与位置序号的账本，对外只露出一个可换实现的窄接口。**
 
-先看最底下那块基本件——上层路由器一辈子只会打交道的东西，就这一份契约：
+把这句话拆成两层：账本负责「把不透明状态变成可读的方向/位置信息」，窄接口负责「让上层根本不知道底下是 html5、hash 还是 memory」。深模块的灵魂也在这里——接口窄到只剩 `push/replace/go/listen`，实现厚到要塞进整套状态机和兜底。
 
-```ts
-type HistoryLocation = string          // 一段完整路径，如 "/users/42?q=1#top"
-enum NavType { pop = 'pop' }           // 导航类型：外部触发的位置变化
-enum NavDir { back = 'back', forward = 'forward', unknown = '' }
-interface NavInfo { type: NavType; direction: NavDir; delta: number }
-type Listener = (to: HistoryLocation, from: HistoryLocation, info: NavInfo) => void
+## 3. 心智模型
 
-interface RouterHistory {
-  readonly location: HistoryLocation   // 当前在哪（只读）
-  readonly state: any                  // 当前这格附带的账本数据（只读）
-  push(to: HistoryLocation): void      // 往前推一格
-  replace(to: HistoryLocation): void   // 改写当前格
-  go(delta: number, triggerListeners?: boolean): void  // 前进/后退 N 格
-  listen(cb: Listener): () => void     // 注册一个监听器，返回注销函数
+接口长这样：五个方法加两个只读 getter。
+
+```text
+RouterHistory {
+  base, location, state        // 只读 getter
+  push(to), replace(to), go(delta)
+  listen(cb), createHref(to), destroy()
 }
 ```
 
-注意一个关键设计：`location` 和 `state` 是**只读的 getter**，外部只能读、不能赋值。上层想改位置？只能通过 `push` / `replace` / `go`。这样一来，**位置怎么存、存哪儿、序号怎么算，全是这块中间层的私事**，上层一概不碰。这就是把变化关进门里的「深模块」——门面很窄（六个方法加两个 getter），但门后藏着整本账本和三套可以互换的底层策略。
+上层 router 只拿这套，从不直接碰 `window.history`。
 
-至于 `location` 那段路径字符串，router 拿到之后怎么把它拆成 path / query / hash、又怎么用 matched 链判断「是不是同一个地方」从而短路重复导航——那是上一章「路由位置与 URL 解析」已经讲透的事，本章只管**这段字符串是怎么被生产出来、还顺手附带了「方向」**。
+要先划清一条边界：history 吐出的只是「完整路径字符串」（如 `/users?page=2`）。把它 resolve 成结构化路由位置、并判定「是不是同一位置而短路」是上一层的活，已在『路由位置与 URL 解析』讲透——本章只关心这段字符串怎么被产出并附带方向语义。
 
-## 监听契约：一个回调吃下所有「外部来的变化」
+账本的核心动作是把 `history.state` 那个不透明黑盒「重新规定」成结构化的 `StateEntry`：
 
-上面那份接口里最值得单独拎出来说的，是 `listen` 的回调签名 `(to, from, info)`。第三个参数 `info` 是个三元组：**类型 + 方向 + 步数差**。
+```text
+StateEntry {
+  back, current, forward   // 上一站 / 当前 / 下一站（路径字符串）
+  position                 // 栈内绝对序号
+  replaced                 // 是不是 replace 来的
+  scroll                   // 当前格的滚动位置
+}
+```
 
-为什么是这个形状？因为位置变化可能从好几个口子进来：用户点浏览器的后退按钮、用户点前进按钮、代码里调了 `go(-2)`。这些来源在上层看来根本不该分门别类去处理——它们都是「位置变了，我得跟着更新视图」。所以中间层把它们**统一翻译成同一个三元组**：往后退了几格、往前进了几格，一清二楚。
+一次 `push('/b')`（从 `/a` 出发）的内部流程：
 
-需要点透一个细节：`push` 和 `replace` 是路由器**自己发起**的，它本来就知道发生了什么（push 就是前进），所以这俩**不会**触发监听器。监听器只为「不是路由器自己发起的变化」准备——主要是用户戳浏览器后退/前进按钮。这么一讲你就明白了，监听器吐的 `type` 永远是 `pop`，它存在的全部意义，就是把「外部来的、方向不明的位置跳变」翻译成路由器能直接用的「方向 + 步数」。
+1. **先补旧格**：把当前 `/a` 那格原地改写——`forward: '/b'`、`scroll: 当前滚动`。
+2. **再追加新格**：新条目 `{back: '/a', current: '/b', forward: null, position: 旧+1}`。
+3. **当前位置指针指向 `/b`**。
 
-## 内存实现：自己造一截历史栈
+用户点浏览器后退 → 触发 `popstate` 事件 → handler 读出事件里携带的那格 state → 方向 = 新 position − 旧 position → 逐个通知监听者 `(to, from, {type: 'pop', direction, delta})`。
 
-现在动手写第一个实现。最干净、最能跑通的是「内存版」——用一个数组当历史栈，一个指针当当前位置：
+三套实现（html5/hash/memory）共用这套心智模型，差别只在「栈到底由谁记」。
+
+## 4. 关键权衡
+
+### 把方向/位置/滚动塞进不透明 state，换语义可见
+
+浏览器历史 API 的 `state` 字段本意只是给你存任意数据，是个不透明的共享内存。这里做了一个看似霸道的选择：**自己规定它的结构，把 back/current/forward/position/scroll 全塞进去**。
+
+换来的是上层路由能精确知道方向、栈内绝对位置、上次滚动——这三件事原生 API 一件都不直接给。后续的滚动恢复章会拿 position 当 key 保存滚动值，前进/后退不同位置可有不同滚动；重复导航短路也会用同一位置语义。
+
+代价落在两处。其一，那条 state 变成「双方共写的共享内存」：任何外部代码（另一个库、一段遗落的 `history.pushState`）改写它，账本就错乱。其二，**当前位置无法直接读到，只能用「相邻两次 state.position 的差」间接推出来**——popstate 事件里你必须先记住上一格的 position，再做减法。
+
+这条权衡化解的本质矛盾是：**「需要确定的方向/位置语义」与「浏览器只提供单一不透明状态」之间的鸿沟**。通解骨架是「在不可靠底层之上叠一层自管的记账层」——凡是被不可靠底层逼到墙角的场景（比如自管连接池、自管光标位置）都套这条骨架。
+
+### hash 把基准前缀标准化成井号，零成本复用 html5
+
+hash 模式（URL 形如 `example.com/#/users`）乍看是另一套独立实现——毕竟它把整个 path 塞进 hash 段。但这里做了一个偷懒的选择：**`createWebHashHistory` 仅把 base 标准化成「以 `#` 结尾」的形态，然后直接 `return createWebHistory(base)`**。
+
+换来的是零成本复用整套状态机、整套 popstate 监听、整套方向推导。三套策略实际收敛为两份代码。
+
+代价落在 html5 实现内部：它被迫长出两条分支——`createCurrentLocation` 要先判断 URL 里有没有 `#`，有就从 hash 段取 path、没有就从 pathname 取；`changeLocation` 拼 URL 时也要看 base 是不是 `#` 形态来决定要不要前缀 `#`。分支膨胀是这条偷懒的直接账单。
+
+这条权衡化解的本质矛盾是：**「多套底层策略各自独立」与「核心状态机不宜复制粘贴」之间的张力**。通解骨架是「找一层语义透明的归一化点，让差异化下沉到入参预处理」。
+
+### 无 DOM 环境，用数组 + 指针自造一截历史栈
+
+SSR 和测试环境没有 `window.history`，但路由代码最好能原样跑。这里的选择是：**用一个 `queue: [url, state][]` 数组加一个 `position` 指针，自己造一截历史栈**。
+
+换来的是 SSR 与测试环境无浏览器也能跑同一套路由，三实现同构。组件可以在 Node 里被正确地「装作在 /users 页」渲染。
+
+代价是这一截栈是内存里的幻象：刷新即丢（状态不进 URL）、起点必须由用户显式设置（不像浏览器至少有当前 URL）、移动指针不产生真正的 URL 副作用（地址栏不变）。所以 SSR 渲染完会把 `queue[0]` 当首屏位置、客户端 hydrate 时再换回真历史。
+
+这条权衡化解的本质矛盾是：**「上层路由希望同构运行」与「目标环境没有浏览器历史 API」之间的落差**。通解骨架是「把环境 API 抽象成接口、用内存数据结构兜住缺失环境」。
+
+### 监听回调统一吐「类型 + 方向 + 步数差」三元组
+
+原生 API 让你区分不出事件来源——浏览器前进后退按钮、代码主动 `pushState`、代码 `go(-1)` 跳转，三者在 popstate 里都长一个样。这里做了一个统一的选择：**所有监听者只注册一个回调，回调签名固定为 `(to, from, {type, direction, delta})` 三元组**。
+
+换来的是上层只挂一个回调即可同时响应三类来源；`info.delta` 还能直接当滚动 key 用（同一 URL 在栈不同位置可有不同滚动）。
+
+代价是 HTML5 实现内部变微妙：popstate 触发时，handler 必须用 `state.position − fromState.position` 反推方向，还得用一个 `pauseState` 标记吞掉「自己主动 `go` 触发的回声事件」——不然你 `go(-1)` 会先收到一次自己造成的 popstate，造成回路。状态机的隐式约定变多，新人读源码容易卡在「这里为什么 return」。
+
+这条权衡化解的本质矛盾是：**「事件来源多样」与「上层希望一个回调搞定一切」之间的张力**。通解骨架是「在底层把异质来源归一化成统一事件信封，代价是底层状态机要承担归一化的复杂度」。
+
+## 5. 最小原理演示
+
+下面这段 TS 演透两件事：窄接口能跑通上层逻辑；两套实现（内存栈 / 浏览器账本）共享同一接口，可透明替换。工程上故意省略的东西见 §7。
 
 ```ts
-const START = ''                        // 空串 = 「还没有位置」的栈底哨兵
-function createMemoryHistory(): RouterHistory {
-  const listeners: Listener[] = []
-  const queue: [HistoryLocation, any][] = [[START, {}]]   // 栈：每格 [路径, 账本]
-  let position = 0                       // 指针：现在站在第几格
+// --- 窄接口：所有实现只暴露这套 ---
+interface NavigationInfo {
+  type: 'pop' | 'push'
+  direction: 'back' | 'forward' | 'unknown'
+  delta: number
+}
+type NavigationCallback = (to: string, from: string, info: NavigationInfo) => void
 
-  const setLocation = (to: HistoryLocation) => {
-    position++
-    if (position !== queue.length) queue.splice(position) // 中途导航：丢掉所有「前进」格
-    queue.push([to, {}])
-  }
+interface RouterHistory {
+  readonly location: string
+  push(to: string): void
+  replace(to: string): void
+  go(delta: number): void
+  listen(cb: NavigationCallback): () => void
+}
+
+// --- 内存实现：数组 + 指针自造一截栈 ---
+function createMemoryHistory(): RouterHistory {
+  let queue: [string, any][] = [['', {}]]  // 空串 = START 哨兵（与前置章 START_LOCATION 同构）
+  let position = 0
+  const listeners = new Set<NavigationCallback>()
 
   return {
     get location() { return queue[position][0] },
-    get state()    { return queue[position][1] },
-    push: setLocation,
-    replace(to) { queue.splice(position, 1); position--; setLocation(to) },
-    go(delta, shouldTrigger = true) {
-      const from = queue[position][0]
-      const direction = delta < 0 ? NavDir.back : NavDir.forward   // 步数差正负 → 方向
-      position = Math.max(0, Math.min(position + delta, queue.length - 1)) // 钳在栈内
-      if (shouldTrigger)
-        listeners.forEach(cb => cb(queue[position][0], from, { type: NavType.pop, direction, delta }))
+    push(to) {
+      position++
+      // 中途导航要截断「前进」条目，忠实模拟浏览器行为
+      if (position < queue.length) queue.splice(position)
+      queue[position] = [to, { position }]
     },
-    listen(cb) { listeners.push(cb); return () => listeners.splice(listeners.indexOf(cb), 1) },
+    replace(to) { queue[position] = [to, { position }] },
+    go(delta) {
+      const next = Math.max(0, Math.min(queue.length - 1, position + delta))
+      if (next === position) return
+      const from = queue[position][0]
+      position = next
+      // 方向由步数差正负推出；监听者拿到的是统一信封
+      const direction = delta < 0 ? 'back' : 'forward'
+      listeners.forEach(cb =>
+        cb(queue[position][0], from, { type: 'pop', direction, delta }))
+    },
+    listen(cb) { listeners.add(cb); return () => listeners.delete(cb) },
   }
 }
-```
 
-这段代码演透了三件事：
-
-第一，**栈底那一格是 `START = ''`**。这个空串哨兵跟上一章的 `START_LOCATION` 是一回事，都表示「还没有位置」；那章讲过它对首次导航的意义，这里只看它在历史栈里充当「栈底」的角色——队列一初始化就 `[ [START, {}] ]`，指针指在 0，谁都还没去过任何地方。
-
-第二，**中途导航会截断前进条目**。`setLocation` 里那句 `if (position !== queue.length) queue.splice(position)` 是在忠实模仿浏览器：你退到 `/b`，又 `push('/d')`，那么原来 `/c` 那条「前进历史」就该作废——你不可能既从 `/b` 往前推到 `/d`，又保留一条通往 `/c` 的路。浏览器这么做，内存版也得这么做，否则两边的语义就对不齐。
-
-第三，**方向直接由步数差的正负推出来**。`go(-1)` 就是后退，`go(2)` 就是前进，内存版指针自己挪，方向明明白白。这也是内存版比浏览器版省心的地方——它不需要去猜方向。
-
-## 浏览器实现：在不透明状态上重记一本账
-
-内存版好是好，但它没真 URL，刷新就丢。真正要驱动 SPA 的是浏览器版，而它面对的是开头那套「靠不住的接口」。怎么办？**在 `history.state` 这个不透明黑盒之上，盖一层自己说了算的账本**：
-
-```ts
-interface StateEntry {                  // 这就是那本「方向账本」
-  back: HistoryLocation | null          // 上一站
-  current: HistoryLocation              // 当前
-  forward: HistoryLocation | null       // 下一站
-  position: number                      // 栈内绝对序号
-  scroll: [number, number] | null       // 离开这格时的滚动位置
+// --- 浏览器实现：在不透明 state 上叠一层方向账本 ---
+interface StateEntry {
+  back: string | null
+  current: string
+  forward: string | null
+  position: number
+  scroll: [number, number] | null
 }
 
-function createWebHistory(win: FakeBrowser): RouterHistory {
-  const listeners: Listener[] = []
-  let current = '/a'
-  let ledger: StateEntry | null = win.state   // 自己的账本容器，记住「上一格的账」
-
-  const write = (to: HistoryLocation, s: StateEntry, replace: boolean) =>
-    replace ? win.replaceState(s, '', to) : win.pushState(s, '', to)
-
-  function push(to: HistoryLocation) {
-    const cur = ledger!
-    // ① 先给「当前这一格」补上「下一站 = to」和「当前滚动」，原地改写它
-    write(cur.current, { ...cur, forward: to, scroll: [0, 200] }, true)
-    // ② 再追加一格新条目，序号 +1
-    const next: StateEntry = { back: current, current: to, forward: null, position: cur.position + 1, scroll: null }
-    write(to, next, false)
-    ledger = next; current = to
+function createWebHistory(): RouterHistory {
+  const listeners = new Set<NavigationCallback>()
+  // 首次访问时 history.state 是 null，主动补建一条
+  let current: StateEntry = history.state ?? {
+    back: null, current: location.pathname, forward: null,
+    position: history.length - 1, scroll: null,
   }
-  // 页面全新打开时 state 是空的，主动补一条当前格
-  if (!ledger) { ledger = { back: null, current, forward: null, position: win.length - 1, scroll: null }; write(current, ledger, true) }
+  if (!history.state) history.replaceState(current, '')
 
-  win.addEventListener('popstate', ({ state }: { state: StateEntry }) => {
-    const from = current, oldLedger = ledger
-    current = state.current; ledger = state
-    const delta = oldLedger ? state.position - oldLedger.position : 0  // 方向 = 新序号 − 旧序号
-    const direction = delta > 0 ? NavDir.forward : delta < 0 ? NavDir.back : NavDir.unknown
-    listeners.forEach(cb => cb(state.current, from, { type: NavType.pop, direction, delta }))
+  window.addEventListener('popstate', (e) => {
+    const incoming = e.state as StateEntry
+    const from = current.current
+    // 当前位置无法直接读 —— 只能用两次 position 的差间接推
+    const delta = incoming.position - current.position
+    const direction = delta < 0 ? 'back' : delta > 0 ? 'forward' : 'unknown'
+    current = incoming
+    listeners.forEach(cb =>
+      cb(incoming.current, from, { type: 'pop', direction, delta }))
   })
 
   return {
-    get location() { return current }, get state() { return ledger },
-    push,
-    replace: (to) => { ledger = { ...ledger!, current: to }; write(to, ledger, true); current = to },
-    go: (d) => win.go(d),
-    listen(cb) { listeners.push(cb); return () => listeners.splice(listeners.indexOf(cb), 1) },
+    get location() { return current.current },
+    push(to) {
+      // 两段式：先给旧格补 forward + scroll，再追加新格
+      current.forward = to
+      current.scroll = [scrollX, scrollY]
+      history.replaceState(current, '')
+      const next: StateEntry = {
+        back: current.current, current: to, forward: null,
+        position: current.position + 1, scroll: null,
+      }
+      history.pushState(next, '', to)
+      current = next
+    },
+    replace(to) {
+      current = { ...current, current: to }
+      history.replaceState(current, '', to)
+    },
+    go(delta) { history.go(delta) },
+    listen(cb) { listeners.add(cb); return () => listeners.delete(cb) },
   }
 }
-```
 
-（上面的 `FakeBrowser` 是一个极简的浏览器历史 mock，模拟 `pushState`/`replaceState`/`popstate`，好让这段账本逻辑能真跑起来；真实环境直接把 `window` 传进去即可。）
-
-这段代码的灵魂，是 `push` 那个**两段式改写**。跟着一个具体轨迹走一遍最清楚：
-
-假设你站在 `/a`（账本记着序号 5），调 `push('/b')`：
-
-1. **第一步，改写当前格**：把 `/a` 这格的账本改成 `{ current: '/a', forward: '/b', scroll: [0, 200], position: 5 }`，用 `replaceState` 写回去。这一步干了俩事——记下「从 `/a` 出发会去 `/b`」，顺手把**离开 `/a` 时的滚动位置**（比如滚到了 200px）存进这格。滚动为什么要存在这儿？因为滚动是「属于某个位置的」属性，离开时存，回来时取。
-2. **第二步，追加新格**：写入一格 `{ back: '/a', current: '/b', forward: null, position: 6, scroll: null }`，用 `pushState`。序号是上一格的 `position + 1`，自己维护，**不信任 `history.length`**。
-
-现在栈里是这样：`… → /a(序号5, 下一站/b, 滚动{0,200}) → /b(序号6) ← 指针`。
-
-接着用户**按浏览器后退按钮**。浏览器触发 `popstate`，事件把目标格的 state 带回来——也就是 `/a` 那格 `{ position: 5 }`。监听器里：
-
-- `delta = 新序号 − 旧序号 = 5 − 6 = −1`，方向是 **后退**。
-- 广播 `('/a', '/b', { pop, back, −1 })` 给上层。
-
-上层路由器拿到这个三元组，立刻知道两件事：用户后退了一步、从 `/b` 退回了 `/a`。它还能拿「`/b` 的路径 + 步数差」当钥匙，去翻出刚存进去的 `{0, 200}`，把滚动恢复出来——这就是为什么滚动值非得塞进账本里：**没有这本账，滚动恢复根本无从下手**。
-
-这就是全章最核心的那个选择带来的连锁好处：**自己往那条不透明状态里塞方向、塞序号、塞滚动，才能在浏览器后退时算出方向、找回滚动、识别重复**。代价也很实在——那条 `history.state` 从此变成了「双方都在写」的共享内存，只要外面有人手贱自己调一次 `history.replaceState`，这本账就乱了；而且「我现在在第几格」永远只能靠相邻两格的序号差间接推出来，浏览器不直接给。
-
-`replace` 跟 `push` 形成对照：它只改 `current`，**把 `position` 钉回原值**（不 +1），所以替换不会让栈长长，也不会破坏前后格的序号连续性。
-
-## hash：只改一个基准，就白嫖整套逻辑
-
-最后看一个「省事省到极致」的设计。hash 模式（URL 里带个 `#`）和 HTML5 模式，表面上是两套路由，但实现上 hash 版**几乎什么都没写**——它只把基准路径规整成「以 `#` 结尾」的形态，然后直接调 `createWebHistory`：
-
-```ts
-function createWebHashHistory(base?: string): RouterHistory {
-  base = location.host ? base || location.pathname + location.search : ''  // file:// 没 host，基准置空
-  if (!base.includes('#')) base += '#'                                     // 强制成「以 # 收尾」
-  return createWebHistory(base)                                            // 其余完全复用
+// --- 上层完全不感知底下是哪一套 ---
+function useRouter(h: RouterHistory) {
+  h.listen((to, from, info) =>
+    console.log(`${from} → ${to} [${info.direction}/${info.delta}]`))
 }
+useRouter(createMemoryHistory())
+useRouter(createWebHistory())
 ```
 
-就这么几行。账本、两段式 push、popstate 监听、方向推导——一整套状态机原封不动复用。换来的是「三套策略收敛成两份代码」，hash 模式零成本拿到 HTML5 模式的全部能力。
+两份实现、共用同一接口；上层 `useRouter` 拿到时不知道、也不需要知道底下是谁。
 
-代价呢？代价被转嫁到了 HTML5 实现内部：因为它现在要同时服务「普通基准」和「含 `#` 的基准」两种用法，所以 `createCurrentLocation`（从地址栏还原当前路径）和 `changeLocation`（拼出要写进地址栏的 URL）里都不得不长出**两条分支**——遇到 `#` 基准走一套切片逻辑，遇到普通基准走另一套。换句话说，省事是省在 hash 这一头，分支膨胀却长在了 html5 那一头。这是一个很典型的「把复杂度从一个地方挪到另一个地方」的取舍：对外接口更干净了（hash 是独立工厂），对内实现却多了一层 if。
+## 6. 执行轨迹
 
-## 关键权衡
+输入：用户在 `/a` 调 `push('/b')`，然后按浏览器后退。初始 `current = {back:null, current:'/a', forward:null, position:5, scroll:null}`。
 
-把本章的设计选择摊开来看，下面这几条是真正值得记住的「为什么」。
+`push('/b')` 阶段：
 
-**权衡一（全章灵魂）：自己往那条不透明状态里塞方向/序号/滚动，重新记一本账。** 浏览器的 `history.state` 是个无结构的黑盒，`history.length` 是总数不是位置，popstate 事件也不带方向。路由器若直接面对这套接口，连「刚才用户是前进还是后退」都答不上来。选择自己往 state 里塞 `{ back, current, forward, position, scroll }`，换来的是：能精确算出方向（序号差）、能识别绝对位置、能存取滚动位置——这三样是滚动恢复和重复导航短路的命根子。代价是：那条 state 变成了路由器和浏览器双方共写的共享内存，外部一旦自行 `replaceState` 就会让账本错乱；而且「当前位置」只能用相邻两格的序号差间接推，不能直接读。这是一笔用「可靠性」换「语义完整性」的账。
+1. 把当前格改写成 `{back:null, current:'/a', forward:'/b', position:5, scroll:{0,200}}`，调 `replaceState` 落进 `history.state`。
+2. 造新格 `{back:'/a', current:'/b', forward:null, position:6, scroll:null}`，调 `pushState('/b', newState)` 压进栈。
+3. `current` 指向新格，地址栏变 `/b`。
 
-**权衡二：hash 模式不另写一套，只把基准规整成 `#` 形态就复用 HTML5 实现。** 这个选择换来的是「零成本复用整套状态机与监听器，三套策略收敛为两份代码」——hash 工厂只有寥寥几行，维护负担极低。代价是 HTML5 实现被迫在「含 `#` 的基准」与「普通基准」之间长出两条分支，`createCurrentLocation` 和 `changeLocation` 都多了 if，实现内部变臃肿。本质上是把对外接口的简洁，换成了对内实现的分支膨胀。
+按后退阶段：
 
-**权衡三：无 DOM 环境用一个数组 + 指针自造一截历史栈。** SSR 和测试环境根本没有浏览器，但路由逻辑得照样跑。选择用 `queue + position` 在内存里模拟一截历史栈，换来的是「SSR、测试、浏览器三套实现同构」，上层代码一行不改就能在 Node 里跑。代价是：内存栈刷新即丢（没有真 URL）、起点必须由用户显式 `push`/`replace` 设置、移动指针也不产生真正的 URL 副作用。它是个忠实但不完整的影子——忠实到连「中途导航截断前进条目」都模仿了，但不完整到没法持久化。
+1. 浏览器触发 `popstate`，`event.state` = 旧 `/a` 格 `{position:5}`。
+2. handler 算 `delta = 5 − 6 = -1`，方向 `back`。
+3. 广播 `listeners.forEach(cb => cb('/a', '/b', {type:'pop', direction:'back', delta:-1}))`。
+4. 上层 router 收到回调：用 `'/b' + (-1)` 当 key 取回 `{0,200}`（这是上次离开 /a 时的滚动），恢复滚动后再导航到 /a。
 
-**权衡四：监听回调统一吐「类型 + 方向 + 步数差」三元组。** 位置变化可能来自浏览器后退按钮、前进按钮、代码 `go` 调用，来源杂、细节多。选择把所有「外部触发的位置变化」统一翻译成 `{ type: pop, direction, delta }`，换来的是「上层只注册一个回调，就能用同一套逻辑响应所有来源」，不用为每个来源写专用处理。代价是：浏览器版实现必须在 popstate 里用序号差反推方向（而不是直接拿到），还得额外维护一个「暂停位」去吞掉那些自己触发、却不想广播的回声事件——状态机因此变得更微妙。
+整条链路里，上层只看到「一次导航事件附带方向与步数差」，它从不知道 `history.state` 长什么样。
 
-## 小结
+## 7. 教学简化说明
 
-这一层做的事，说到底就是：**在浏览器那套靠不住的历史接口之上，重新记一本带方向和位置序号的账**，再把它包成一个窄到只有六个方法的接口。账本让方向、位置、滚动都变得可推算；窄接口让上层完全不碰 DOM；三套实现（HTML5 / hash / memory）共用同一份契约，可以透明互换。hash 模式更是把「复用」做到了极致——只改一个基准形态，就白嫖了 HTML5 的整套状态机。
+本章演示故意省略了：
 
-这套抽象吐出的，始终只是一段路径字符串外加一个方向。至于这段字符串怎么在一张路由表里被编译、匹配成一条 matched 链——那是下一章「路由匹配表：从配置到 matched 链」的主题。
+- **`pauseState` 吞回声**：演示里 `go(delta)` 直接调 `history.go`，真源码要先记 `pauseState = from`，popstate 里若 `pauseState === from` 就 return，吞掉自己主动 `go` 触发的那次回声。
+- **滚动持久化的生命周期**：真源码挂 `pagehide`/`visibilitychange`（iOS Safari 不触发 `beforeunload`），在 `visibilityState === 'hidden'` 时把滚动 `replaceState` 进 state。本章只演「push 时把滚动塞进旧格」，没演「页面隐藏时再补一次」。
+- **`pushState` 的 Safari 兜底**：30 秒内调用 100 次会抛 `SecurityError`，真源码 try/catch 后退化成 `location.assign(url)` 强制导航重置计数。
+- **`<base>` 标签与 file:// 的基准归一化**、**`createHref` 的井号正则**、**结构化克隆的类型限制**（state 不能含 Symbol/函数）——这些是工程兜底，不影响原理主线。
+
+## 8. 小结
+
+把不透明的浏览器历史 API 关在窄接口背后、自己在它上面记一本带方向与位置的账，这是上层 router 能拥有「确定的方向/位置/滚动语义」的根。html5/hash/memory 三实现只是同一本账的三种存法：真栈、含井号的真栈、内存幻象。下一章会把视野从「单条 URL 怎么来」抬到「一整张路由表怎么搭」——当历史抽象把 URL 吐给上层后，下一步要回答的就是「这张表是怎么从配置编译成可匹配结构的」。

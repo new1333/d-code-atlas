@@ -1,189 +1,216 @@
 # 订阅系统：$onAction 的动作包裹与 $subscribe 的监听协调
 
-想象你在给一个线上应用做埋点。需求听起来简单：每次用户触发某个动作（加购、下单、登出），你都要在它"开始前"和"结束后"各记一条日志；万一中途抛错，还得单独记一条失败日志。与此同时，你还想盯着整份状态——不管是谁、用什么方式改了它（直接赋值也好、批量更新也好、某个动作内部顺手改的也好），都希望收到一条带着"这次改动是哪种来源"的通知。
+> 本章属于 composite 层。前置：Store 装配、状态变更模型、订阅原语。
+> 学完你能讲清：Pinia 为什么用「两个监听开关 + 手动触发」协调 $subscribe 的 watcher 与 $patch，以及 $onAction 怎么把一次函数调用撑成一段生命周期事件。
 
-真做起来你会发现到处是坑。动作的"前后"要怎么挂钩？异步动作（返回 Promise）的"结束"要等到什么时候？状态被改的方式五花八门，怎么把它们做成"一条不重复的通知"？更烦的是：动作内部如果直接改了状态，那"动作通知"和"状态通知"会不会重复报两次？
+## 1. 为什么需要它
 
-这一章就拆解 Pinia 是怎么把这两件事做成一套统一、可控、不重复的通知系统的。底层只有一对最小的工具，往上搭出两类订阅，再靠两个看起来很不起眼的布尔开关，把所有时序矛盾摆平。
+设想你正在给一个 store 写一段旁路逻辑：每次 state 改了就 log 一条 `{storeId, type, payload}`，每次 action 被调了就统计一下耗时、失败时还要上报错误。你大概会伸手要两个钩子：一个「state 变了」、一个「action 调了」。
 
-## 两类订阅，共用同一对最小工具
+可真用起来你会发现：调一次 `store.$patch(s => { s.a = 1; s.b = 2 })` 应该只算一次改动，却被原生 watcher 当成多条通知；直接 `store.count++` 和 action 内部改 state 都是 watcher 拍到的、区分不出谁是谁；action 是普通函数，调完就结束、没地方挂钩 before/after/onError，async action 的 resolve/reject 更是没人通知你。
 
-先说最底下那块。第 2 章已经把这对工具讲透了（章节「订阅原语」）：一个装回调的集合、一个"加入"函数、一个"逐个触发"函数。订阅就是往集合里塞一个回调、再拿回一个能把自己摘掉的函数；触发就是遍历集合把回调挨个调一遍。生命周期默认跟着当前作用域走，作用域没了订阅自动清掉——这套第 2 章已定，本章不再重演。
+上一章把状态变更收拢到 $patch，用「暂停深度 watcher、改完手动发一条」换来「补丁只产一条通知」；留下的口子是：$subscribe 的 watcher 该怎么配合这套暂停-恢复、又怎么让直接改 state 仍能被正常通知。本章从订阅侧接住这个口子，再补上 action 的「before/after/onError」需求。
 
-这一章要看的新东西是：**这对工具怎么被两类长得完全不一样的上层订阅消费**。
+## 2. 核心思想
 
-- 一类是**动作订阅**（`$onAction`）：它关心的不是状态，而是"某个函数被调用了"。它直接拿这对工具用——注册即往动作回调集合里加回调，几乎零加工。
-- 另一类是**状态订阅**（`$subscribe`）：它关心的是"状态被改了"。它不能光靠这对工具，还得在旁边另挂一只 Vue 的深度 watcher 盯着状态，watcher 一响，再去调集合里的回调。
+Vue 已经提供两类天然信号：「一次函数调用」（瞬时、调用栈一展开就消失）和「一次响应式变更」（由 watcher 代理、被 Vue 调度好）。订阅系统做的事，是把这两类信号**重新包装成带语义的事件**：函数调用被撑成「before/after/onError 的一段生命周期」，响应式变更被分流成「direct 或 patch 的带类型事件」，再交给同一个回调集合去广播。
 
-流程上两类订阅的注册/移除长得几乎一样（都是"加回调 → 返回移除函数 → 作用域自动清理"），但内部干的事完全不同：动作订阅是纯转发，状态订阅是"watcher + 回调集合"的组合体。这个不对称后面会反复出现。
+落到具体工程上：用一个动作包裹器把每次调用撑成生命周期事件；用两个监听开关让 watcher 在 $patch 期间闭嘴、由 patch 自己手动补一条带类型的事件。两者共用同一对「回调集合」原语（第 2 章已讲透），本章只看它怎么被两类上层订阅消费。
 
-> **关键权衡 · 两类订阅共用同一对工具**
-> 选择：动作订阅和状态订阅都建在第 2 章那对"加回调 / 触发"工具之上，注册、移除、作用域自动清理的行为完全一致。
-> 换来：两类订阅的用法和生命周期管理高度统一，使用者学一套即可；插件、devtools 也能用同一套方式对待它们。
-> 代价：两类订阅的内部其实并不对称——动作订阅是纯转发，状态订阅还得在工具之外额外挂一只深度 watcher、并把"停 watcher"塞进工具的清理回调。这份不对称的复杂度全压在状态订阅一侧。
+## 3. 心智模型
 
-## 动作订阅：把一次函数调用重组成一个生命周期事件
+两个东西同源：动作订阅与状态订阅都建在第 2 章那对最小原语 `addSubscription`/`triggerSubscriptions` 之上——一个往 Set 里加回调、一个对所有回调广播事件。差别只在于「事件从哪儿发出来」。
 
-你想在每次 action 调用前后挂钩，最朴素的办法是让 action 自己在开头和结尾调一下"通知所有人"——但 action 是用户写的业务代码，不能逼用户手写通知。所以 Pinia 在装配时给每个 function 都套了一层**包裹器**（第 4 章讲过装配时怎么包，这里只看它对订阅暴露了什么）。
+**动作订阅（$onAction）的链路**：
 
-这个包裹器的妙处在于：它不是给 action 挂一个全局的"前后钩子"，而是**每次调用都临时搭一个一次性舞台**。看这段从零写的最小版：
+1. 装配时，setup 返回的每个 function 都被 `action(fn, name)` 包一层（第 4 章已交代），得到一个带 Symbol 标记的包裹函数。
+2. 注册 `$onAction(cb, detached)` 就是把 cb 加进 `actionSubscriptions` 集合，按 detached 决定是否绑 effectScope（第 2 章已交代）。
+3. 调用 action 时，包裹器为**这一次调用**新建两个临时 Set：`afterCallbackSet`、`onErrorCallbackSet`，把 `{ args, name, store, after, onError }` 作为事件广播给所有监听者——监听者收到 context 即相当于 before 时机。
+4. 监听者在 context 里调 `after(cb)` 或 `onError(cb)`，把自己的钩子登记进**本次调用**的那两个 Set。
+5. 包裹器随后真正调原 action：同步成功→触发 after；同步抛错→触发 onError 再抛出；返回 Promise→`.then(触发 after).catch(触发 onError)`。
+
+**状态订阅（$subscribe）的链路**：
+
+1. 装配末尾，把两个开关 `isListening`/`isSyncListening` 都置 true——之前的初始化赋值一律静音。
+2. 注册 `$subscribe(cb, { detached, flush })` 先做回调去重（已注册过的回调直接返回 noop），再把 cb 加进 `subscriptions` 集合，并在 store 作用域里建一个监听根状态 `pinia.state.value[$id]` 的深度 watcher；订阅被移除时连带 stop 这个 watcher。
+3. 改 state 的两条路径：
+   - **直接改**（`store.count++`、`store.$state.x = ...`）：watcher 被 Vue 调度；handler 在 `flush:'sync'` 时查 `isSyncListening`，否则查 `isListening`——开着才调回调，事件类型标 `direct`。
+   - **走 $patch**：上一章已交代，开头把两个开关置 false 静音 watcher，改完 state 后 `isSyncListening` 立即恢复、`isListening` 延迟到 nextTick 之后恢复；同时**手动**调一次 `triggerSubscriptions(subscriptions, ...)` 发**一条**事件，类型标 `patch object` 或 `patch function`。
+
+两类订阅最后都落在「事件 + 当前 state」的回调签名上，差别只在事件的 type 字段——这让上层（devtools、插件）能区分变更来源。
+
+## 4. 关键权衡
+
+### 协调 watcher 与 $patch：两个开关加手动触发，换来不重复的一条通知
+
+Vue 的 watcher 是「订阅 state 变更」最现成的工具，但它一旦挂上就什么变更都收——包括 $patch 改的。如果让 watcher 老老实实通知，再叠加 $patch 自己手动触发的那一条，订阅者会收到两条。最朴素的想法是在 watcher 里加个标志位「这次是 patch、别通知」，但 Vue 的 watcher 有三种 flush 时机：sync watcher 在改 state 时立即触发、pre/post watcher 把通知推迟到下一 tick 的 flush 队列。两类 watcher 处于完全不同的时间点，单开关盖不住。
+
+Pinia 的选择是**用两个开关分别管两类 watcher**：`isSyncListening` 管 sync watcher、`isListening` 管 pre/post watcher。补丁开头同时关掉两个：sync watcher 在改 state 时立即触发、查开关为关而丢弃；pre/post watcher 进队列、到下一 tick flush 时查开关也为关而丢弃。改完后 `isSyncListening` 立即恢复（sync watcher 接下来该收还得收），`isListening` 推迟到 `nextTick().then()` 之后恢复，因为 pre/post watcher 的 flush 队列此刻还没跑完。这一延迟恢复就是为了让本次 flush 时开关仍为关，watcher 在 flush 时被静默丢弃；同时由 $patch 手动 `triggerSubscriptions` 发**唯一一条**带 `patch` 类型的事件。
+
+**换来**：直接改 state 和打补丁两条路径，订阅者都只收到一条、且绝不重复（watcher 的自动通知与手动通知不会叠加）。
+
+**代价**：引入了与 Vue 调度时序强耦合的两个布尔开关、一个 nextTick 延迟恢复、外加一个「最后者胜」的去抖标记（`activeListener = Symbol()`，防止连续多次补丁里前一次的恢复过早打开开关）。这些时序极其微妙、几乎无法靠直觉推理，issue #1129 就是它踩出来的坑。
+
+**背后化解的本质矛盾**：「响应式系统的通知是 Vue 调度好的、不在你手里」与「批处理路径想要自己掌控通知时机与去重」之间的张力。任何「在框架的响应式通知之上叠加一层批处理」的设计都会撞上这个矛盾——React 的并发模式里批处理与 effect 调度的拉扯、Redux middleware 里 dispatch 拦截与 store subscriber 的协调，本质都一样：自动通知与手动通知要谁让位、要在什么时机让位、让多久。
+
+### 调用期临时钩子集合：把瞬时函数调用撑成可观测的生命周期
+
+action 是普通函数，调用即执行、调完即结束。如果想让外部订阅者在「函数开始前」「函数成功后」「函数抛错时」三个时机挂钩、且还要支持 async action 的 resolve/reject，最朴素的 API 设计是给 action 加三个 callback 参数——但每个 action 调用都得写一遍、订阅者要复用还得自己提。Pinia 的办法是：在包裹器里，为**每次调用**新建两个临时 Set（`afterCallbackSet`、`onErrorCallbackSet`），把它们封进 `after`/`onError` 注册器，连同 args/name/store 一起作为事件发给动作订阅者。订阅者在自己的回调里要不要登记钩子、登记几个，完全自由——「context 到达」本身就等于 before 时机，订阅者想干什么就在那儿干；随后包裹器按结果分派：同步成功触发 after、同步抛错触发 onError 再 throw、返回 Promise 则 `.then(触发 after).catch(触发 onError)`。
+
+**换来**：订阅者一次注册就能拿到 before/after/onError 三个时机、并自动感知 Promise 的 resolve 与 reject。同一份订阅代码对同步 action、抛错 action、async action 都生效，不需要订阅者区分。
+
+**代价**：每个 action 都被包一层闭包，每次调用都要新建两个临时 Set、走一次 `triggerSubscriptions` 派发 context——频繁调用的 action 有固定开销；钩子集合是「调用期」的，不同调用之间互不可见（订阅者要在多次调用间共享状态，得自己在闭包里维护）。
+
+**背后化解的本质矛盾**：「函数调用是瞬时的、调用栈一展开就消失」与「订阅者要在多个时机挂钩、还要支持异步」之间的张力。这类「把瞬态信号重组成结构化事件」的升级别处也有：Promise 把「一次性回调」重组为「可链式调用的异步管线」、RxJS 把「事件流」重组为「可组合的操作符链」。
+
+### 两类订阅共用同一对最小原语：换来对称的注册/移除/作用域清理
+
+动作订阅与状态订阅都落在 `addSubscription`/`triggerSubscriptions` 上——同一个「往 Set 加回调并返回移除函数、默认绑 onScopeDispose」的注册路径，同一个「对集合里所有回调广播事件」的派发路径。这意味着两类订阅的作用域自动清理、detached 退出、回调签名稳定性、移除语义完全一致，使用者的心智模型只需一份。
+
+**换来**：API 行为的对称与可预测，且代码量也省了一份——一套原语支撑两条业务路径。
+
+**代价**：类型层面与内部结构层面都不对称。动作订阅的事件是个对象（`{ args, name, store, after, onError }`），但原语的类型约束是 `T extends _Method`（接收函数），不匹配，store.ts 在派发处用 `@ts-expect-error` 绕过；types 层还要用条件类型把「多个具名 action」映射成各自的 context 联合。状态订阅则更重：除了用原语注册回调，还要**额外**在 store 作用域里挂一个深度 watcher，并把「停 watcher」塞进原语的 `onCleanup` 回调里——两条订阅路径的内部复杂度并不对称。
+
+**背后化解的本质矛盾**：「想用一套原语统一所有订阅形态」与「两类订阅底层信号源完全不同（一个是函数调用、一个是响应式变更）」之间的张力。共用原语换来了 API 层面的统一与代码量的减少，但代价是「内部复杂性」被压进了实现细节里——使用者看到一个对称的 API，但维护者要为这个对称搭一层不对称的桥。
+
+### 状态订阅做回调去重、动作订阅不做：一条不对称的边界
+
+`$subscribe` 在注册前先做 `subscriptions.has(callback)` 检查，同一个回调被多次注册时直接返回 noop、不建 watcher（issue #3143 的修复）。原因是 watcher 是有副作用的资源：多建一个就多一份开销、还会被多次通知，重复注册明显是 bug。`$onAction` 没做这个去重，同一个监听者可以被多次加进 `actionSubscriptions` 集合、被多次通知。
+
+**换来**：状态订阅避免了重复 watcher 的资源浪费与重复通知；动作订阅保留了「同一监听者可在不同地方分别挂钩」的灵活性。
+
+**代价**：两个订阅 API 在去重策略上不对称，使用者需知晓——尤其是写插件时，可能一不小心把同一个动作监听者注册了好几遍。
+
+**背后化解的本质矛盾**：「订阅资源有副作用（建 watcher）」与「订阅资源是纯回调（加进 Set）」之间的张力。前者重复就是 bug、后者重复可能是有意，把这两类统一处理反而会丢失语义。
+
+## 5. 最小原理演示
+
+下面这段几十行的脚本演两件事：第一，「两个开关 + 手动触发」让直接改与补丁都只产生一条通知、互不重复；第二，action 包裹器用调用期临时集合暴露 after/onError 并感知 Promise。每一行都对应上面某个原理点。
 
 ```ts
-function wrap(fn, name) {
-  return (...args) => {
-    // 每次调用都新建一对临时集合——只对"这一次调用"生效
-    const afterSet = new Set(), errSet = new Set()
-    trigger(actionSubs, {
-      name, args,
-      after: (cb) => afterSet.add(cb),      // 监听者用这俩函数登记钩子
-      onError: (cb) => errSet.add(cb),
-    })                                       // 监听者收到 context = before 时机
-    let ret
-    try { ret = fn(...args) }
-    catch (e) { trigger(errSet, e); throw e } // 同步抛错 → onError，再原样抛出
-    if (ret instanceof Promise)
-      return ret
-        .then((v) => { trigger(afterSet, v); return v })
-        .catch((e) => { trigger(errSet, e); throw e }) // Promise reject → onError
-    trigger(afterSet, ret)                    // 同步成功 → after
-    return ret
-  }
+import { reactive, watch, nextTick } from 'vue'
+
+// 共享原语：回调集合
+function addSubscription(set, cb, onCleanup = () => {}) {
+  set.add(cb)
+  return () => { if (set.delete(cb)) onCleanup() }
 }
-```
+function triggerSubscriptions(set, ...args) {
+  set.forEach(cb => cb(...args))
+}
 
-关键看那对 `afterSet` / `errSet`：它们是**这次调用**的局部变量，调用结束就丢。监听者在收到的 context 里调 `ctx.after(cb)` / `ctx.onError(cb)`，等于把自己的钩子登记进这次调用的临时集合。所以"到达 context"天然就是 before 时机；调用成功，临时 after 集合被触发；调用抛错，临时 onError 集合被触发；返回的是 Promise，就等它 resolve 再触发 after、reject 则触发 onError。
+function createStore() {
+  const state = reactive({ count: 0 })
+  const subs = new Set()           // 状态订阅回调集合
+  const actionSubs = new Set()     // 动作订阅回调集合
+  let isListening = true           // 异步 watcher 的开关
+  let isSyncListening = true       // 同步 watcher 的开关
+  let activeListener               // 最后者胜的去抖标记
 
-把它跑起来：
+  // 动作包裹器：把每次调用撑成带 before/after/onError 的生命周期
+  function wrapAction(fn, name) {
+    return function wrapped(...args) {
+      const afterSet = new Set()
+      const onErrorSet = new Set()
+      const after = cb => afterSet.add(cb)
+      const onError = cb => onErrorSet.add(cb)
+      triggerSubscriptions(actionSubs, { args, name, store, after, onError })
+      let ret
+      try { ret = fn.apply(store, args) }
+      catch (e) {
+        triggerSubscriptions(onErrorSet, e); throw e
+      }
+      if (ret instanceof Promise) {
+        return ret
+          .then(v => { triggerSubscriptions(afterSet, v); return v })
+          .catch(e => { triggerSubscriptions(onErrorSet, e); return Promise.reject(e) })
+      }
+      triggerSubscriptions(afterSet, ret)
+      return ret
+    }
+  }
 
-```ts
-$onAction((ctx) => {
-  console.log('[action] before', ctx.name)
-  ctx.after((v) => console.log('[action] after', ctx.name, v))
-  ctx.onError((e) => console.log('[action] onError', ctx.name, e.message))
+  const store = {
+    state,
+    $onAction(cb) { return addSubscription(actionSubs, cb) },
+    $subscribe(cb, opts = {}) {
+      if (subs.has(cb)) return () => {}            // 状态订阅做回调去重
+      const remove = addSubscription(subs, cb, () => stopWatcher())
+      const stopWatcher = watch(
+        () => state,
+        s => {
+          // watcher handler 里的开关判断：开关关着就不通知
+          if (opts.flush === 'sync' ? isSyncListening : isListening)
+            cb({ type: 'direct' }, s)
+        },
+        { deep: true, flush: opts.flush || 'pre' }
+      )
+      return remove
+    },
+    $patch(mutator) {
+      // 关掉两类 watcher，避免与手动触发叠加
+      isListening = false
+      isSyncListening = false
+      mutator(state)
+      // 最后者胜的去抖：只有最后一次补丁的 nextTick 才恢复异步开关
+      const myId = (activeListener = Symbol())
+      nextTick().then(() => {
+        if (activeListener === myId) isListening = true
+      })
+      // 同步开关立即恢复：sync watcher 接下来该收还得收
+      isSyncListening = true
+      // 手动发唯一一条带类型的事件
+      triggerSubscriptions(subs, { type: 'patch function' }, state)
+    },
+    fail: wrapAction(() => { throw new Error('boom') }, 'fail'),
+    asyncInc: wrapAction(() => new Promise(r => setTimeout(() => r(5), 10)), 'asyncInc'),
+  }
+  return store
+}
+
+const store = createStore()
+const log = []
+const flush = () => new Promise(r => setTimeout(r, 0))
+
+store.$subscribe(e => log.push(`state ${e.type} count=${store.state.count}`))
+store.$onAction(ctx => {
+  log.push(`before ${ctx.name}`)
+  ctx.after(v => log.push(`after ${ctx.name}${v != null ? `=${v}` : ''}`))
+  ctx.onError(e => log.push(`error ${ctx.name}: ${e.message}`))
 })
 
-const boom = wrap(() => { throw new Error('boom') }, 'boom')
-try { boom() } catch (e) { console.log('[caller] caught', e.message) }
-// [action] before boom
-// [action] onError boom boom
-// [caller] caught boom
-
-const task = wrap(() => new Promise((r) => setTimeout(() => r('ok'), 10)), 'task')
-console.log(await task())
-// [action] before task
-// [action] after task ok
-// ok
+store.state.count++            // 直接改：watcher 下一 tick flush 查开关开着 → 一条 direct
+await flush()
+await store.$patch(s => { s.count++; s.count++ })  // 补丁：两开关置关、手动发一条 patch、watcher flush 时被静默
+await flush()
+try { store.fail() } catch {}  // 同步抛错：触发 onError、错误继续抛
+await store.asyncInc()         // async action：before→resolve 后 after
+console.log(log)
+// =>
+// [ 'state direct count=1',
+//   'state patch function count=3',
+//   'before fail', 'error fail: boom',
+//   'before asyncInc', 'after asyncInc=5' ]
 ```
 
-同步抛错走 `try/catch` 那条路：onError 先触发，错误再原样抛给调用方（所以 `[caller] caught`）。异步走 Promise 那条路：before 在调用时立刻发出，after 要等到 resolve 才发。一次注册，三个时机全拿到，还自动适配了 async/await。
+## 6. 执行轨迹
 
-> **关键权衡 · 调用期临时钩子集合**
-> 选择：每次调用 action 都新建一对临时的 after/onError 集合，而不是用一个全局钩子列表。
-> 换来：订阅者注册一次，就能拿到 before / after / onError 三个时机，并自动感知 Promise 的 resolve 与 reject——无需订阅者自己分辨同步还是异步。
-> 代价：每个 action 都被套一层闭包，而且**每次调用**都要新建两个集合、触发一次动作订阅。一个被高频调用的 action（比如拖拽里每帧都调）会背上这份固定开销；钩子也只对当次调用可见，跨调用要累积状态得订阅者自己在闭包里维护。
+拿演示里四种输入当慢动作看一遍：
 
-## 状态订阅：一只深度 watcher，加两个监听开关
+**输入** `store.state.count++`（直接改）。Vue 立即把深度 watcher 排进 pre flush 队列；下一微任务 flush 时，handler 进入查开关：`opts.flush` 默认 `pre`、查 `isListening`——此刻为 true，回调收到 `{ type: 'direct' }`、state 为 `{ count: 1 }`。**一条**通知。
 
-再看状态订阅。`$subscribe` 想要的是"状态被以任何方式改动，我都收到通知"。这个需求天然适合 Vue 的深度 watcher——对着整份状态 `watch(() => state, cb, { deep: true })`，谁动了都响。
+**输入** `store.$patch(s => { s.count++; s.count++ })`。$patch 进入立刻把两个开关置 false，然后跑 mutator，state.count 被改两次，watcher 在 Vue 内部被调度但还没 flush。$patch 接着记一个 `myId = Symbol()` 作为 `activeListener` 的当前值，把 `isSyncListening` 立即恢复为 true、把 `isListening` 的恢复排到 `nextTick().then()` 里；最后**手动**调 `triggerSubscriptions(subs, { type: 'patch function' }, state)`，订阅者立刻收到**一条** `patch function` 事件、state 已经是 `{ count: 3 }`。等到 Vue 真的 flush 它的 watcher 队列时，handler 进入查 `isListening`，此刻仍是 false（要等 nextTick 之后才恢复），watcher 通知被静默丢弃。结果：**一条**通知，watcher 没叠。
 
-但 Pinia 没有直接把回调塞进 watcher 就完事。它干了一件额外的事：**watcher 的处理器不是无条件调回调，而是先抬头看一眼一个叫"监听开关"的布尔值，开着才通知。**
+**输入** `await store.asyncInc()`（async action）。包裹器先建临时 Set、广播 context 给动作订阅者：监听者收到 `{ name: 'asyncInc', args: [], after, onError }`、登记一个 after 钩子进临时 Set、顺手 log 下「before」。接着真正调原 action，拿到一个 Promise（10ms 后才 resolve）。包裹器 `.then(触发 after).catch(触发 onError)` 后返回。Promise resolve 时，afterSet 被触发，监听者的钩子被调用、log 下「after」。
 
-```ts
-function $subscribe(cb, flush = 'pre') {
-  if (subs.has(cb)) return () => {}                 // 去重：同一回调只挂一只 watcher
-  return watch(
-    () => state,
-    (s) => {
-      if (flush === 'sync' ? isSyncListening : isListening)  // 先看开关
-        cb({ type: 'direct' }, s)
-    },
-    { deep: true, flush },
-  )
-}
-```
+**输入** `store.fail()`（同步抛错）。包裹器广播 context（before 已到达），进入 try 跑原 action，立刻抛错。catch 块触发 `onErrorSet`（监听者的 onError 钩子被调用、log 下「error」），然后 `throw error` 把错误继续抛出去，调用方拿到原始错误。
 
-为什么 watcher 触发了还要再看一个开关？因为"改状态"在 Pinia 里有两条路（第 5 章讲透了）：直接赋值 `store.count++`，和打补丁 `store.$patch(...)`。第 5 章的关键决定是：打补丁时先把 watcher 静音、改完再手动统一触发一次订阅，把一整批改动收拢成单条通知。这一章要回答的是订阅侧的追问——**watcher 被"静音"到底是怎么静音的？凭什么直接改和打补丁不会重复通知？** 答案就藏在那两个开关里。
+**注意**：action 内部若改了 state，那条改动会走 direct 路径、单独发一条 `direct` 通知——因为 action 包裹器不暂停 watcher、它只负责派发 before/after/onError。这与 $patch「暂停 watcher、手动发一条」是两套机制，刚好对应「直接改 vs 打补丁」两条路径。
 
-## 核心：为什么是两个开关，不是一个
+## 7. 教学简化说明
 
-这是本章最该停下来想清楚的地方。
+本章演示故意省略了：`detached` 与 `onScopeDispose` 的作用域自动清理（第 2 章已展开）、`mergeReactiveObjects` 的对象式补丁深合并（第 5 章已展开）、dev 下 watcher 的 `onTrigger` 钩子收集 `debuggerEvents` 供 devtools 分组展示、HMR 复用同一对开关短暂静音再恢复、`$dispose` 靠停 effectScope 连带停掉所有 watcher 与订阅、两个 Symbol（动作标记 / 动作名）防止 action 被二次包裹的机制、types 层为兼容两种语法对动作监听者 context 做的条件类型映射。这些不影响核心思想，本章只演两件事：把瞬时调用撑成生命周期事件、用两个开关协调 watcher 与 patch。
 
-打补丁时要让 watcher 闭嘴，最直白的做法是补丁期间设一个 `paused = true`，处理器里 `if (!paused) 通知`，补丁结束再 `paused = false`。一个开关听起来就够了，为什么 Pinia 用了两个——`isListening` 和 `isSyncListening`？
+## 8. 小结
 
-因为 Vue 的 watcher 是有"脾气"的，分两种触发时机：
-
-- **同步脾气**（`flush: 'sync'`）：状态一被改，处理器**当场、同步**就跑。
-- **异步脾气**（`flush: 'pre'`，也是默认）：状态被改后，处理器只被**排队**，等到下一个微任务（`nextTick`）才真正跑。
-
-这两类脾气的"静音窗口"落在完全不同的时间点上：
-
-- 同步 watcher 在补丁**改状态的那一瞬间**就触发。所以你必须在"改之前"关掉开关，**改完立刻**打开——否则紧接着补丁之后的下一次同步改动也会被误伤。
-- 异步 watcher 在补丁结束、**下一个 tick 的 flush** 时才触发。所以你必须让开关在"整个本次 flush 期间"都保持关闭，也就是**推迟到 `nextTick` 之后**才能打开——否则本次 flush 跑到处理器时开关已经开了，direct 通知漏出来，跟手动触发的那条 patch 撞成两条。
-
-换句话说，同步开关要快、异步开关要慢，一个开关没法同时又快又慢。于是拆成两个：同步开关管同步 watcher、改完立即恢复；异步开关管异步 watcher、推迟到 `nextTick` 恢复。补丁的完整时序是：
-
-```
-$patch 开始
-  → isListening = isSyncListening = false       关掉两个开关
-  → 改状态（同步 watcher 当场触发，但开关关着 → 丢弃；
-            异步 watcher 被排队，但还没 flush）
-  → nextTick().then(() => isListening = true)    异步开关：排队等下个 tick 恢复
-  → isSyncListening = true                       同步开关：立刻恢复
-  → trigger(subs, { type: 'patch' })             手动发一条（唯一的通知）
-$patch 结束
-……下一个 tick……
-  → 异步 watcher 的 flush 跑到处理器，isListening 仍是 false → 丢弃
-  → 然后才轮到 nextTick 的回调，把 isListening 恢复成 true
-```
-
-注意最后这段顺序的微妙之处：手动触发的那条 patch 在补丁里**同步**就发出去了；而被排队的异步 watcher 要等到 flush，可 flush 跑处理器时异步开关还没恢复（恢复它的 `nextTick().then` 排在 flush **之后**）。所以异步 watcher 这次必然被丢弃——这就是"只发一条"能成立的时序根基。这段几乎没法靠直觉推，得照着微任务调度一步步走。
-
-把它和"直接改"放一起跑，两个开关各被一只脾气的 watcher 实际卡住：
-
-```ts
-$subscribe((m) => console.log('[state:async]', m.type))            // 异步脾气
-$subscribe((m) => console.log('[state:sync]', m.type), 'sync')     // 同步脾气
-
-// ① 直接改：两个开关都开着，两只 watcher 各发一条 direct
-state.count++
-await nextTick()
-// [state:sync] direct      ← 同步 watcher 改的瞬间当场触发
-// [state:async] direct     ← 异步 watcher 下个 tick flush 时触发
-
-// ② 打补丁：两个开关都关，两只 watcher 全被静音，只剩手动触发
-$patch((s) => { s.count++; s.name = 'b' })
-await nextTick()
-// [state:async] patch function   ← 手动触发
-// [state:sync]  patch function   ← 手动触发
-// （此期间两只 watcher 都被各自开关卡住，零 direct）
-```
-
-① 里两条改动（`count++` 和 `name='b'`）被补丁合并成一条 patch，两只 watcher 的 direct 全被吞掉；直接改则各发一条 direct——两类改动互不重复、各走各的通知类型。
-
-> **关键权衡 · 两个监听开关 + 手动触发**（本章核心）
-> 选择：用 `isListening` / `isSyncListening` 两个布尔开关分别管住异步、同步两类脾气的 watcher，补丁期间关掉、改完按各自脾气恢复（同步立即、异步推迟到 `nextTick`），再手动触发一次订阅。
-> 换来：无论状态是被直接赋值改的、还是被 `$patch` 批量改的，订阅者都只收到**一条**通知，watcher 的自动通知和手动通知**绝不会叠加成两条**；两类脾气的订阅者都被正确照顾到。
-> 代价：时序与 Vue 的微任务调度**强耦合**，几乎无法靠直觉推理——得知道 `flushJobs` 跑在 `nextTick().then` 之前，才能解释"为什么异步 watcher 必然被丢"。还要额外引入一个"最后者胜"的去抖记号：连续多次补丁时，只有最后一次补丁的 `nextTick` 才有资格恢复异步开关，避免前面的补丁过早把开关打开。这套机制脆弱但精确，是"通知不重复"这条硬要求的必然代价。
-
-## 三种通知来源，与一个不对称的去重策略
-
-上面已经出现了 `direct` 和 `patch function` 两种通知类型。Pinia 把状态变更的来源标成三类，好让订阅者一眼分清这次改动从哪来：
-
-- `direct`：watcher 直接捕获到的赋值（`store.count++` 这种）——也包括 action 内部直接改 state 的情况，因为那同样没走 `$patch`、不会被静音。
-- `patch function`：函数式补丁（`$patch(s => { ... })`）手动触发的。
-- `patch object`：对象式补丁（`$patch({ count: 1 })`）手动触发的。
-
-这三类标签让 devtools、插件、业务层都能稳定判断"谁、什么时候、用什么方式改了状态"——正是一开始那个埋点场景最想要的东西。顺带也就回答了开头的悬念：动作通知和状态通知是**两个维度**各报一次（一个是"函数被调了"，一个是"状态被改了"），不算重复；只有当同一个维度里 watcher 和手动触发同时发声时，才需要这两个开关去消掉。
-
-最后还有一个容易被忽略的不对称：**状态订阅会去重，动作订阅不会**。状态订阅注册时先查 `subs.has(cb)`，同一个回调注册第二次直接返回空操作、不建第二只 watcher（否则一只回调被多只 watcher 盯着，一次改动收 N 条）；动作订阅没这道检查，同一个监听者可以被加进集合多次、从而被通知多次。
-
-> **关键权衡 · 去重策略的不对称**
-> 选择：状态订阅做回调去重（同一回调只挂一只 watcher），动作订阅不做去重。
-> 换来：状态订阅不会因为重复注册而建出多只深度 watcher 重复通知（深度 watcher 建多了是实打实的性能和正确性问题）；动作订阅则保留了"同一监听者多次注册就被多次通知"的简单语义。
-> 代价：两个订阅 API 的去重行为不一致，是一个使用者必须知晓的边界——拿同一个回调调两次 `$subscribe` 和调两次 `$onAction`，效果不一样。
-
-## 小结
-
-这一章把"函数调用"和"状态变更"这两种原本各说各话的事，做成了一套统一的通知系统。底层是第 2 章那对最小工具；往上，动作订阅靠一个**每次调用临时搭台**的包裹器，把一次调用重组成 before / after / onError 三个时机并自动适配 Promise；状态订阅靠一只深度 watcher 盯住状态，再用**两个脾气的开关**（同步立即恢复、异步推迟到 `nextTick` 恢复）配合补丁的手动触发，保证直接改和打补丁都只通知一次、绝不重复。最费脑的不是"怎么通知"，而是"凭什么不重复"——那两个开关和一段微妙的微任务时序，是整套设计的命门。
-
-到这里，setup 语法下 store 的状态、动作、订阅三套机制都已就位。下一章会看到，Pinia 的另一种写法——Options Store（`state/getters/actions` 选项式）——并没有另起炉灶，而是把自己拼成一个 setup 函数，转交给本章和前几章铺好的同一条装配路径。
+订阅系统暴露的是「信号重组」：把瞬时函数调用撑成生命周期、把响应式变更分流成带来源标记的事件。这种重组的代价是要操心 Vue 调度的每一个微任务边界：两个开关、一个 nextTick 延迟、一个去抖标记，都是为了让 Vue 自动派的通知与 Pinia 自己手动派的通知不打架。下一章换个面向——从作者语法看进来，Options Store 与 Setup Store 看似是两种写法，最后都汇入同一条装配路径。

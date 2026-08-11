@@ -1,409 +1,244 @@
----
-title: 维护者行动算法：迁移比例与 catalog 解析
----
-
 # 维护者行动算法：迁移比例与 catalog 解析
 
-## 这一章在解决什么问题
+> 本章属于 composite 层。前置：resolvePackage：把磁盘包变可读节点。
+> 学完你能讲清：为什么"该先升谁"这个主观问题被一套 cohort + semver 判定降维成了按比例排序的数值问题，以及为了让这套比例稳定且不引偏，做了哪几个不那么显然的取舍。
 
-想象你刚接手一个老 monorepo，跑一次依赖分析，屏幕上跳出两千多个包。你面前是一份实实在在的「现场清单」，但维护者真正想问的不是「谁重复了」——重复的可以另开一篇——而是这三个问题：
+## 1. 为什么需要它
 
-- 我这个仓库里，**还有哪些依赖停在旧版**？谁该优先升？
-- 哪些声明已经**跟上了最高稳定版**，可以暂时放心？
-- monorepo 内部那堆 `@scope/a` 依赖 `@scope/b` 的 alias，**别给我误报成迁移机会**。
+上一章给了用户一张能筛能搜的全依赖表——按 license、author、size 任何字段都能挑出关心的子集。可维护者打开这张表时，问的从来不是"挑出哪些"，而是"我该先动哪些"。一个真实工程里几百上千个依赖、每个又拖出一长串传递依赖，同一个 `lodash` 可能并存 4 个版本。维护者真想问的是：哪些已经追上主流、哪些还卡在旧线、按什么顺序处理最划算。
 
-光靠眼睛翻每个 `package.json` 是不现实的——一份声明的版本可能写在 `dependencies`，可能写在 `peerDependencies`，可能根本就是一个 `catalog:deps` 引用指向别处。本章讲的那块代码，就是把这堆纷乱的输入自动变成一张「按消费方分组的升级待办表」。
+筛和搜答不了这个问题。筛能告诉你"哪些包安装了多个版本"，但说不出"哪条具体声明该改"；搜能定位到一个包名，但定位不到"哪个消费者的哪条依赖声明落后了"。维护者只能挨个翻 `package.json`，肉眼比版本号——这件人肉做的事，就是本章要替他做的事。
 
-它做的不是「找出重复」，而是回答一个**主观的优先级问题**——「该先动谁」。把这个主观问题**变成一个数值排序问题**，靠的就是两件可静态计算的事：迁移比例 `migrated / total`，和 semver 范围判定。这两件事都不需要联网、不需要发请求，本地就能跑完。
+这套机制要产出的是一份**按消费方分组的待办清单**：每条记录说"某个消费者、某条依赖声明、目前装的最高版是 X、你声明的是 ^Y、迁移比例是 N%"。维护者按比例从低到高过一遍，就把"该先升谁"答完了。
 
-## 一句话核心思想
+## 2. 核心思想
 
-> 先按依赖名把已装版本聚成一个 cohort 拿到「最高稳定版」基线；再用每条声明的 semver 范围去判它属于「已迁」还是「落后」；最后按消费方重组，就得到一张可行动的升级待办表。
+把"这条声明该不该升"这个**主观判断**，替换成"在所有同名依赖的最高稳定版基线下，这条声明的范围是被满足还是被超越"——一个**二值判定**。再把成百上千条二值判定按 `depName` 累计，得到 `migrated / total` 这个 0~1 之间的数字。最后维护者不用读 `package.json`，只看一张按这个数字排好的表。
 
-打个比方：cohort 就像一块**公共留言板**——所有装在项目里的、名字相同的包版本都贴在同一块板上；这块板上写着「目前最高稳定版是 18.2.0」。然后每条 `dependencies` 里的声明就像一张张**便签**，写着「我能接受的最低范围是 `^17`」——把它跟留言板上的最高版对一下，就知道这张便签要不要被排进升级清单。
+说白了就是换坐标系。原本要回答"值不值得升"——产品决策、技术债权衡、人员偏好混在一起的主观题。改回答"在当前装的所有版本里，这条声明是已经追上最高稳定版、还是落后"：semver 库一行函数能给出的客观题。把主观题投影到客观题，是这套机制唯一的智力内核；后面所有取舍都是为了让这个投影既稳定、又不引偏。
 
-## 自底向上：从一块「cohort 留言板」开始
+## 3. 心智模型
 
-### 第 0 层：cohort 基线 = stable 最高版
+整套计算围着四张表打转：
 
-第一个要做的事是把全场已装包**按依赖名**收拢。比如项目里同时存在 `react@17.0.0` 和 `react@18.2.0`，它们都属于同一个 cohort：`react`。
+- **`versions`**：外部传入的 `Map<depName, PackageNode[]>`——"当前装了哪些包"的全集，同名包会落在同一个数组里。
+- **`stats`**：内部维护的 `Map<depName, DepStats | null>`，给每个 depName 算出"最高稳定版"基线，外加 migrated/behind 两个计数器。
+- **`items`**：扁平数组，每条是一个待办（`dep-upgrade` 或 `publint`）。
+- **`byConsumer`**：分组阶段才有，按消费者的 spec 把 items 重新装进桶。
 
-但是 cohort 的「最高版」**不是简单取末位**——先要做两步过滤：
+每个 depName 的 cohort（同声调）基线只算一次：第一次查到这个 depName 时，过滤 prerelease、取 stable 列表的末位作 `highestPkg`；如果一个 stable 版本都没有，stats 直接记 `null`、之后永远跳过。
 
-1. **过滤掉 prerelease**。`18.0.0-alpha.3` 不能算最高版，否则下一步算迁移建议时会引导用户升到 alpha。
-2. **如果全是 prerelease，整条依赖作废**。这条依赖的统计记为 `null`，被静默跳过。
+算法流程大致是五步：
 
-为什么这么严？因为这份表是给维护者做**决策**用的，一个不小心推到 alpha，事后排查「为什么 CI 全挂了」就是几小时的事。
+1. 拿到所有已装包，按 `depName` 收拢，过滤 prerelease，取 stable 里版本号最大的那个当 `highestPkg`。
+2. 第一遍扫包：对每个消费者的 `dependencies` 和 `peerDependencies`，每条声明先用 catalog 字典（如果传了）解析回真实 semver。解析后是非纯 semver 写法（`*`/`latest`/`workspace:`/`git:` 等）的直接跳。
+3. 拿解析后的范围去和 cohort 的 highest 比：能 satisfy 就 `migrated++`，被 highest 超越就 `behind++`，声明比最高版还高的不计入。**这一遍只累加 stats，不生成 item**。
+4. 第二遍扫包：同样的遍历，但只用 `isGreaterThanrange` 命中的（即"落后"的）生成 item，每条 item 都带上从 stats 里读出的 `migratedCount`/`totalCount`。这里多一道兄弟跳过：consumer 和 highestPkg 的 `repository.url` 都有值且相等，整条声明静默 continue。
+5. 把扁平 items 按 `consumer.spec` 重新分组，每组算 `maxMigrationRatio` 和 `latestReleasedAt`，按 depth / migration / latest 三种模式之一排序输出。
 
-### 第 1 层：声明范围要过两道关
+第三步和第四步看起来在做同一件事，但它们必须分开——这是本章最重要、也最不显然的取舍，下面单独展开。
 
-光有 cohort 基线还不够——你的 `package.json` 里写的版本范围五花八门，得先**规整**。
+## 4. 关键权衡
 
-**第一道关：catalog 解析。**
+### 用「repository URL 相等」当兄弟探测仪，避免 monorepo alias 被误报
 
-`pnpm` 的 `catalog:` 机制允许你把所有版本集中到一个文件里管，写法是：
+pnpm 的 monorepo 里，`@scope/app-a` 依赖 `@scope/lib-b` 是常见写法。`lib-b` 既可能是发布到 npm 的独立包，也可能是 monorepo 内部的 alias（指向 `workspace:*` 或某个固定版本）。如果它们恰好都装在同一份 `node_modules` 里、且 `lib-b` 又同时存在两个版本——单看名字和版本，算法会把它当成"一个真实的迁移机会"，但其实这只是 monorepo 兄弟互相引用，根本不算技术债。
 
-```json
-{
-  "dependencies": {
-    "react": "catalog:deps"
-  }
-}
-```
+选择是：**只要 consumer 和 candidate 的 `resolved.repository.url` 都有值且相等，就跳过这条 item**。换来的是 monorepo 内部引用永远不会被推到升级清单上——这正是维护者想看到的。代价是 `repository` 是 `package.json` 的可选字段，没填的包拿不到这层保护，会产生一些本应被屏蔽的"假迁移机会"。注意这里用的是"双 truthy 守卫"：必须两边都有 URL、且相等才跳过；只要一边缺，就老老实实落回判定。
 
-这里的字符串 `"catalog:deps"` **本身不是一个 semver 范围**。直接喂给 `satisfies()` 一定会炸。所以第一步必须把 `catalog:deps` 解析回真实的 `^18.2.0`：
+这条化解的本质矛盾是：**"两包同源" vs "两包同名同版本差"**——单看包名和版本号区分不了兄弟和真实版本差，必须靠 `repository.url` 这个外部归属信号做交叉验证。读者一旦抓住这个矛盾，在 npm/yarn/pnpm 之外的任何"按 name 比对版本"的场景（Python 的 `pkg-resources`、Go 的 `go.mod` replace 指令、Rust crate 的 path dependencies）都能套用同一个解法——找一个外部归属字段做交叉验证。
 
-```ts
-function resolveCatalogRange(range, depName, catalogs) {
-  if (!range.startsWith('catalog:')) return range        // 普通范围，原样返回
-  if (!catalogs) return undefined                       // 没传 catalog 表 → 作废
-  const name = range.slice('catalog:'.length) || 'default'
-  return catalogs[name]?.[depName]                      // 查不到也作废
-}
-```
+### 只用 stable 版本做"最高版"基线，永远不把用户引向 prerelease
 
-**第二道关：纯 semver 范围判定。**
+最高版基线决定了"落后"的判定阈值。如果直接取所有版本里 semver 最大的——很多流行库的"最新版"会是 `4.0.0-alpha.3`。算法会建议所有写 `^3` 的消费者"升到 4"，但实际上 4 还没发稳定版，照着改的人会一头撞进"上游其实还没稳定"的坑。
 
-解析完之后还得过滤——只有「纯 semver 写法」才进入判定。下面这些直接排除：
+选择是：**先 filter 掉 prerelease，再取 stable 列表的末位作为 highestPkg**。换来的是迁移建议永远不会指向一个 alpha/beta/rc。代价是某个依赖"全是 prerelease"（早期项目、固定 tag 发布）时，整个 depName 的 stats 记为 `null`、被静默跳过——维护者在清单里完全看不到它的存在，既不知道它落后、也不知道它存在。
 
-- `*`、`latest`、`x`（太宽泛，等于没说）
-- `workspace:*`、`link:../foo`、`file:./pkg`、`npm:foo@1.0.0`（本地或别名引用）
-- `git+https://...`、`http://...`、`github:owner/repo`（非 registry 来源）
+本质上化解的矛盾是：**"该用最新版做基线（语义最准）" vs "最新版可能不稳（误导用户）"**。权衡偏向保守——宁可漏报，不可误推。这个矛盾在所有"自动建议升级"的系统里都会出现：Dependabot、Renovate、IDE 的依赖提示——它们各自用"白名单 major"、"等待 X 天"、"用户配置"等不同方式回答同一个问题，但底层矛盾只有一个：**新 ≠ 稳**。
 
-为什么要排掉 `*`？因为它**永远满足**任何版本——把它算进 `migrated` 会让比例虚高，对决策没有意义。
+### catalog 引用先解析回真实 semver，原始值仅作附带信息保留
 
-### 第 2 层：三态判定
+pnpm 9 引入了 `catalog:` 协议：monorepo 里所有子包写 `react: "catalog:react-18"`，真实的 `^18.2.0` 只在根 `pnpm-workspace.yaml` 里维护一份。这对工程是好事（单点改），但对算法是麻烦——`catalog:react-18` 不是合法 semver 范围，直接拿去 `satisfies` 必抛错。
 
-现在有了 cohort 基线（最高稳定版 `highestVersion`），也有了规整后的声明范围 `range`，可以做判定了：
+选择是：**每条声明先用 `catalogs` 字典解析回真实 semver 再走判定，但 `rawRange` 和 `catalogName` 字段仍然随 item 返回**。换来的是上层 UI 既能拿解析后的 `declaredRange` 做数学计算，又能给用户显示"这条声明来自 `catalog:react-18`"——用户改的时候知道去根目录改、不是去子包改。代价是同一条记录上始终并存着两份信息（`declaredRange` vs `rawRange`），调用方混淆就会算错——比如有人误以为 `declaredRange` 是 raw、用错字段去做 `satisfies`，结果就是 catalog 路径完全失效。
 
-| 情况 | 含义 | 计入 |
-|---|---|---|
-| `satisfies(highestVersion, range)` 为真 | 声明接受最高版，**已迁移** | `migrated++` |
-| `isGreaterThanRange(highestVersion, range)` 为真 | 最高版超出声明范围，**落后** | `behind++` |
-| 都不命中 | 声明比最高版还高（罕见） | **忽略**，不计入任何分母 |
+本质矛盾：**"工程层用语义引用（catalog:foo）" vs "判定层只认字面量（^18.2.0）"**——两个抽象层各自合理，但跨层时必须做一次翻译，并且翻译痕迹要在结果里留痕，否则 UI 无法回溯。这条矛盾在所有"声明性引用 + 字面量判定"的系统里都存在：kustomize 的 `nameReference`、Helm 的 `values.yaml` 引用、Terraform 的 module output——它们都要在某个点上把语义引用解析回字面量，又都要在结果里同时保留两者。
 
-第三种「忽略」最容易被忽略——它意味着这条声明**不属于这个 cohort 的统计口径**。比如某个 patch-only 的内部补丁版本被锁死在比 npm 公开版本更高的号段上。如果把这类也算进 `total`，迁移比例的分母会被噪声污染。
+### 两阶段扫包：先全员累计 stats，再二次扫生成 item
 
-> 两个 semver 调用都包了 `try/catch`，库抛错时返回 `null` 视作不命中。这是一道保险——某些畸形范围（比如空字符串、奇怪的组合）会让 semver 库炸掉，不能让一条坏声明把整张表算崩。
+这是整套机制最不显然的取舍。第一遍扫包时，每条 dep 声明在 cohort 里的判定是独立的——理论上可以一边判定、一边直接生成 item。源码却偏要分两轮：第一轮只把 migrated/behind 累加进 stats，第二轮才基于稳定的 stats 生成 item。
 
-### 第 3 层：为什么要扫两遍
+选择是：**强制两阶段**，第二轮生成 item 时，每条 item 上的 `totalCount = migrated + behind` 必须是**全局口径**——即"整个项目里、这个 depName 一共有多少条声明参与了判定"，而不是"我这条 item 自己看到的局部口径"。换来的是迁移比例的语义稳定：50% 就是 50%，无论这条 item 在数组的哪个位置、无论消费者遍历顺序怎么变。如果只扫一遍，每条 item 的 totalCount 只能基于"截至当前已扫到的部分"，比例会随扫包顺序漂移——同一份输入因为消费者顺序不同给出不同比例，这是不可接受的。
 
-这是全章最关键的机制点。说人话就是：
+代价是对超大依赖图来说是双倍扫描成本（两次完整遍历 `dependencies` 和 `peerDependencies`）。本质矛盾：**"判定是逐条独立的（一遍即可）" vs "比例是全局口径的（必须先累计再生成）"**——单条判定的正确性一遍就能得到，但"比例"这个聚合量的正确性需要全局视野。这条矛盾在所有"既要单点判定、又要全局聚合"的系统里都出现：SQL 的 window function、流处理的 two-pass aggregate、编译器的符号解析——它们都分两遍走，原因都一样：**聚合量的正确性，要求它必须在数据齐备时才被计算**。
 
-> **第一遍扫，是为了让计数稳定下来；第二遍扫，才能用稳定的计数生成可读的待办项。**
+## 5. 最小原理演示
 
-为什么要这么麻烦？因为单条声明的「迁移比例」**不是它自己的事**，而是整个 cohort 的事。
-
-考虑这个场景：cohort `react` 装了 17 和 18 两个版本，三条声明里：
-
-- `app` 声明 `^17`（落后）
-- `lib-a` 声明 `^17`（也落后）
-- `lib-b` 声明 `^18.0.0`（已迁）
-
-最终的 `migrationRatio` 应该是 `1/3 ≈ 0.33`。这个分母 3，**必须等所有声明都过完一遍**才能确定。
-
-如果你一边扫一边生成 item，会出问题：
-
-- 扫到 `app` 时，stats 还只有 `behind=1`，这时生成的 item `totalCount=1, migrationRatio=0`。
-- 等扫到 `lib-b` 时，分母才变成 3。
-
-每条 item 拿到的 `totalCount` 不一致，UI 上一会儿显示 0%、一会儿显示 33%，就乱了。
-
-所以代码把这件事**硬拆成两遍**：
+下面这段约 50 行的脚本只演透三件事：**为什么必须两阶段**（item 的 totalCount 才稳定）、**为什么必须先 catalog 解析**（否则 `catalog:foo` 会被当作非纯 semver 直接排除）、**为什么 repository URL 相同要跳**（避免 monorepo 兄弟被误报）。能直接 `node --experimental-strip-types` 跑。
 
 ```ts
-// 第一遍：只累加 stats，不生成 item
-for (const consumer of packages) {
-  for (const [depName, rawRange] of entries(consumer.deps)) {
-    const range = resolveCatalogRange(rawRange, depName, catalogs)
-    if (!isPlainSemverRange(range)) continue
-    const entry = getStats(depName)
-    if (!entry) continue
-    if (safeSatisfies(entry.highestVersion, range)) entry.migrated++
-    else if (safeGtr(entry.highestVersion, range)) entry.behind++
-  }
-}
+import { satisfies, isGreaterThanRange, compare } from 'verkit'
 
-// 第二遍：基于已稳定的 stats，生成 item
-for (const consumer of packages) {
-  for (const [depName, rawRange] of entries(consumer.deps)) {
-    // ...同样的过滤...
-    if (safeGtr(entry.highestVersion, declaredRange) !== true) continue
-    // 只有「落后」的声明才会变成可执行 item
-    items.push({ /* ...migrationRatio: entry.migrated / total */ })
-  }
-}
-```
-
-注意第二遍里的 `if (safeGtr(...) !== true) continue`——它意味着「已迁」的声明**不会变成 item**，但它在第一遍里贡献的 `migrated++` 仍然保留在分母里。这就是「参与计数但不产生待办」的语义。
-
-### 第 4 层：兄弟跳过
-
-到这一步 item 已经能生成了，但有个反直觉的情况：monorepo 内部，`@scope/lib-a` 的 peer 声明里写了 `@scope/lib-b: workspace:^1.0.0`（解析出来就是某个 semver 范围），而 lib-a 和 lib-b 都锁在比 npm 公开发布版本更低的号段上——按理说会命中 gtr、生成一条「升级 `@scope/lib-b`」的待办。
-
-但这条待办是**假的**：lib-a 和 lib-b 是同一家仓库的兄弟包，它们的版本号节奏是仓库内部的事，跟「该不该升 npm 上公开发布的版本」完全是两个问题。
-
-守卫条件很简单：
-
-```ts
-const consumerRepo = consumer.resolved.repository?.url
-const depRepo = entry.highestPkg.resolved.repository?.url
-if (consumerRepo && depRepo && consumerRepo === depRepo) continue
-```
-
-注意是**两边都为真且相等**才跳过——只要有一边没填 `repository` 字段，跳过逻辑就不生效，落回正常判定。这条守卫只对「已经走到 gtr 命中之后」才生效——也就是说它**只在第二遍出现**，第一遍累加 stats 时不查 repo。
-
-### 第 5 层：按消费方重组
-
-最后一层把扁平的 items 数组按 `consumer.spec` 分桶，每个桶叫一个 `MaintainerActionGroup`。分组时还会算两个聚合字段：
-
-- `maxMigrationRatio`：这个消费方所有 item 里最高的迁移比例。
-- `latestReleasedAt`：消费方自己的发布时间，用于「按最新发布排序」模式。
-
-消重逻辑也藏在这里：先按 `spec`（带版本号）分桶，再按 `name` 二次去重——同名只保留版本号最高的那个。这样 `app@1.0.0` 和 `app@1.1.0` 不会同时出现在表里。
-
-三种排序模式，主键不同，二级三级 tie-breaker 也不完全一样：
-
-- `depth`（默认）：主键 `depth` 升序 → 二级 `maxMigrationRatio` 降序 → 三级 `name` 字典序。
-- `migration`：主键 `maxMigrationRatio` 降序 → 二级 `depth` 升序 → 三级 `name` 字典序（提示「这个包大部分人都升上去了，就你还卡着」）。
-- `latest`：主键 `latestReleasedAt` 降序 → 二级 `depth` 升序 → 三级 `name` 字典序（提示「这个包刚发版，可能值得跟进」）。
-
-注意默认 `depth` 模式跟另外两个的二级 key 不一样——它把 `maxMigrationRatio` 挪到二级，相当于「在浅层里再按迁移比例排一下」。
-
-## 最小原理演示
-
-下面这段脚本演透三件事：**为什么必须先全员累计、再二次扫**；**为什么 catalog 必须先解析**；**为什么 repository URL 相同要跳**。
-
-载体选 TypeScript——本仓库主语言就是 TS，跑一下能直接看到 cohort 的两个阶段是怎么分离的。能跑最好，跑不通也不影响理解。
-
-```ts
-import { satisfies, isGreaterThanRange as gtr } from 'verkit'
-
-// --- 演示数据：3 个消费方 + react 的两个已装版本 ---
-type Pkg = {
+interface Pkg {
   name: string
   version: string
   spec: string
-  depth: number
-  repo?: string
-  deps: Record<string, string>     // depName → raw range
+  repoUrl?: string
+  deps: Record<string, string>     // dependencies + peerDependencies 合并演示
 }
 
-// react 的「仓库 URL」（伪造：假设所有 react 版本都来自 github:foo/bar）
-const REACT_REPO = 'github:foo/bar'
+// 演示用：粗略判 prerelease（真实实现用 verkit.getPrerelease === null）
+const isStable = (v: string) => !/-/.test(v)
 
-const packages: Pkg[] = [
-  {
-    name: 'app', version: '1.0.0', spec: 'app@1.0.0', depth: 0,
-    deps: { react: '^17.0.0' },                       // → 落后于 18.2.0
-    // app 自己没填 repo → 兄弟跳过守卫不成立
-  },
-  {
-    name: '@scope/lib-a', version: '1.0.0', spec: '@scope/lib-a@1.0.0', depth: 1,
-    repo: REACT_REPO,                                  // 跟 react 共享同一仓库 URL（伪造 monorepo 兄弟）
-    deps: { react: '^17.0.0' },                       // → 命中 gtr，但被兄弟跳过
-  },
-  {
-    name: 'lib-b', version: '2.0.0', spec: 'lib-b@2.0.0', depth: 1,
-    deps: { react: 'catalog:deps' },                  // → 解析回 ^18.0.0，satisfies 命中
-  },
-]
-
-// cohort 基线：模拟「已安装」的 react 版本
-const installed: Record<string, string[]> = {
-  react: ['17.0.0', '18.2.0'],
+// 第一阶段：按 depName 聚 cohort，过滤 prerelease 取最高 stable
+function buildStats(packages: Pkg[]) {
+  const byName = new Map<string, Pkg[]>()
+  for (const p of packages) {
+    if (!byName.has(p.name)) byName.set(p.name, [])
+    byName.get(p.name)!.push(p)
+  }
+  const stats = new Map<string, { highest: Pkg, migrated: number, behind: number } | null>()
+  for (const [name, list] of byName) {
+    const stable = list.filter(p => isStable(p.version))
+    if (!stable.length) { stats.set(name, null); continue }
+    stable.sort((a, b) => compare(a.version, b.version))
+    stats.set(name, { highest: stable.at(-1)!, migrated: 0, behind: 0 })
+  }
+  return stats
 }
 
-// catalog 表：catalog:deps 里的 react 解析为 ^18.0.0
-const catalogs: Record<string, Record<string, string>> = {
-  deps: { react: '^18.0.0' },
-}
-
-// --- cohort 统计 ---
-type Stats = { highest: string; migrated: number; behind: number }
-const stats = new Map<string, Stats | null>()
-
-function getStats(depName: string): Stats | null {
-  if (stats.has(depName)) return stats.get(depName)!
-  const versions = installed[depName]
-  if (!versions?.length) { stats.set(depName, null); return null }
-  // 这里简化：假设都是 stable。真代码会 filter prerelease。
-  const highest = versions.slice().sort()[versions.length - 1]
-  const entry = { highest, migrated: 0, behind: 0 }
-  stats.set(depName, entry)
-  return entry
-}
-
-const NON_SEMVER_PREFIX = ['workspace:', 'link:', 'file:', 'npm:', 'git+', 'git:', 'http:', 'https:', 'github:']
-function isPlainSemverRange(r?: string): r is string {
-  if (!r || r === '*' || r === 'latest' || r === 'x') return false
-  return !NON_SEMVER_PREFIX.some(p => r.startsWith(p))
-}
-
-function resolveCatalogRange(range: string, depName: string): string | undefined {
+// catalog 解析：catalog:foo → 真实 semver；否则原样返回
+function resolveCatalog(
+  range: string,
+  depName: string,
+  catalogs?: Record<string, Record<string, string>>,
+): string | undefined {
   if (!range.startsWith('catalog:')) return range
   const name = range.slice('catalog:'.length) || 'default'
-  return catalogs[name]?.[depName]
+  return catalogs?.[name]?.[depName]
 }
 
-// --- 第一遍：只累加 stats ---
-console.log('--- 第一遍：累加 stats ---')
-for (const c of packages) {
-  for (const [depName, rawRange] of Object.entries(c.deps)) {
-    const range = resolveCatalogRange(rawRange, depName)
-    if (!isPlainSemverRange(range)) {
-      console.log(`[skip  ] ${c.spec} → ${depName}@${rawRange} (非纯 semver)`)
-      continue
-    }
-    const entry = getStats(depName)!
-    const note = rawRange !== range ? ` (解析自 ${rawRange})` : ''
-    if (satisfies(entry.highest, range)) {
-      entry.migrated++
-      console.log(`[migr  ] ${c.spec} → ${depName}@${range}${note} 满足最高版 ${entry.highest}`)
-    }
-    else if (gtr(entry.highest, range)) {
-      entry.behind++
-      console.log(`[behind] ${c.spec} → ${depName}@${range}${note} 落后于最高版 ${entry.highest}`)
+// isPlainRange：排除 *、latest、各种协议前缀
+function isPlainRange(r?: string): r is string {
+  if (!r || r === '*' || r === 'latest') return false
+  return !['workspace:', 'link:', 'file:', 'npm:', 'git+', 'git:', 'http:', 'https:', 'github:']
+    .some(p => r.startsWith(p))
+}
+
+// 两阶段主算法
+function computeActions(packages: Pkg[], catalogs?: Record<string, Record<string, string>>) {
+  const stats = buildStats(packages)
+
+  // 第一阶段：全员累计，不生成 item
+  for (const c of packages) {
+    for (const [depName, rawRange] of Object.entries(c.deps)) {
+      const range = resolveCatalog(rawRange, depName, catalogs)
+      if (!isPlainRange(range)) continue
+      const s = stats.get(depName)
+      if (!s) continue
+      if (satisfies(s.highest.version, range)) s.migrated++
+      else if (isGreaterThanRange(s.highest.version, range)) s.behind++
     }
   }
-}
 
-// --- 第二遍：基于稳定的 stats 生成 item ---
-console.log('\n--- 第二遍：生成 item ---')
-for (const c of packages) {
-  for (const [depName, rawRange] of Object.entries(c.deps)) {
-    const range = resolveCatalogRange(rawRange, depName)
-    if (!isPlainSemverRange(range)) continue
-    const entry = stats.get(depName)!
-    if (gtr(entry.highest, range) !== true) {
-      console.log(`[pass  ] ${c.spec} → ${depName} 不命中 gtr，不生成 item`)
-      continue
+  // 第二阶段：基于稳定 stats 生成 item，totalCount 是全局口径
+  const items = []
+  for (const c of packages) {
+    for (const [depName, rawRange] of Object.entries(c.deps)) {
+      const range = resolveCatalog(rawRange, depName, catalogs)
+      if (!isPlainRange(range)) continue
+      const s = stats.get(depName)
+      if (!s || isGreaterThanRange(s.highest.version, range) !== true) continue
+      // 兄弟跳过的双 truthy 守卫：两边 repository URL 都得有、且相等
+      if (c.repoUrl && s.highest.repoUrl && c.repoUrl === s.highest.repoUrl) continue
+      const total = s.migrated + s.behind
+      items.push({
+        consumer: c.spec,
+        depName,
+        declaredRange: range,
+        rawRange: rawRange === range ? undefined : rawRange,
+        installedHighest: s.highest.version,
+        migratedCount: s.migrated,
+        totalCount: total,
+        migrationRatio: total ? s.migrated / total : 0,
+      })
     }
-    // 兄弟跳过守卫：两边都有 repo 且相等
-    const consumerRepo = c.repo
-    const depRepo = REACT_REPO // 真代码里取 highestPkg.resolved.repository?.url
-    if (consumerRepo && depRepo && consumerRepo === depRepo) {
-      console.log(`[skip  ] ${c.spec} → ${depName} (兄弟包，同仓库 ${consumerRepo})`)
-      continue
-    }
-    const total = entry.migrated + entry.behind
-    const ratio = total ? entry.migrated / total : 0
-    console.log(`[ITEM  ] consumer=${c.spec} dep=${depName} range=${range} highest=${entry.highest} migrated=${entry.migrated}/${total} ratio=${ratio.toFixed(2)}`)
   }
+  return items
 }
 ```
 
-跑出来的执行轨迹大概是这样：
+跑下面这段，三种结局各演一次：被收编进 cohort / 因兄弟同仓库被跳 / 因非纯 semver 被排除。
+
+```ts
+const pkgs: Pkg[] = [
+  { name: 'app', version: '1.0.0', spec: 'app@1.0.0',
+    deps: { react: '^17.0.0' } },
+  { name: 'react', version: '17.0.0', spec: 'react@17.0.0',
+    repoUrl: 'github:facebook/react', deps: {} },
+  { name: 'react', version: '18.2.0', spec: 'react@18.2.0',
+    repoUrl: 'github:facebook/react', deps: {} },
+  // @fb/lib-a 与 react 共享 repoUrl，是 monorepo 兄弟。它也声明 ^17.0.0、
+  // 也会在第一遍被 gtr 命中——但它在第二遍的 item 会被兄弟跳过。
+  // 注意：第一遍的 behind 计数仍然算上它（这就是全局口径的来源）。
+  { name: '@fb/lib-a', version: '1.0.0', spec: '@fb/lib-a@1.0.0',
+    repoUrl: 'github:facebook/react', deps: { react: '^17.0.0' } },
+  // lib-b 声明 *，被 isPlainRange 直接排除
+  { name: 'lib-b', version: '2.0.0', spec: 'lib-b@2.0.0',
+    deps: { react: '*' } },
+]
+
+console.log(computeActions(pkgs))
+// 唯一输出：
+// { consumer: 'app@1.0.0', depName: 'react', declaredRange: '^17.0.0',
+//   installedHighest: '18.2.0', migratedCount: 0, totalCount: 2, migrationRatio: 0 }
+// 注意 totalCount=2：lib-a 的 behind 在第一遍被算进去了，
+// 但 lib-a 自己的 item 在第二遍被兄弟跳过——总数和 item 数对不上的"矛盾"，
+// 正是两阶段扫包换来的"全局口径稳定"。
+```
+
+## 6. 执行轨迹
+
+把上面的演示数据走一遍，看每一步内部状态怎么变。
+
+**初始**：5 个 Pkg 进 `buildStats`。`byName` 收拢出 4 个桶：`app`、`react`（2 个版本）、`@fb/lib-a`、`lib-b`。stable 过滤后都通过（没有 prerelease）。`stats` 此时长这样：
 
 ```
---- 第一遍：累加 stats ---
-[behind] app@1.0.0 → react@^17.0.0 落后于最高版 18.2.0
-[behind] @scope/lib-a@1.0.0 → react@^17.0.0 落后于最高版 18.2.0
-[migr  ] lib-b@2.0.0 → react@^18.0.0 (解析自 catalog:deps) 满足最高版 18.2.0
-
---- 第二遍：生成 item ---
-[ITEM  ] consumer=app@1.0.0 dep=react range=^17.0.0 highest=18.2.0 migrated=1/3 ratio=0.33
-[skip  ] @scope/lib-a@1.0.0 → react (兄弟包，同仓库 github:foo/bar)
-[pass  ] lib-b@2.0.0 → react 不命中 gtr，不生成 item
+stats = {
+  app:       { highest: app@1.0.0,       migrated: 0, behind: 0 },
+  react:     { highest: react@18.2.0,    migrated: 0, behind: 0 },
+  @fb/lib-a: { highest: @fb/lib-a@1.0.0, migrated: 0, behind: 0 },
+  lib-b:     { highest: lib-b@2.0.0,     migrated: 0, behind: 0 },
+}
 ```
 
-注意三件事：
+`react` 桶有两个版本，按 semver 排序后 `[17.0.0, 18.2.0]`，取末位 `18.2.0` 作 highest。
 
-1. **lib-b 的 `catalog:deps` 必须先解析回 `^18.0.0`** 才能进入判定——如果跳过 `resolveCatalogRange`，`catalog:` 前缀会被 `isPlainSemverRange` 排除，整条声明根本不参与计数。
-2. **lib-a 在第一遍贡献了 `behind++`**——分母 3 里有它一份；但它在第二遍被兄弟跳过守卫拦住，不会变成 item。
-3. **app 这条 item 的 ratio=1/3**——分母 3 是「cohort 内所有有效声明的总和」（migrated + behind），而不是「最终生成 item 的声明数」。这就是「全局口径」的来源。
+**第一遍扫包**（按数组顺序：app → react@17 → react@18.2 → lib-a → lib-b）：
 
-把这三件事串起来：第一遍累加让分母稳定，第二遍才有「生成 item 还是跳过」的分叉——**计数和生成 item 是分离的，参与计数不等于必须出现在最终清单里**。
+- `app.deps.react = '^17.0.0'` → isPlainRange 通过 → stats.react 存在 → `satisfies('18.2.0', '^17.0.0')` 返回 false → `isGreaterThanRange('18.2.0', '^17.0.0')` 返回 true → `behind++`。stats.react 变成 `{ migrated: 0, behind: 1 }`。
+- `react@17.deps = {}`、`react@18.2.deps = {}` → 都没贡献。
+- `@fb/lib-a.deps.react = '^17.0.0'` → isPlainRange 通过 → `satisfies` false → `isGreaterThanRange` true → `behind++`。stats.react 变成 `{ migrated: 0, behind: 2 }`。注意这里**没有任何 sibling 检查**——第一遍只管累加。
+- `lib-b.deps.react = '*'` → isPlainRange false → 跳。
 
-## 关键权衡
+**第一遍结束**时 stats.react = `{ highest: 18.2.0, migrated: 0, behind: 2 }`，totalCount 在此时已经定下来是 2。第一遍**没有**生成任何 item。
 
-这一章机制丰富，有 4 条值得复述的权衡。
+**第二遍扫包**（同样的遍历）：
 
-### 权衡 1：跳过同仓库兄弟，代价是「没填 repository 的包失去这层保护」
+- `app.deps.react = '^17.0.0'` → isGreaterThanRange 命中（true）→ 检查 repository URL：`app.repoUrl` 是 undefined，双 truthy 守卫不成立 → 不跳 → push item。从 stats 读出 `totalCount = 0+2 = 2`、`migratedCount = 0`、`migrationRatio = 0/2 = 0`。
+- `@fb/lib-a.deps.react = '^17.0.0'` → isGreaterThanRange 命中（true）→ 检查 repository URL：`lib-a.repoUrl = 'github:facebook/react'`、`stats.react.highest.repoUrl = 'github:facebook/react'`，两边都有值且相等 → **跳过**，不 push item。
+- `lib-b.deps.react = '*'` → isPlainRange false → 跳。
 
-**做了什么选择**：消费方和候选包的 `repository.url` 相等时，直接跳过、不生成迁移 item。
+**输出**：一条 item，`migrationRatio = 0`、`totalCount = 2`。
 
-**换来了什么**：monorepo 内部 alias（`@scope/a` peer 依赖 `@scope/b` 实为兄弟包）不会被误报成迁移机会。这条非常重要——monorepo 大量用 workspace alias，如果每条都报「该升级 @scope/b」，待办表会被噪声淹没，维护者很快就会对整张表失去信任。
+如果只扫一遍，`app` 在前会得到 `totalCount=1`（只算到 app 自己），`lib-a` 在后会得到 `totalCount=2`（算到了 app 和 lib-a）——同一条 react 的迁移比例会因为扫到的时间点不同而漂移。两阶段扫包消除了这个漂移：每条 item 看到的 totalCount 都是稳定的全局值。
 
-**代价**：`repository` 字段不是 npm 强制要求的。一个包如果没在 `package.json` 里写 `repository.url`，跳过逻辑的双 truthy 守卫就不成立——它会被当作普通第三方包参与判定。结果是**本应被屏蔽的「假迁移机会」会出现在清单上**。
+这里有个微妙之处值得点一下：lib-a 的 behind 计数被算进了 stats，但 lib-a 自己的 item 被兄弟跳过——所以**总 item 数（1）和 totalCount（2）对不上**。这不是 bug，是全局口径的代价：cohort 统计和 item 生成是两套独立的判定，第一遍不挑食、第二遍才筛。维护者在 UI 上看到 totalCount=2 时，要理解这个"2"是"全项目范围内 react 的 dep 声明数"，而不是"会被推荐的待办数"。
 
-这是一个**信任 npm 元数据完整性的选择**：你赌大多数活跃维护的包都会填 repository（事实上确实如此），冷门或老包可能漏掉，但那部分本来也是噪声较大的部分。
+## 7. 教学简化说明
 
-### 权衡 2：只信 stable 版本做基线，代价是「全 prerelease 的依赖被静默跳过」
+本章演示故意省略了：publint 作为另一种 action 类型（与 dep-upgrade 并存于同一 items 数组，是"顺路打包送给 UI"的旁路）；DTO 层（把 Group 内部的 PackageNode 引用展平成字符串，仅为跨 RPC 序列化）；三种排序模式切换、authors 聚合、`latestOnly` 过滤、limit 截断等工程化逻辑。这些都不影响 cohort + 判定 + 兄弟跳过这条原理主线。
 
-**做了什么选择**：算 cohort 最高版前先 `filter(p => isStable(p.version))`，把所有 prerelease（alpha/beta/rc）扔掉，只对 stable 排序取末位。
+## 8. 小结
 
-**换来了什么**：迁移建议**永远不会指向一个 alpha/beta**。维护者看到「该升到 18.2.0」时，可以相信 18.2.0 是稳定版，不会一脚踩进不稳版的坑里。这跟第一章定调「主观问题变成数值排序」一脉相承——决策建议必须落在「安全区」。
-
-**代价**：某些前沿依赖（特别是新的 web 框架、新工具链）早期**全是 prerelease**，根本没有 stable 版本。这种依赖整条 `stats.set(depName, null)`、被**静默跳过**——`stats` 里这条记为 null，外部看不到任何提示。
-
-更隐蔽的是：用户看不到「这条依赖被跳过了」，他只会觉得「咦，这个包明明装了，怎么待办表里没出现？」。如果想做对，应当在 UI 层单独展示「全 prerelease 跳过」的清单，但本机制本身没有这个出口。
-
-### 权衡 3：catalog 引用先解析、原始值附带保留，代价是「两条信息必须成对出现」
-
-**做了什么选择**：声明形如 `catalog:foo` 时，先用 `catalogs` 字典查回真实 semver（比如 `^18.2.0`）再走判定；但 item 里同时塞了 `rawRange`（原始的 `catalog:foo`）和 `catalogName`（解析出的 catalog 名）。
-
-**换来了什么**：上层 UI 既能用解析后的 `declaredRange` 做精确的迁移计算，又能给用户显示「这条声明来自 `catalog:deps`，去改 catalog 文件就能改」，而不用逼着维护者去脑补「`^18.2.0` 是从哪来的」。
-
-**代价**：item 现在同时带着 `declaredRange` 和 `rawRange`——两者**必须成对出现**，且只有 `rawRange !== declaredRange` 时 `rawRange` 才有值。任何调用方混淆这两个字段就会算错：比如把 `rawRange`（可能是 `catalog:foo`）当 semver 喂给 `satisfies`，立刻炸。
-
-这种「字段冗余但语义重叠」的设计是一种**接口上的负债**——它把「catalog 机制存在」这个事实信息留在每一个 item 上。如果有更优雅的做法，可能是把 catalog 解析做成一个独立预处理阶段，让 item 永远只看到最终 semver——但那样 UI 就丢失了「这条来自 catalog」的提示能力。
-
-### 权衡 4：两阶段扫包换稳定口径，代价是「双倍扫描成本」
-
-**做了什么选择**：第一轮把每个 depName 的 migrated/behind 计数累加进共享 stats；第二轮再用累计好的 stats 生成可执行 item。
-
-**换来了什么**：每条 item 的 `totalCount` 是**全局口径**而非「自己看到的口径」——前面演示里 lib-a 在第一遍贡献了 behind，lib-b 在第一遍贡献了 migrated，最终 app 的 item 拿到的分母是正确的 3，而不是只看到自己一次。这让迁移比例的语义稳定、可解释：同一 cohort 下所有 item 共享同一个分母。
-
-**代价**：必须遍历**两次** packages。对几百个包的项目无所谓；对超大依赖图（万级节点）来说是双倍扫描成本。
-
-为什么没用「一遍扫、第二遍只补 totalCount」之类的优化？因为「补 totalCount」意味着把已生成的 item 再遍历一遍去回填——本质上还是两遍。不如第一遍纯累加（O(N)、常数小）、第二遍纯生成（O(N)、可以同时做兄弟跳过和 item 构造），逻辑分得清、好测试。
-
-> **本章机制集中**：除了这 4 条核心权衡，DTO 层的「字段重命名 + 引用剥离」、`publint` 作为旁路 action 的并存、分组时的 `latestOnly` 过滤等都是工程化细节，原理上没有新东西，不展开。
-
-## 一条完整的执行轨迹
-
-把演示里的数据再用一张表过一遍，让两条扫描的语义更清楚。
-
-**输入**：3 个消费方 + react 的两个已装版本（`17.0.0`、`18.2.0`），catalog 表 `{ deps: { react: '^18.0.0' } }`。
-
-**第一遍扫描**（累加 stats）：
-
-| 消费方 | raw range | 解析后 | 处理 | 累计结果 |
-|---|---|---|---|---|
-| app | `^17.0.0` | `^17.0.0` | plain semver，进入判定，gtr 命中 | `behind = 1` |
-| @scope/lib-a | `^17.0.0` | `^17.0.0` | plain semver，进入判定，gtr 命中（不查 repo） | `behind = 2` |
-| lib-b | `catalog:deps` | `^18.0.0` | 解析后 plain semver，进入判定，satisfies 命中 | `migrated = 1` |
-
-第一遍结束：cohort `react` 的 `highestVersion=18.2.0`、`migrated=1`、`behind=2`、`total=3`。
-
-**第二遍扫描**（生成 item）：
-
-| 消费方 | gtr 命中？ | repo 比较 | 结果 |
-|---|---|---|---|
-| app | 是 | app 无 repo，守卫不成立 | 生成 item：`migrated=1/3, ratio=0.33` |
-| @scope/lib-a | 是 | 两边都 `github:foo/bar`，相等 | **兄弟跳过**，不生成 item |
-| lib-b | 否（satisfies 命中） | — | `gtr !== true`，直接 continue |
-
-**最终输出**：一条 dep-upgrade item（consumer=app）。按 consumer 分组后 `app` 这一组的 `maxMigrationRatio=0.33`。
-
-注意 lib-a 和 lib-b 都**没出现在 item 清单里**，但它们对分母的贡献（各 +1）仍然体现在 app 那条 item 的 `totalCount=3` 上。这正是「全局口径」的语义：分母代表整个 cohort，分子代表已经迁过去的部分。
-
-## 同级产物
-
-跟 `computeMaintainerActions` 平级的还有两个兄弟函数，都被 CLI 的 `report` 命令平行调用，但**不属于本机制的原理链条**：
-
-- **重复检测**：按 name 聚合 → 比 `minVersions`（默认 2）→ 按版本数降序。纯计数，不涉及 semver 判定。
-- **安装体积测算**：按 bytes 降序 → limit（默认 50）截断 → 默认排除 workspace 包。
-
-三者各自独立、互不依赖，共享的只是「输入一份 packages、输出一份可读报告」这个外部形态。
-
-## 小结
-
-这一章要带走的三件事：
-
-1. **两阶段扫描是迁移比例语义稳定的核心**——第一遍累加、第二遍生成，让分母永远是全局口径。
-2. **catalog 解析必须前置**——否则 `catalog:foo` 会被当作非 semver 直接排除，整条依赖消失。
-3. **兄弟跳过用两边都为真且相等的守卫**——只在两边都填了 repository 且相等时跳过，赌大多数活跃包都会填这个字段。
-
-这三件事凑在一起，把「该先升哪些依赖」这个主观问题，变成了一个**可批量重跑、不依赖网络、按比例排好的数值表**——维护者只需要看表，不需要再翻 `package.json`。
+这一章算的全是"已经装在本地的版本之间的相对关系"——cohort 的 highest 来自本地 `node_modules`，迁移比例来自本地 `package.json` 声明，全程没碰一次网络。它回答了"基于现状，我该先动哪些"，但回答不了"上游是否已经发得更高、是否已被爆漏洞"。下一章就把这两个外部维度补上——按 batch 拉 npm registry、按包年龄算 TTL 缓存、顺手把漏洞数据并进来——让维护者的清单从"装了的相对位置"扩展到"上游和安全的绝对信号"。

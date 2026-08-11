@@ -1,245 +1,184 @@
 # SSR 与状态水合：单一根状态的序列化契约
 
-## 一份状态，要原样穿过网络
+> 本章属于 system 层。前置：Store 装配、状态变更模型。
+> 学完你能用一句话讲清：Pinia 的 SSR 契约为什么就是那一个根状态对象，以及客户端怎么把它按 key 拆还给每个 store。
 
-想象你在做服务端渲染。服务端拿一个已经登录的用户的购物车——里面 `count` 是 3——把整个页面渲染成 HTML 发给浏览器。浏览器收到 HTML,画面上明明白白写着「购物车:3 件」。接着 Vue 在浏览器里「激活」这份 HTML:它要重新跑一遍你的 store,把响应式状态接上,让按钮、事件重新生效。
+## 1. 为什么需要它
 
-问题就出在这一步。客户端重新跑 store 的时候,`count` 又从默认值 0 开始算。于是你看到画面闪了一下:3 → 0 → 再变回 3。这就是传说中的「水合不匹配」(hydration mismatch)——界面会闪、事件可能错位、开发模式下还会报一串警告。
+上一章把 DevTools 当作一个插件，整套可观测层建立在「状态可被拍照与回放」这个前提上——timeline 记录每次变更、inspector 展开当前快照。SSR 把这个前提推到了极致：服务端拍下整份状态发往浏览器，客户端要把它原样回放出来。
 
-你真正想搞明白的是:服务端那份状态,怎么原样、完整地搬到客户端,让两边每个 store 的每个字段都一模一样,一个 bit 都不差?
+读者撞上的烦恼很具体：服务端算好了购物车有 3 件商品、用户已登录、当前主题是暗色，HTML 里渲染的就是这些值；可浏览器拿到 HTML 后，客户端的 store 会按 setup 函数里写的默认值重新建一遍——count 又变回 0、用户变回未登录。界面闪一下、事件对不上、控制台报「水合不匹配」。
 
-## 把所有状态钉在一块公共留言板上
+读者真正要解决的是把服务端算完的那份状态原封不动搬到客户端，让客户端的 store 拿到时就已经是那个值。这个搬移需要一份契约：一份服务端和客户端都认得的状态快照。
 
-pinia 的答案出奇地朴素:**所有 store 的状态,全都汇聚进同一个根对象**。这个根对象就是一块谁都能看到的公共留言板——每个 store 把自己当下的 state 钉在上面。服务端离开之前,给整块留言板拍张照(序列化);客户端开机第一件事,是把这张照片原样贴回一块新的留言板(回填)。状态就这么穿过网络了。
+## 2. 核心思想
 
-说人话:序列化这一个根对象、再回填这一个根对象,就是搬移状态的**全部契约**。不需要每个 store 各自搞一套序列化协议,不需要任何额外的握手。
+把「状态搬移」从「每个 store 各自想办法」降维成「一个根对象承载全部」——序列化它就等于序列化了所有 store，回填它就等于回填了所有 store。
 
-这一步其实是在兑现前面埋下的伏笔。第 4 章讲装配时,已经把每个 store 的 state 一路镜像进了这一个根对象(镜像那一步是装配阶段的取舍,本章不重讲)。正因为当初把状态都收进了这一处,现在跨网络搬移才只需要搬这一个对象——那个「单一可序列化状态树」的承诺,到这一章才真正兑现。
+这个根对象是个扁平映射：`{ storeId: stateObject }`。任何能做 JSON 的运行时都能搬它，不需要额外的序列化协议、不需要每个 store 写自己的 serialize/deserialize。
 
-## 这一个根对象,长什么样
+## 3. 心智模型
 
-它就是一个扁平的映射表:`{ storeId: 该store的state }`。
+根状态对象长这样：
 
 ```
 pinia.state.value = {
-  cart:  { count: 3, items: [], tags: ['vip'] },
-  user:  { id: 7,  name: 'Ada' },
-  theme: { dark: true },
+  cart: { count: 3, items: [] },
+  user: { id: 7, name: 'ada' },
+  prefs: { theme: 'dark' }
 }
 ```
 
-每个 store 在这张表里占一格,格子里装的是它完整的 state。它是平的、是普通对象、可以 `JSON.stringify`——这三点凑齐,它就能穿过任何能读 JSON 的运行时。
+服务端跑完所有 store 后，这个对象里躺着每个 store 的最终状态。整套状态搬移分两步：
 
-## 两段式搬移:拍照,再贴回去
+第一步「拍照」：把整个根对象 `JSON.stringify` 一下，塞进 HTML 的载荷发给浏览器。
 
-搬移分两端,pinia 在中间只露出那一个根对象:
+第二步「回放」：浏览器拿到载荷后，先把它整体回填进同一个根对象；当页面首次用到某个 store 时，装配过程读出「这个 store 在根里已有的入站状态」，按需灌进 store 自己的状态容器。
 
-```
-[服务端]                              [客户端]
-各 store 装配                          框架把 JSON 整个回填
-   ↓                                     进同一个根对象
-state 镜像进 root                    root = { cart:{...}, user:{...} }
-   ↓                                     ↓
-JSON.stringify(root)  ──网络──>     parse
-   ↓                                     ↓
-一段 JSON                            首次 useStore('cart')
-塞进 HTML 由框架发出                   触发装配,读出入站状态
-```
+第二步里两种语法分叉：
 
-这里有个分工要分清:pinia 自己**只暴露** `pinia.state.value` 这一个可序列化的根;真正把 JSON 塞进 HTML、客户端再从 HTML 里抠出来回填的动作,是 Vue SSR / Nuxt 这类框架干的活。pinia 不碰 stringify、不碰 parse,它只保证「我这一块根对象随时可序列化、可回填」。
+- **option store**：state 形状由 `state()` 选项声明，直接从根对象取——根里是什么，state 就是什么，天然已水合。
+- **setup store**：state 是命令式 `ref()` 一个个建出来的，装配时遍历 setup 返回的每个 state 容器，把入站值逐 key 灌进去，再把容器注册回根对象保持双向同步。
 
-## 装配的第一眼:有没有入站状态?
+## 4. 关键权衡
 
-客户端把根对象回填好之后,并不会主动去动各个 store。store 是惰性的——直到某段代码第一次调用 `useStore('cart')`,装配才发生。
+### 用一个根对象当契约，而不是给每个 store 单独的序列化协议
 
-装配函数开头第一件事,就是去根对象里捞自己的那一格:
+这个设计直接兑现装配章那次权衡——把所有 state 镜像进同一个根对象，换来「单一可序列化状态树」；本章就在这个根对象上把状态序列化发往客户端，省下一套额外的序列化协议。
+
+服务端只要把那一个根对象 stringify、客户端只要把那一个根对象回填，跨网络的状态搬移就完成了。任何能跑 JSON 的运行时都能接：Nuxt 用它、Vue SSR 用它、自研框架也能用它。
+
+换来这套跨框架的中立性，代价落在 setup store 上。option store 的 state 形状由 `state()` 选项声明，从根里直接取就行；setup store 的 state 是开发者在 setup 函数里命令式 `ref()` 一个个建出来的，装配时要做一段「按 key 灌值」的胶水：遍历 setup 返回的每个 state 容器，把入站值赋进去，再把容器注册回根对象保持双向同步。这段胶水是单一契约换来的必然成本。
+
+化解的本质矛盾是「**框架中立 vs. 语法自由**」：状态契约想要稳定到任何运行时都能搬，store 的写法又想自由到能命令式声明任意响应式容器——两者不可能同时满足，除非承认「契约只有一个根对象，让 setup store 自己负责把根里的值灌进它建的容器」。读者一旦抓住这个骨架，在任何「把序列化值灌回运行时容器」的 SSR/hydrate 场景里都能认出同一组取舍。
+
+### 集合水合时先清空默认值，再灌入站值
+
+setup store 里常会写 `items: ref(new Set())` 或 `tags: ref(new Map())` 这种集合默认值。水合这种集合时，pinia 的做法是先 `prop.clear()` 把默认值倒掉，再灌入站值，而不是把默认值与服务端值深度合并。
+
+换来的是与 `$patch` 完全一致的合并语义：客户端拿到的就是服务端那份集合本身，不会因为开发者本地默认填了几个种子值就被混进网络传来的真值。代价是开发者在 setup 里给集合设的「默认种子」在客户端水合时会被直接丢弃——你只能从「服务端值是唯一真相」的角度理解集合的初始状态。
+
+> 深合并工具本身在状态变更模型一章里已展开过，这里只引用它处理集合灌值的语义。
+
+### 提供「应否水合」的标记 API，让 setup store 能声明「这个有状态对象不是真状态」
+
+setup store 经常会返回一些「有状态但不是数据」的对象——最典型的是路由实例：它内部有大量字段，但根本不该被序列化发给客户端。如果默认所有 ref/reactive 都水合，这类对象就会被 stringify 进载荷，发到浏览器，既浪费带宽又会把不该暴露的内部句柄泄出去。
+
+pinia 提供一对 API 解决这个：`skipHydrate(obj)` 给对象打一个不可枚举的 symbol 标记，`shouldHydrate(obj)` 反向判断。装配时遍历每个 state 容器，发现被标记的就跳过水合、也不注册回根。
+
+换来的是把路由实例、第三方有状态对象安全放进 setup store 而不被序列化的能力。代价是「声明权」交给使用者——你得主动给这类非状态对象打标记，漏打就会触发序列化。本质矛盾是「**响应式容器表面同质**（都是 ref/reactive）**而水合需求异质**（有的是数据、有的是句柄）」：光看类型看不出谁是数据、谁是句柄，必须靠显式标记区分。
+
+### option store 留一个可选的自定义水合钩子当逃生口
+
+option store 因 state 形状已知、天然从根取值，绝大多数情况不需要任何特殊处理。但有一类边角：state 用了 `customRef`、`computed`，或用了「服务端值 ≠ 客户端值」的响应式（如 `useLocalStorage`）——这种情况下，光靠「从根取值」无法把入站状态对齐到这类特殊响应式上。
+
+pinia 给 option store 留了 `options.hydrate(store.$state, initialState)` 钩子当逃生口，让开发者手动把入站值灌进特殊响应式。换来的是「特殊响应式在 option store 里也能精确对齐」，代价是这个钩子仅 option store 可用——setup store 因默认逐 key 灌值机制已覆盖大部分情况，特殊响应式需自行处理。
+
+本质矛盾是「**默认水合路径普适** vs. **少数响应式需要特殊对齐**」：默认机制想保持简单，又得给边角情况留口子，逃生钩子就是这个口子。
+
+## 5. 最小原理演示
+
+下面的代码只用极简的 `{ value }` 模拟 ref、用普通对象模拟根状态，演透三件事：(a) 一个根对象就是全部契约；(b) 给定入站状态和 setup 函数返回的若干 state 容器，装配时按 key 把入站值灌进每个容器；(c) 被标记为「跳过水合」的对象不参与灌值。
 
 ```ts
-const initialState = pinia.state.value['cart']
+// 用极简 { value } 模拟 ref，演透「按 key 灌值」，不演响应式本身
+type Box<T> = { value: T }
+const box = <T>(v: T): Box<T> => ({ value: v })
+const isBox = (v: any): v is Box<any> =>
+  v && typeof v === 'object' && 'value' in v
+
+// 跳过水合的标记：给对象挂一个不可枚举的 symbol
+const SKIP = Symbol('skip')
+function skipHydrate<T>(obj: T): T {
+  Object.defineProperty(obj, SKIP, {})
+  return obj
+}
+function shouldHydrate(obj: any) {
+  return !obj || typeof obj !== 'object' || !(SKIP in obj)
+}
+
+// 一个根对象 = 全部 SSR 契约
+type Root = Record<string, Record<string, any>>
+
+// 服务端：跑完所有 store 后，把根对象序列化发往客户端
+function serialize(root: Root): string {
+  return JSON.stringify(root)
+}
+
+// 客户端：把载荷整体回填进根对象
+function hydrateRoot(payload: string): Root {
+  return JSON.parse(payload)
+}
+
+// setup store 装配：给定 id、setup 函数、根对象，按 key 把入站值灌进每个 state 容器
+function assemble<SS extends Record<string, any>>(
+  id: string,
+  setup: () => SS,
+  root: Root
+): SS {
+  // 读「根里已有的入站状态」——非空说明处于水合场景
+  const incoming = root[id]
+  // 占位：setup store 装配前先在根里挂个空对象，准备接住反向注册
+  if (!incoming) root[id] = {}
+
+  const store = setup()
+  for (const key in store) {
+    const prop = store[key]
+    // 只处理 state 容器（演示里用 Box 模拟 ref），跳过 action/getter
+    if (!isBox(prop)) continue
+
+    if (incoming && shouldHydrate(prop.value)) {
+      // 集合先清空再赋，换与 $patch 一致的覆盖语义，不与服务端值混
+      if (prop.value instanceof Set || prop.value instanceof Map) {
+        prop.value.clear()
+      }
+      prop.value = incoming[key]
+    }
+    // 反向注册：把容器写回根对象，保持根与 store 双向同步
+    root[id][key] = prop.value
+  }
+  return store
+}
 ```
 
-这一行,就是判断「我现在是不是在水合场景」的唯一依据:
+这份演示只演核心思想，故意省略了真正的响应式、effectScope 托管、reactive 包装、option store 的自定义水合钩子、$patch 暂停监听、devtools。
 
-- `initialState` 是空的(不存在)→ 这是首次纯客户端启动,没有入站状态,按默认值走。
-- `initialState` 有内容 → 有入站状态,需要水合。
+## 6. 执行轨迹
 
-捞到入站状态之后,往下怎么灌,option store 和 setup store 走两条不同的岔路。
-
-## 岔路一:option store,天生就水合好了
-
-option store 的 state 长什么样,你在 `state()` 里已经声明死了。装配时它直接从根对象里把自己的那一格取出来用:`toRefs(root['cart'])`。根里是什么,它的 state 就是什么——入站值天然已经在里面了,不需要逐个字段去灌。
-
-换句话说,option store 的 state 因为「形状已知」,水合这一步几乎是免费的。
-
-但免费归免费,有一种情况它搞不定:你在 state 里用了 customRef、computed,或者 `useLocalStorage` 这种「服务端的值和客户端的值本来就不一样」的东西。这时候入站的平值没法自动对齐。于是 pinia 给 option store 留了一个逃生口——一个可选的 `hydrate` 钩子:
-
-```ts
-defineStore('cart', {
-  state: () => ({ token: useLocalStorage('token', '') }),
-  hydrate($state, initialState) {
-    // 手动把入站值塞进这个特殊响应式容器
-    $state.token.value = initialState.token
-  },
-})
-```
-
-装配到末尾,如果有入站状态、是 option store、又定义了这个钩子,就调一下,把对齐的活交给你。
-
-## 岔路二:setup store,逐 key 把入站值灌回去(本章核心)
-
-setup store 麻烦一些。它的 state 不是声明出来的,是你在 setup 函数里命令式地一个个 `ref()` 创建的:
+拿一个具体输入走一遍。服务端定义一个购物车 store：
 
 ```ts
 const useCart = defineStore('cart', () => {
-  const count = ref(0)
-  const items = ref([])
+  const count = box(0)
+  const items = box([] as string[])
   return { count, items }
 })
 ```
 
-根对象事先不知道这个 store 有哪些 key、每个 key 是什么类型。所以装配时,它得遍历 setup 返回的每一个属性,逐个判断、逐个灌。
+某个请求里 `count` 被改成 3。服务端渲染结束后，根对象变成：
 
-对每个属性,先看它是不是 state(是 ref 但不是 computed,或者是 reactive 对象)。是的话,进入水合——
-
-- **是 ref**:直接 `prop.value = inbound[key]`,整体覆盖。简单值,照搬。
-- **是 Set 或 Map**:先 `prop.clear()` 把你在 setup 里声明的默认值清空,再用深合并工具把入站值灌进去。(那个深合并工具 `mergeReactiveObjects` 第 5 章已经展开过它怎么处理 Map/Set,这里直接复用,不重讲。)
-- **是别的 reactive 对象**:递归地把入站值赋进去。
-
-最后还有一步很关键:把这个容器 `root['cart'][key] = prop` 注册回根对象。这样根和 store 始终是同一份引用,双向同步,后面谁改谁都看得见。
-
-经过这一遍遍历,无论你在 setup 里怎么命令式地造 state,最后都老老实实按 key 落回到那一个根对象里——和服务端那份长得一模一样。
-
-## 那些有状态、却不是真状态的对象
-
-setup store 有时候会返回一个怪东西:它确实有内部状态,但你压根不想把它序列化发给浏览器。最典型的就是路由实例 `router`——它有 currentRoute 之类的内部数据,可它是框架对象,不是你的业务状态。
-
-如果你什么都不做,装配会把它当成一个 reactive 对象,老老实实往里灌入站值、注册回根、然后跟着 root 一起被序列化发出去——把一个根本不该过网的对象发给了客户端。
-
-所以 pinia 提供了一对标记 API:`skipHydrate(obj)` 给对象打一个不可见的隐藏标记,`shouldHydrate(obj)` 反过来检查这个标记。装配时遇到每个 state 属性,先问一句 `shouldHydrate(prop)`——被打过标记的,直接跳过,不灌、不注册、不序列化。
-
-用法就是你主动给这类对象套一下:
-
-```ts
-const useApp = defineStore('app', () => {
-  const router = skipHydrate(useRouter())
-  const count = ref(0)
-  return { router, count }
-})
+```
+root = { cart: { count: 3, items: [] } }
 ```
 
-一个细节:`shouldHydrate` 对 `null` 和非对象一律返回「该水合」,只有「被打过标记的对象」才返回「不水合」。也就是说这个跳过标记只对对象生效——简单值该灌还是灌,不受影响。
+`serialize(root)` 把它转成 JSON 载荷塞进 HTML。浏览器拿到 HTML 后，先 `hydrateRoot(payload)` 把同一个根对象重建出来。
 
-## 关键权衡
+接着页面里某处首次调用 `useCart()`，触发装配：
 
-这一章机制不算少,有四条权衡值得记住。
+1. `incoming = root['cart']`，读到 `{ count: 3, items: [] }`，非空，处于水合场景。
+2. 跑 setup 函数，拿到 `{ count: box(0), items: box([]) }`——注意这里 count 的默认值是 0。
+3. 遍历 store：
+   - `count` 是 box，`shouldHydrate(0)` 返回 true，把 `box.value` 从 0 改成 3。
+   - `items` 是 box，`shouldHydrate([])` 返回 true，集合先 clear（空数组无操作），赋值 `[]`。
+4. 反向注册：`root['cart']['count'] = 3`、`root['cart']['items'] = []`。
+5. store 返回时，`count` 读出来就是 3，与服务端渲染的 HTML 完全一致，无水合不匹配。
 
-**一、用单一根对象当序列化契约,而不是给每个 store 单独设计一套协议。**
+如果 setup 里多返回了一个路由实例（被 `skipHydrate` 标记过），第 3 步遍历到它时 `shouldHydrate` 返回 false，跳过灌值、也不注册回根——它就不会出现在序列化载荷里。
 
-选择:所有 store 的 state 都收进那一个 `pinia.state.value`,服务端序列化它、客户端回填它,就完事。
+## 7. 教学简化说明
 
-换来:框架无关、零额外序列化代码。任何能读 JSON 的运行时(Nuxt、原生 Vue SSR、甚至你自己撸的)都能搬这套状态——它看到的始终就是同一个扁平对象。
+本章演示故意省略了：真正的 ref/reactive 实现、effectScope 托管、reactive 整体包装、option store 的自定义水合钩子分支、$patch 暂停监听批处理、devtools 时间线、真正的 HTML 载荷传输（这部分由 Vue SSR 或 Nuxt 完成）。这里只演透「一个根对象即契约 + 按 key 拆还」的核心思想。
 
-代价:setup store 因为 state 是命令式一个个创建的,必须**逐 key** 把入站值灌回各个容器,多了一段「按 key 水合」的胶水代码。option store 没这个代价(形状已知),代价全压在 setup store 这一边。
+## 8. 小结
 
-**二、集合水合时先清空默认值再灌入站值,而不是把两者深合并。**
-
-选择:遇到 Set/Map,先 `clear()` 把 setup 里声明的默认内容清掉,再灌入站值。
-
-换来:和 `$patch` 完全一致的合并语义,而且绝不会把 store 里声明的默认集合内容错误地和服务端的值搅在一起。想象你的 tags 默认带一个 `'默认标签'`,服务端那边这个集合是空的——如果不 clear,合并完客户端会莫名其妙多出一个默认标签,和服务端对不上。
-
-代价:你在 setup 里给集合设的那些默认值,在客户端水合时会被直接丢弃。客户端的集合内容完全以服务端为准。
-
-**三、提供一对「应否水合」的标记 API,让 setup store 能声明「这个有状态对象不是真状态」。**
-
-选择:用 `skipHydrate` 打标记、`shouldHydrate` 查标记,让路由实例这类对象能被显式排除在水合之外。
-
-换来:你可以把第三方有状态对象安全地放进 setup store,而不会被序列化发往客户端——否则就是把不该过网的东西塞进了发给浏览器的 JSON。
-
-代价:使用者得**主动**给这类非状态对象打标记。漏打了,它就会被当成普通 state 灌值、注册、序列化——错误是静默的,不会报错,你只会在客户端 payload 里发现一个本不该出现的巨大对象。
-
-**四、option store 给一个可选的自定义水合钩子当逃生口。**
-
-选择:option store 可以定义 `hydrate($state, initialState)`,在水合末尾被调用。
-
-换来:customRef、computed、`useLocalStorage` 这类「服务端值 ≠ 客户端值」的特殊响应式,能被你手动对齐——入站的平值塞不进这些特殊容器,钩子给你一个动手的地方。
-
-代价:这个钩子仅 option store 可用。setup store 因为默认就是逐 key 灌值,已经覆盖了大部分情况;但如果你在 setup store 里也用了 customRef 这类东西,没有钩子可用,得自己在 setup 函数里处理对齐。
-
-## 最小演示:一个根就是契约,按 key 拆还
-
-下面这段几十行的脚本把核心演透:一个根对象 `{ id: state }` 就是全部契约;给定入站状态和一个命令式造 state 的 setup 函数,装配时按 key 灌值;被 `skipHydrate` 标记的对象不参与灌值。用极简的 `{ value }` 模拟响应式容器,不接 vue,能直接 `node ssr-hydration.mjs` 跑。
-
-```ts
-// ssr-hydration.mjs —— node ssr-hydration.mjs 即可运行
-
-// 极简模拟一个响应式容器(真实实现是 vue 的 ref)
-const ref = (v) => ({ value: v })
-const isRefLike = (o) => o && typeof o === 'object' && 'value' in o
-
-// 「跳过水合」标记:给对象打一个不可枚举的隐藏属性
-const SKIP = Symbol('skip')
-const skipHydrate = (obj) => (Object.defineProperty(obj, SKIP, {}), obj)
-const shouldHydrate = (obj) =>
-  !obj || typeof obj !== 'object' || !Object.hasOwn(obj, SKIP)
-
-// 整个 SSR 的状态契约:就这一个根对象,{ storeId: state } 的扁平表
-const rootState = {}
-
-// ===== 服务端:跑完所有 store,序列化这一个根对象 =====
-function serverSide() {
-  rootState.cart = { count: 3, items: [], tags: ['vip'] }
-  return JSON.stringify(rootState) // 这就是发给浏览器的全部货物
-}
-
-// ===== 客户端:回填根对象,再在首次装配时按 key 水合 =====
-function clientSide(payload) {
-  // 第 1 步:JSON 整个回填进同一个根对象
-  Object.assign(rootState, JSON.parse(payload))
-
-  // 第 2 步:首次用到购物车 store,读出它在根里已有的入站状态(拍个快照)
-  const inbound = { ...rootState.cart }
-
-  // 第 3 步:客户端也跑一遍 setup,命令式创建「带默认值」的全新容器
-  const setupStore = {
-    count: ref(0),                       // 默认 0
-    items: ref(['本地默认项']),           // 默认值会怎样?见权衡二
-    tags: new Set(['默认标签']),          // 命令式声明的集合,默认带一个标签
-    router: skipHydrate({ path: '/' }),  // 路由实例:有状态但不是真状态
-  }
-
-  // 第 4 步:按 key 把入站值灌进每个容器 —— setup store 水合的核心
-  for (const key in setupStore) {
-    const prop = setupStore[key]
-    if (!shouldHydrate(prop)) continue   // 被 skipHydrate 标记的,直接跳过
-
-    if (isRefLike(prop)) {
-      prop.value = inbound[key]          // 简单值:整体覆盖默认值
-    } else if (prop instanceof Set || prop instanceof Map) {
-      prop.clear()                       // 集合:先清空声明时的默认值
-      inbound[key].forEach((v) => prop.add(v))  // 再逐个灌入站值
-    }
-    // 最后把这个容器注册回根状态,保持根与 store 双向同步
-    rootState.cart[key] = prop
-  }
-  return setupStore
-}
-
-console.log('=== 服务端 ===')
-const json = serverSide()
-console.log('发往客户端的 JSON:', json)
-
-console.log('=== 客户端水合后 ===')
-const store = clientSide(json)
-console.log('count  =', store.count.value)   // 3       ← 与服务端一致,无水合不匹配
-console.log('items  =', store.items.value)   // []      ← 默认值 ['本地默认项'] 被丢弃
-console.log('tags   =', [...store.tags])     // ['vip'] ← 默认标签被清掉,只剩入站值
-console.log('router =', store.router.path)   // '/'     ← 未被入站值覆盖,保持客户端原样
-```
-
-跑出来的轨迹正好对应前面几条原理:`count` 被入站的 3 整体覆盖,和服务端一致;`items` 的默认值 `['本地默认项']` 被丢弃,变成入站的空数组;`tags` 这个集合先 clear 掉 `'默认标签'`,再灌入 `'vip'`;`router` 因为打了标记,从头到尾没被碰,保持客户端自己的 `{ path: '/' }`。
-
-## 小结
-
-一句话收束:pinia 的 SSR 不发明任何新的传输协议,它只做一件事——保证所有 store 的状态始终汇聚在那一个可序列化的根对象里。服务端拍照、客户端贴回去,然后装配时按 key 把入站值灌进各自的容器(option store 因形状已知而天然水合,setup store 逐 key 灌值,集合先清后灌,非状态对象用 skipHydrate 跳过)。状态就这么原样穿过了网络。
-
-但 pinia 自己只负责把根对象暴露出来、把入站值按 key 灌好——真正把那段 JSON 塞进 HTML、客户端再自动回填的那套脚手架,是框架的事。紧邻的下一章「Nuxt 模块」就会讲 Nuxt 是怎么用运行时插件把这套拍照—回填自动化、再用构建期变换把接入样板抹平的。
+SSR 的全部契约就是那一个根状态对象：序列化它、回填它，跨网络的状态搬移就完成了。setup store 因为 state 命令式创建，多了一段「逐 key 灌值」的胶水，并用 skipHydrate 标记路由实例这类非状态对象跳过水合；option store 因为 state 形状已知，天然从根取值，只给特殊响应式留了个可选钩子。这套契约的下一站是框架级集成——下一章会看 Nuxt 模块怎么把这套序列化与回填自动化：在 app:rendered 钩子里序列化 state 到 payload、在客户端从 payload 回填 state。

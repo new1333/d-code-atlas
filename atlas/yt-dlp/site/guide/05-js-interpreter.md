@@ -1,320 +1,288 @@
 # 进程内手写 JS 解释器：本地执行对抗性脚本
 
-## 场景：拿到的「下载地址」其实是一段加密脚本
+> 本章属于 composite 层。前置：info_dict 数据总线与提取器骨架。
+> 学完你能用一句话讲清：当站点下发的不是 URL 而是一段会变的对抗性 JS 时，为什么 yt-dlp 选择在进程内手写一个「刚好够用」的 JS 求值器，而不是拉一个外部引擎进来。
 
-想象你写了个下载器，去抓某个视频站的播放地址。结果抓回来的根本不是一个能直接 `GET` 的 URL，而是一段混淆过的 JavaScript。这段脚本是站点故意下发的对抗性代码——它存在的目的，就是当场算签名、解密 key、把 `n` 参数搅乱。你必须**先把这段 JS 跑出结果**，才能拼出真正能下载的地址。
+## 1. 为什么需要它
 
-麻烦来了：用户机器上可能既没装浏览器，也没装 Node。那这段 JS，到底谁来跑？
+上一章把「一个胖字典在各阶段间流动 + 一个厚基类吸收样板」这两件事办成了，提取器抓数据变成几十行的纯变换。但它留下一个口子——你抓有些站点（最典型的就是 YouTube）的时候，网页里塞给你的根本不是直链 URL，而是一段混淆过的 JavaScript。这段 JS 通常在做这几件事：
 
-答案是：**下载器自己在进程里手搓一个「刚好够用」的 JS 求值器，把对手下发的脚本当数据本地跑掉。** 不拉 V8，不依赖任何外部引擎。换来的好处很实在——零外部依赖、跨平台可移植，而且跑出来的结果完全可控、可预测（不会被某个引擎的版本差异带偏，签名永远算得对）。
+- 给视频 URL 算一个签名（`&sig=...`），没这个签名 CDN 直接拒；
+- 解「n 参数」——一个被故意搅乱的查询参数，不解出来就触发节流或返回 403；
+- 解密已被站点加密的某些 key。
 
-> 承前一句话：上一章讲了 `info_dict` 这条数据总线——提取器抓回来的各种字段都汇进它。但总线里有些字段（签名、解密后的真 URL）不是抓出来的，而是**必须先执行站点那段 JS 才能算出来**；这个求值器的输出，就是总线某些字段的供给方。总线本身这里不展开了，本章只盯住「求值器」这一个东西。
+更要命的是这段 JS 是站点下发的、会不定期变样、写法对正常浏览器以外的环境毫不友好——里面可能故意用到一些「在 V8 里能跑、在别的引擎里跑不通」的边界行为。
 
-## 最底层的一块：JS 的算术规则，不是你以为的那样
+现在问题落在你头上：用户机器上很可能没装 Node、也没装浏览器，下载器进程里怎么把这段 JS 跑掉？
 
-很多人第一反应是：「跑 JS 不就是把它的 `+` `-` `/` 直接换成我这门语言的运算符吗？」——这一步就踩坑了。
+最现成的两条路是：拉一个完整的 JS 引擎（V8、QuickJS、SpiderMonkey）进来当依赖；或者 `subprocess.run(['node', ...])` 调外部运行时。两条都不可行——前者爆炸式增加安装体积，引擎升级还可能把锁定的行为悄悄改掉；后者要求用户预装 Node 或浏览器，违反「单个二进制跑起来」的承诺。
 
-JS 有一堆和绝大多数宿主语言**不一样**的数值边界：位运算强制走 32 位有符号整数（超出 32 位就回绕）；除以 0 不报错而是得到 `Infinity`；`0/0` 得 `NaN`；`0 ** 0` 居然等于 `1`；还有一套自己的「假值」集合。更麻烦的是，JS 的 `undefined` 和 `null` 是两个东西，不能混。
+yt-dlp 选择了第三条路：**在进程内手写一个「刚好够用」的 JS 求值器，把对手下发的脚本当数据本地跑掉**。零外部依赖、跨平台可移植、运行结果完全可控。这套机制的输出最终汇入上一章那条 info_dict 数据总线——它就是某些字段（签名后的 URL、解密后的 key）的供给方。
 
-所以求值器的最底层，是一组**逐个运算符手写的语义包装**：
+## 2. 核心思想
 
-- **32 位回绕**：`2147483648` 做位运算前先截到低 32 位、再把最高位当符号位，变成 `-2147483648`。
-- **除零与幂**：除数为 0 直接返回 `Infinity`；只要操作数里出现 `undefined` 就返回 `NaN`；幂运算明确规定 `0 ** 0 === 1`。
-- **假值集合**：`false` / `null` / `0` / `''` / `undefined` / `NaN` 这六个判为假，其余全真——`if`、`while`、三元运算全靠它驱动。
+不要把 JS 当一门完整的语言去实现，而是把「站点实际用到的那个子集」当一段结构化文本去切片、递归求值。一个文件，一套递归下降，足够。
 
-说人话就是：你在自家厨房里按对手的菜谱一比一复刻，连「火候」（数值边界）都得照着对方的来，差一点算出来的签名就对不上，对面就拒绝你。每个运算符都得套一层这样的包装，不能偷懒用宿主原生的。
+对手下发的 JS 在这里不是「程序」，是「数据」。我们写一个最小可吃下它的解释器就行，不必追求 ECMAScript 全集。
 
-## 控制流的红绿灯，全都做成「紧急信号」
+## 3. 心智模型
 
-接下来是 `break` / `continue` / `throw`。这三个东西的共同点是：它们都要**从当前嵌套深度里跳出去**——`break` 跳出最近的循环，`throw` 一路跳到最近的 `catch`。
+一段 JS 源码从这里到跑出结果，一共分七步：
 
-这里有个非常省事的设计：**把这三个控制流动作直接建模成宿主语言的异常**。`break` 就抛一个 `JS_Break` 异常，`throw` 就抛 `JS_Throw`。于是：
+1. **存文本**：构造解释器时只把源码字符串存起来，不立即解析——大多数函数这辈子都不会被调用，没必要提前消化。
+2. **点名要哪个函数**：外部说「帮我跑 `df` 这个函数，参数是 `[a, b]`」→ 解释器用正则去源码文本里捞出 `df` 的形参表和函数体文本。
+3. **现编现用**：把函数体文本编译成一个宿主语言闭包（绑定形参名、套一层作用域栈）。
+4. **进函数**：调用闭包 → 实参按形参名塞进作用域栈顶 → 进入「逐语句解释」循环。
+5. **切语句**：手写切片器按分号把函数体切成一条条语句，对每条做**前缀模式分发**——开头是 `return` 走返回路径、是 `var`/`let` 走声明、是 `{` 当块、是 `if`/`for`/`while` 走控制流、剩下当表达式。
+6. **算表达式**：表达式里的二元运算按优先级切片，每个符号查一张运算符表，交给对应的语义包装函数求值；若操作数里又出现 `fname(...)`，递归回到第 2 步。
+7. **处理跳转**：遇到 `break`/`continue`/`throw` 就抛对应异常，由外层循环或 try 捕获；遇到 `return` 就带一个「应返回」标记逐层向上传播，到闭包边界把它变成返回值。
 
-- 循环体只要写 `try { 执行循环体 } catch (JS_Break) { 跳出 }`；
-- JS 的 `try/catch`，几乎就是白送的——直接复用宿主的 `try/except`；
-- 非局部跳转几乎零成本实现，不用自己维护一套跳转表。
+撑起这套流程的三个核心数据结构：
 
-打个比方：把红绿灯（`break`）和急刹车（`throw`）都设计成同一种「紧急信号」，循环和 `try` 只要会接信号就行，不用各自发明一套机制。代价后面权衡里讲——正常退出和报错走的是同一条通道，调试时栈轨迹会有点误导。
+- **作用域栈**：多层字典叠加。写变量时向上查找已存在的同名变量就地改写（模拟 JS 对外层变量的赋值），找不到才写当前层。
+- **运算符表**：每个符号映射到一个语义包装函数；`?`、`??`、`||`、`&&` 走短路/条件特殊路径，不直接套函数。
+- **三个控制流异常类**：`JS_Break`/`JS_Continue`/`JS_Throw`——break/continue/throw 在这里都是「跨函数边界的非局部跳转」。
 
-## 解析的心脏：一个手写的文本切片器
+## 4. 关键权衡
 
-JS 源码进来时是一坨纯文本。求值的第一步，是把它**按分隔符切成片**：按 `;` 切语句、按 `,` 切参数、按运算符切表达式。
+### 文本切片 + 边解析边求值，而不是经典的「词法→语法树→字节码」三段式
 
-但「切」远没有听起来简单。因为分隔符可能在括号里、在字符串里、在正则里，那些都不能切。于是有了一个状态机式的切片器，边扫描边同时盯住四件事：
+经典脚本引擎的做法是先词法分析吐 token 流、再构 AST、最后 tree-walk 求值或编译成字节码跑 VM。这套流水线干净、可扩展，但代价是至少三套数据结构和几千行骨架才能动起来。
 
-- **括号配对计数**：`(`/`{`/`[` 进栈，遇到对应的闭括号出栈，计数没归零时遇到的分隔符一律不切；
-- **当前引号**：在字符串内部时，分隔符不算数；
-- **转义**：刚遇到反斜杠时，下一个字符原样保留；
-- **正则字符组**：在 `/.../ ` 里、又在 `[...]` 里时，规则又不同。
+yt-dlp 这里的选择是不分阶段：直接拿源码文本，用一个手写状态机切片器按操作符/逗号/分号切，切完一片就直接求值一片——解析和求值揉在同一个递归函数里。
 
-其中最棘手的是**斜杠 `/` 的二义性**：它既是除号，又是正则字面量的开头。切片器的判据是「前一个字符是不是运算符」——运算符之后的 `/` 当成正则开头，否则当除号。这一层状态机是整个解析器最脆弱的部分，站点一旦用了罕见的正则写法就可能切错。
+- **换来**：整个解释器塞进一个文件、不到一千行就能覆盖 YouTube 这类站点实际用到的 JS 子集；新增一种语句只要在前缀分发里挂一个分支。
+- **代价**：解析与求值耦合在一个巨大的分发函数里（`interpret_statement` 单函数数百行），每遇到一种新语法就得在巨函数里加一个前缀分支；切片器里那段「消歧 `/` 是除号还是正则字面量」的状态机是整个解析器最脆弱的部分，站点 JS 一旦用到罕见的正则写法就可能切错。
+- **化解的本质矛盾**：「实现成本要低」与「JS 是个有歧义的语法、消歧需要状态」之间的矛盾——把状态塞进切片器、把骨架压成一个函数，是工程上的最短路径。
 
-## 一条语句怎么求值：前缀分发 + 一个「应返回」标记
+### 把 break/continue/throw 建模为宿主语言的异常
 
-切好之后，每条语句交给一个**按开头特征做前缀匹配**的巨型分发函数。它看语句第一个字符或第一个关键字决定走哪条路：
+JS 里 `break`/`continue`/`throw` 都是非局部跳转——`break` 跨多层嵌套跳出循环、`throw` 一路飞到最近的 `catch`。tree-walking 解释器要自己实现这套跳转很啰嗦：得在每个循环节点和 try 节点维护「正在跳转中」的状态位。
 
-```
-以引号开头  → 字符串/正则字面量
-以 new 开头 → 构造对象
-以 { 开头   → 对象字面量 或 语句块
-以 ( 开头   → 括号表达式
-try/if/for/switch → 对应控制流
-= 赋值 / ++ -- → 赋值与自增自减
-裸变量/数字   → 直接取值
-name.method() → 成员与方法调用
-name(args)    → 函数调用
-```
+这里选了最短的路：直接用宿主语言的异常来当跳转载体。
 
-这个分发函数有个贯穿始终的返回签名：`(值, 应返回)`。第二个布尔位是关键——一旦求值碰到 `return`，就把「应返回」置真，让这个信号**逐层往上传播**，直到函数边界把它变成真正的返回值。`break`/`continue`/`throw` 则不走这条路，它们直接抛异常（见上一节）。
+- **换来**：非局部跳转几乎零成本——循环体 `try { ... } except JS_Break: break` 就完事；`try/catch/finally` 天然就是宿主的 try/except，连 `finally` 都白送。
+- **代价**：「正常控制流」和「错误传播」共用同一条异常通道，调试时栈轨迹会被这些「不是真错」的异常混进来；外部 try 想区分「站点真抛了错」和「解释器自己崩了」也得小心排除控制流异常。
+- **化解的本质矛盾**：「tree-walking 解释器要逐层向上传信号」与「不想为每种信号单独维护状态机」之间的矛盾——把跳转当异常复用宿主栈，是工程上最便宜的解法。
 
-还有一个细节值得点一句：表达式语境里不允许出现 `return`。所以求值表达式时会套一层——如果内部居然传出了「应返回」，就报错「不能从表达式里 return」。
+### 每个运算符单独写语义包装，强制复刻 JS 的数值与类型规则
 
-## 函数：惰性捞取、编译成闭包、缓存复用
+JS 的运算符语义和宿主语言（这里是 Python）并不一致：JS 的位运算走 32 位有符号整数（高位置 1 要减 `0x100000000` 转负）；`x / 0` 得 `Infinity`，`0 / 0` 得 `NaN`；`0 ** 0 === 1`；JS 的 falsy 集合是 `(false, null, 0, '', undefined, NaN)`，比宿主语言的 falsy 多几样；JS 的 `undefined` 和 `null` 是两个东西，不能糊在一起。
 
-函数是最有意思的一层。注意一个前提：这段 JS 是**当数据**喂进来的，构造解释器时只存下整段文本，**并不立即解析**。
+如果直接用宿主的运算符，跑出来的结果会和浏览器里不一样——签名算错一点 CDN 就拒绝，整个站点当场挂掉。
 
-直到外部点名要调用某个函数（比如 `sign`），才发生这些事：
+这里选了最笨但最稳的办法：每个运算符单独写一个语义包装函数，强制走 JS 的规则。
 
-1. 用正则在那坨源码文本里**捞出** `sign` 的形参表和函数体文本（支持 `function sign`、`sign: function`、`var sign = function` 几种写法）；
-2. 把函数体**编译成一个宿主语言闭包**——闭包里绑好了形参名，套上了一层作用域栈；
-3. 把这个闭包**缓存**起来，下次再调 `sign` 就不用重新捞了。
+```python
+def int_to_int32(n):
+    n &= 0xFFFFFFFF
+    if n & 0x80000000:
+        return n - 0x100000000
+    return n
 
-编译出的闭包大致长这样：调用时把实参按形参名塞进作用域栈顶，进入逐语句解释循环；如果循环带回了「应返回」标记，就把那个值作为返回值交还调用方。
+def _js_div(a, b):
+    if JS_Undefined in (a, b) or not (a or b):
+        return float('nan')
+    return (a or 0) / b if b else float('inf')
 
-这里还藏着一个**保命机制：显式的递归深度计数器**。因为这种「边走边求值」（tree-walking）的解释器，每一层 JS 函数调用都会吃掉一层宿主语言的调用栈。JS 又允许递归，万一站点脚本写了个死循环递归，宿主栈就炸了。所以每次进入求值都让计数器减一（默认从 100 起），减到负数就主动抛「Recursion limit reached」。等于给你的递归套了根安全绳——往下钻到第 100 层就主动喊停，免得把自家的地基压塌。
-
-## 走一遍完整轨迹：`f(41)` 怎么变成 `42`
-
-把上面几块串起来，看一次最简单的调用 `f(41)`，源码是 `function f(a){return a+1}`：
-
-```
-源码文本 "function f(a){return a+1}"
-  → ① 正则提出: 形参 [a], 函数体 "return a+1"
-  → ② 编译成闭包(绑定形参 a, 套作用域栈)
-  → ③ 调用 f(41): 作用域栈顶写入 {a: 41}
-  → ④ 语句 "return a+1" 命中 return 前缀
-         表达式 "a+1" 按二元运算切: 左 = a, 右 = 1
-         查作用域 a = 41 → 求 41 + 1 = 42
-  → ⑤ "应返回" 标记逐层上传 → 闭包把 42 作为返回值交还调用方
+def _js_exp(a, b):
+    if not b:
+        return 1  # even 0 ** 0 !!
+    elif JS_Undefined in (a, b):
+        return float('nan')
+    return (a or 0) ** b
 ```
 
-整条链路里，**正则捞函数体**、**前缀分发命中 return**、**二元运算切片求值**、**应返回标记上传**，四件事各司其职。如果在表达式里又撞见一次函数调用，就从第 ② 步递归重来——这就是它能跑任意嵌套调用的原因。
+- **换来**：对 JS 边界行为的精确模拟——32 位整数回绕、除零得无穷、`0**0===1`、特定 falsy 集合，全都一比一复刻；站点脚本跑到哪一步都对得上浏览器。
+- **代价**：每个运算符都要手写包装、维护一套独立的运算符表；JS 子集越宽（位运算、指数、可选链……）维护成本越高；每个新加的运算符都得配上对应的边界测试。
+- **化解的本质矛盾**：「要在没浏览器的环境里跑出和浏览器一致的结果」与「不想拉一个完整引擎进来」之间的矛盾——把 JS 的怪癖逐个手写复刻，是最笨但最可控的解。
 
-## 最小演示：用 TS 手搓一个「刚好够用」的求值器
+### JS 函数惰性提取、首次调用时编译成宿主闭包并缓存
 
-下面这段几十行的 TypeScript，把主线四件事演透：**文本切片 + 前缀分发递归求值、用异常做控制流、深度计数器防溢出、逐运算符语义包装**。它故意砍掉了完整运算符表、对象字面量、正则字面量内部状态机、原型方法分派等工程外壳，只留骨架。
+源码里可能定义了几十个函数，外部实际只点名叫一两个。提前把所有函数全编译成 AST 是浪费，对 tree-walking 解释器来说 AST 本身也没多大用。
 
-```typescript
-// mini-js.ts —— 一个「刚好够用」的最小 JS 求值器骨架
-// 演透四件事：① 文本切片 + 前缀分发递归求值  ② 用异常做控制流
-//            ③ 显式深度计数器防栈溢出        ④ 逐运算符语义包装
+这里的选择是惰性：构造解释器时只存文本；外部点名要某个函数时，才用正则在源码里捞出它的形参和函数体，当场编译成一个宿主闭包，缓存进函数表。下次再调它就直接拿缓存。
 
-// ===== 第 0 层：JS 的 undefined 必须和 null 分开 =====
-const UNDEF = Symbol('undefined')
+- **换来**：调用过的函数只编译一次；JS 函数天然成为一等公民，可以在作用域里像普通值一样传来传去；构造期零开销。
+- **代价**：函数提取靠正则匹配三种定义形态（`function x` / `x: function` / `var x = function`）的并集，遇到站点用更罕见的写法（箭头函数、生成器、`class` 方法简写）就得持续打补丁；命名冲突时正则可能捞错。
+- **化解的本质矛盾**：「不想在启动时一次性付出全量解析代价」与「JS 函数定义散落在源码各处」之间的矛盾——把发现成本推迟到首次调用、按需付出。
 
-// ===== 第 1 层：逐运算符复刻 JS 语义（在真实非 JS 宿主里这些是硬刚需）=====
-function jsDiv(a: any, b: any): any {
-  if (a === UNDEF || b === UNDEF || !(a || b)) return NaN
-  return b ? (a || 0) / b : Infinity          // 除零 → Infinity
-}
-function jsExp(a: any, b: any): any {
-  if (!b) return 1                             // 0 ** 0 === 1
-  if (a === UNDEF || b === UNDEF) return NaN
-  return (a || 0) ** b
-}
-function truthy(v: any): boolean {             // JS 的 falsy 集合一比一复刻
-  if (v === false || v === null || v === 0 || v === '' || v === UNDEF) return false
-  if (typeof v === 'number' && Number.isNaN(v)) return false
-  return true
-}
+## 5. 最小原理演示
 
-// ===== 第 2 层：控制流 = 异常 =====
+下面这段 TS 演透本章主线：**正则文本切片 + 前缀分发递归求值 + 用异常做控制流 + 用显式深度计数器防栈溢出**。它故意只覆盖一个极小的 JS 子集——`var` 声明、`return`、`while`、`break`、加减乘除与函数调用——刚好够演示四件事。
+
+```ts
+// 控制流即异常：break / continue / throw / return 都是宿主异常
 class JSBreak extends Error {}
-class JSContinue extends Error {}
-class JSThrow extends Error { constructor(public value: any) { super('js throw') } }
+class JSReturn extends Error { constructor(public value: unknown) { super('return'); } }
 
-// ===== 第 3 层：作用域链（写入时向上找同名变量就地改写）=====
-class Scope {
-  vars: Record<string, any> = {}
-  constructor(public parent: Scope | null = null) {}
-  get(name: string): any {
-    return name in this.vars ? this.vars[name] : this.parent ? this.parent.get(name) : UNDEF
+// 深度计数器：每层 JS 调用都吃宿主调用栈，主动截断防溢出
+const MAX_RECURSION = 100;
+
+type Scope = Map<string, unknown>;
+type JSFunction = { params: string[]; body: string };
+
+// 函数表：源码里发现的每个 JS 函数，编译成一个宿主闭包
+const functions = new Map<string, JSFunction>();
+
+// 正则文本切片：在源码文本里捞函数定义，按括号配对找函数体右括号
+function extractFunction(src: string, name: string): JSFunction {
+  const re = new RegExp(`function\\s+${name}\\s*\\(([^)]*)\\)\\s*\\{`);
+  const m = re.exec(src);
+  if (!m) throw new Error(`function ${name} not found`);
+  let depth = 0, i = m.index! + m[0].length, start = i;
+  while (i < src.length) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') { if (--depth < 0) break; }
+    i++;
   }
-  set(name: string, value: any) {
-    let s: Scope | null = this
-    while (s) { if (name in s.vars) { s.vars[name] = value; return }; s = s.parent }
-    this.vars[name] = value                    // 找不到才落在当前层
+  return {
+    params: m[1].split(',').map(s => s.trim()).filter(Boolean),
+    body: src.slice(start, i),
+  };
+}
+
+// JS 语义包装：除零得无穷、零除零得 NaN（不是宿主默认行为）
+function applyOp(op: string, a: number, b: number): unknown {
+  if (op === '/') {
+    if (b === 0) return a === 0 ? NaN : Infinity;
+    return a / b;
+  }
+  if (op === '+') return a + b;
+  if (op === '-') return a - b;
+  if (op === '*') return a * b;
+  throw new Error(`unknown op ${op}`);
+}
+
+// 表达式求值：字面量 / 变量 / 二元运算 / 函数调用（递归回 callFunction）
+function evalExpr(expr: string, scope: Scope, depth: number): unknown {
+  expr = expr.trim();
+  if (/^-?\d+(\.\d+)?$/.test(expr)) return Number(expr);
+  if ((expr.startsWith('"') && expr.endsWith('"')) ||
+      (expr.startsWith("'") && expr.endsWith("'"))) return expr.slice(1, -1);
+  const call = /^(\w+)\(([\s\S]*)\)$/.exec(expr);
+  if (call) {
+    const args = call[2] ? call[2].split(',').map(a => evalExpr(a, scope, depth)) : [];
+    return callFunction(call[1], args, depth);
+  }
+  for (const op of ['+', '-', '*', '/']) {
+    const idx = findTopLevelOp(expr, op);
+    if (idx > 0) {
+      const l = evalExpr(expr.slice(0, idx), scope, depth) as number;
+      const r = evalExpr(expr.slice(idx + 1), scope, depth) as number;
+      return applyOp(op, l, r);
+    }
+  }
+  return scope.get(expr);
+}
+
+function findTopLevelOp(expr: string, op: string): number {
+  let depth = 0;
+  for (let i = 0; i < expr.length; i++) {
+    if (expr[i] === '(') depth++;
+    else if (expr[i] === ')') depth--;
+    else if (depth === 0 && expr[i] === op) return i;
+  }
+  return -1;
+}
+
+// 语句解释：前缀分发——开头是啥就走哪条路径
+function interpretStatement(stmt: string, scope: Scope, depth: number): void {
+  stmt = stmt.trim().replace(/;$/, '');
+  if (!stmt) return;
+  if (depth < 0) throw new Error('Recursion limit reached');
+
+  // return 用异常上传；while 捕获 JSBreak；其它前缀各自走分支
+  if (stmt.startsWith('return ')) throw new JSReturn(evalExpr(stmt.slice(7), scope, depth));
+  if (stmt.startsWith('var ')) {
+    const [name, init] = stmt.slice(4).split('=').map(s => s.trim());
+    scope.set(name, init ? evalExpr(init, scope, depth) : undefined);
+    return;
+  }
+  if (stmt === 'break') throw new JSBreak();
+  const wm = /^while\s*\(([\s\S]+)\)\s*\{([\s\S]*)\}$/.exec(stmt);
+  if (wm) {
+    while (truthy(evalExpr(wm[1], scope, depth))) {
+      try { runBlock(wm[2], scope, depth - 1); }
+      catch (e) { if (e instanceof JSBreak) break; throw e; }
+    }
+    return;
+  }
+  evalExpr(stmt, scope, depth);  // 兜底：当表达式语句
+}
+
+function runBlock(body: string, scope: Scope, depth: number): void {
+  for (const stmt of body.split(';')) interpretStatement(stmt, scope, depth);
+}
+
+// JS 真值规则：复刻 falsy 集合 (false, null, 0, '', undefined, NaN)
+function truthy(v: unknown): boolean {
+  return !(v === false || v === null || v === 0 || v === '' ||
+           v === undefined || (typeof v === 'number' && isNaN(v)));
+}
+
+// 闭包：实参按形参名塞作用域栈顶、深度计数器递减、JSReturn 在边界转成返回值
+function callFunction(name: string, args: unknown[], depth: number): unknown {
+  if (depth < 0) throw new Error('Recursion limit reached');
+  let fn = functions.get(name);
+  if (!fn) { fn = extractFunction(sourceText, name); functions.set(name, fn); }
+  const local: Scope = new Map();
+  fn.params.forEach((p, i) => local.set(p, args[i]));
+  try {
+    runBlock(fn.body, local, depth - 1);
+    return undefined;
+  } catch (e) {
+    if (e instanceof JSReturn) return e.value;  // 闭包边界把异常翻成返回值
+    throw e;
   }
 }
 
-// ===== 第 4 层：手写切片器（按括号配对，在顶层切）=====
-function splitTop(s: string, delim: string): string[] {
-  const out: string[] = []; let depth = 0, start = 0
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i]
-    if ('([{'.includes(c)) depth++
-    else if (')]}'.includes(c)) depth--
-    else if (depth === 0 && s.startsWith(delim, i)) {
-      out.push(s.slice(start, i)); start = i + delim.length; i += delim.length - 1
-    }
-  }
-  out.push(s.slice(start)); return out
-}
-function popBalanced(s: string, open: string): [string, string] {
-  const close: Record<string, string> = { '(': ')', '{': '}', '[': ']' }
-  const i0 = s.indexOf(open); let depth = 0
-  for (let i = i0; i < s.length; i++) {
-    if (s[i] === open) depth++
-    else if (s[i] === close[open]) { if (--depth === 0) return [s.slice(i0 + 1, i), s.slice(i + 1)] }
-  }
-  throw new Error(`未配对的 ${open}`)
-}
-
-// ===== 第 5 层：前缀分发递归求值，返回 [值, 应返回] =====
-type R = [any, boolean]
-function run(expr: string, scope: Scope, depth: number): R {
-  if (depth < 0) throw new Error('Recursion limit reached')   // ← 深度计数器
-  expr = expr.trim()
-  if (!expr) return [undefined, false]
-
-  // 语句先按分号在顶层切开；前面分句先执行，最后一句做前缀分发
-  const subs = splitTop(expr, ';')
-  if (subs.length > 1) {
-    for (let i = 0; i < subs.length - 1; i++) { const r = run(subs[i], scope, depth - 1); if (r[1]) return r }
-    expr = subs[subs.length - 1].trim()
-  }
-
-  let m: RegExpMatchArray | null
-  m = expr.match(/^return\b\s*(.*)$/s);  if (m) return [run(m[1] || 'undefined', scope, depth - 1)[0], true]
-  m = expr.match(/^throw\s+(.*)$/s);       if (m) throw new JSThrow(run(m[1], scope, depth - 1)[0])
-  if (expr === 'break') throw new JSBreak()
-  if (expr === 'continue') throw new JSContinue()
-
-  m = expr.match(/^(?:var|let|const)\s+([a-zA-Z_$][\w$]*)\s*=\s*(.*)$/s)   // 声明落在当前层
-  if (m) { const v = run(m[2], scope, depth - 1)[0]; scope.vars[m[1]] = v; return [v, false] }
-
-  if (expr.startsWith('while')) {                       // 循环体用 try/catch 接住 break/continue
-    const rest = expr.slice(5).trim()
-    const [cond, a1] = popBalanced(rest, '(')
-    const [body, a2] = popBalanced(a1.trim(), '{')
-    let last: R = [undefined, false]
-    while (truthy(run(cond, scope, depth - 1)[0])) {
-      try { const r = run(body, scope, depth - 1); last = r; if (r[1]) return r }
-      catch (e) { if (e instanceof JSBreak) break; if (e instanceof JSContinue) continue; throw e }
-    }
-    return a2.trim() ? run(a2, scope, depth - 1) : last
-  }
-
-  if (expr.startsWith('if')) {
-    const rest = expr.slice(2).trim()
-    const [cond, a1] = popBalanced(rest, '(')
-    const [thenB, a2] = popBalanced(a1.trim(), '{')
-    const t = a2.trim()
-    const elseB = t.startsWith('else') ? popBalanced(t.slice(4).trim(), '{')[0] : ''
-    return truthy(run(cond, scope, depth - 1)[0])
-      ? run(thenB, scope, depth - 1)
-      : elseB ? run(elseB, scope, depth - 1) : [undefined, false]
-  }
-
-  m = expr.match(/^([a-zA-Z_$][\w$]*)\s*=(?!=)\s*(.*)$/s)                  // 赋值（=(?!=) 避开 ==）
-  if (m) { const v = run(m[2], scope, depth - 1)[0]; scope.set(m[1], v); return [v, false] }
-
-  const OPS: { s: string; f: (a: any, b: any) => any }[] = [               // 按优先级从低到高试切
-    { s: '<', f: (a, b) => (a || 0) < (b || 0) }, { s: '>', f: (a, b) => (a || 0) > (b || 0) },
-    { s: '+', f: (a, b) => (a === UNDEF || b === UNDEF) ? NaN : (typeof a === 'string' || typeof b === 'string' ? `${a}${b}` : (a || 0) + (b || 0)) },
-    { s: '-', f: (a, b) => (a || 0) - (b || 0) },
-    { s: '**', f: jsExp }, { s: '*', f: (a, b) => (a || 0) * (b || 0) }, { s: '/', f: jsDiv },
-  ]
-  for (const { s, f } of OPS) {
-    const p = splitTop(expr, s)
-    if (p.length > 1 && p[0].trim() !== '') {            // 空左操作数 = 一元符，跳过
-      const right = p.pop()!, left = p.join(s)
-      const lv = run(left, scope, depth - 1)[0], rv = run(right, scope, depth - 1)[0]
-      return [f(lv, rv), false]
-    }
-  }
-  if (/^-?\d+(\.\d+)?$/.test(expr)) return [Number(expr), false]
-  if (/^[a-zA-Z_$][\w$]*$/.test(expr)) return [scope.get(expr), false]
-  throw new Error(`不支持的 JS: ${expr}`)
-}
-
-// ===== 第 6 层：函数惰性捞取 + 编译成闭包 + 缓存 =====
-class MiniJS {
-  cache: Record<string, (...a: any[]) => any> = {}
-  constructor(public code: string) {}
-  call(name: string, args: any[]): any {
-    if (!(name in this.cache)) {
-      const hm = this.code.match(new RegExp(`function\\s+${name}\\s*(?=\\()`))
-      if (!hm) throw new Error(`找不到函数 ${name}`)
-      const rest = this.code.slice(hm.index! + hm[0].length)
-      const [argsStr, a1] = popBalanced(rest, '(')       // ① 正则捞出形参与函数体
-      const [body] = popBalanced(a1.trim(), '{')
-      const names = argsStr.split(',').map(s => s.trim()).filter(Boolean)
-      this.cache[name] = (...ca: any[]) => {             // ② 编译成闭包并缓存
-        const sc = new Scope()
-        names.forEach((n, i) => (sc.vars[n] = i < ca.length ? ca[i] : UNDEF))
-        const [ret, aborted] = run(body, sc, 99)         // ③ 深度从 99 起算
-        return aborted ? ret : undefined
-      }
-    }
-    return this.cache[name](...args)
-  }
-}
-
-// ===== 试运行 =====
-const js = new MiniJS(`
-  function sign(x) {
-    var doubled = x * 2;
-    return doubled + 1;
-  }
-  function loopSum(n) {
-    var sum = 0; var i = 0;
-    while (i < n) {
-      sum = sum + i; i = i + 1;
-      if (i > 3) { break; }      // ← break 被实现成异常，由 while 接住
-    }
-    return sum;
-  }
-`)
-console.log('sign(21)     =', js.call('sign', [21]))      // 21*2+1 = 43
-console.log('loopSum(100) =', js.call('loopSum', [100]))  // 累加到 i>3 触发 break → 6
-console.log('1 / 0        =', jsDiv(1, 0))                // Infinity
-console.log('0 ** 0       =', jsExp(0, 0))                // 1
-```
-
-配一个最小 `package.json` 就能跑：
-
-```json
-{
-  "name": "mini-js-eval",
-  "private": true,
-  "type": "module",
-  "scripts": { "start": "bun run mini-js.ts" }
+let sourceText = '';
+export function interpret(src: string, name: string, args: unknown[] = []): unknown {
+  sourceText = src;
+  functions.clear();
+  return callFunction(name, args, MAX_RECURSION);
 }
 ```
 
-直接 `bun run mini-js.ts`（或 `npx tsx mini-js.ts`）即可看到 `sign(21)=43`、`loopSum(100)=6`。`loopSum` 那个 `6` 最值得品：它正是「`break` 被实现成异常、由 `while` 的 `catch` 接住」的活证据——累加到 `i>3` 时 `break` 抛出，循环戛然而止，返回此时的 `sum`。
+跑三个用例验证主线：
 
-> 一个诚实的注脚：演示用 TS 当宿主，而 TS 本身就遵循 JS 语义（`1/0` 本就是 `Infinity`），所以 `jsDiv` 这些包装在这里看似「多此一举」。但它们的意义在「**锁定行为**」——把 JS 的边界规则写死在包装里，求值器的输出就不再依赖宿主碰巧怎么实现。在真实的（非 JS）宿主里，这些包装是硬刚需：比如 Python 的 `1/0` 会直接抛 `ZeroDivisionError`，没有它们签名就算不对。
+```ts
+// 算术 + return 信号逐层上传
+interpret(`function f(a){ return a+1; }`, 'f', [41]);
+// → 42
 
-## 关键权衡
+// JS 语义 ≠ 宿主默认：除零得 Infinity
+interpret(`function g(x){ return x/0; }`, 'g', [1]);
+// → Infinity
 
-本章机制密集，下面展开四条核心权衡。它们共同回答一个问题：**为什么不拉一个真 JS 引擎，而非要手搓？**
+// break 用异常跳出 while 死循环
+interpret(`function h(){ var i=0; while(true){ if(i==3){break;} i=i+1; } return i; }`, 'h');
+// → 3
+```
 
-**权衡一：选择「正则文本切片 + 边解析边求值的递归下降」，而不是经典的「词法 → 语法树 → 字节码」流水线。**
-换来的是——整套解释器能塞进**单个文件**，刚好覆盖站点实际用到的那个 JS 子集，不需要一整套编译器骨架（词法分析器、AST 节点类、字节码生成、虚拟机）。对于一个「只为算签名」的工具来说，这是极具诱惑的简洁。代价是——**解析与求值死死耦合在一个巨大的分发函数里**。每遇到一种新语法（新的字面量、新的语句形式），就得在那个巨函数里**再加一个前缀分支**；这个函数因此长到几百行，分支越叠越多，越来越难一眼读懂全貌。
+## 6. 执行轨迹
 
-**权衡二：选择「把 `break` / `continue` / `throw` 建模为宿主语言的异常」。**
-换来的是——非局部跳转**几乎零成本**实现。循环体写一句 `catch (JS_Break)` 就能接住 `break`；JS 的 `try/catch` 天然就是宿主的异常捕获，等于白送。代价是——「**正常控制流**」（`break`、循环跳出）和「**错误传播**」（真正的异常、`throw`）**共用同一条异常通道**。调试时，一个普通的 `break` 会在栈轨迹里留下「异常」痕迹，很容易把人带偏——源码注释里那句「这让未来调试非常痛苦」正是为此而发。
+输入 `function f(a){ return a+1; }`，外部调用 `f(41)`。
 
-**权衡三：选择「为每个运算符单独写语义包装、强制复刻 JS 的数值与类型规则」，而不是直接复用宿主运算符。**
-换来的是——对 JS 边界行为的**精确模拟**：32 位整数回绕、除零得 `Infinity`、零除零得 `NaN`、`0 ** 0 === 1`、特定的假值集合。这意味着无论这个求值器被移植到哪种宿主语言，算出来的签名都和浏览器里一致——**行为可锁定**。代价是——**每个运算符都要手写一层包装**；JS 子集越宽（站点用到的运算符越多），维护成本就线性上涨，任何一个边界复刻错了都是静默的签名错误。
+1. 构造解释器：源码字符串原样存进 `sourceText`，函数表为空。
+2. 外部调 `callFunction('f', [41], MAX_RECURSION=100)`：`functions.get('f')` 没命中，调 `extractFunction`。
+3. `extractFunction` 用正则匹配 `function f(`，从函数体起点 `{` 之后按括号配对扫到匹配的 `}`，得到 `params = ['a']`、`body = ' return a+1; '`。缓存进 `functions`。
+4. 进入闭包：`local = { a: 41 }`，深度计数器从 100 减到 99。调 `runBlock(body, local, 99)`。
+5. `runBlock` 按分号切，得 `[' return a+1', '']`。
+6. 对第一条 `return a+1`：前缀分发命中「return」→ 求 `a+1`。
+7. `evalExpr('a+1', local, 99)`：`+` 是运算符，左右切 `a` 与 `1`；`a` 是变量名 → 查 `local.get('a')` 得 `41`，`1` 是字面量；`applyOp('+', 41, 1)` 得 `42`。
+8. `return` 包装成 `JSReturn(42)` 抛出，逐层上传。
+9. 闭包的 `try/catch` 捕获 `JSReturn`，把 `e.value` 当返回值交还。整个 `interpret` 返回 `42`。
 
-**权衡四：选择「JS 函数惰性提取、首次调用时编译成宿主闭包并缓存」。**
-换来的是——调用过的函数**只编译一次**；而且 JS 函数天然成了**一等公民**，可以在作用域里像普通值一样传来传去、互相调用。代价是——函数定义的捞取**完全靠正则在源码文本里匹配**，只有 `function x` / `x: function` / `var x = function` 这几种「典型形态」能被认出。站点一旦换了非典型的定义写法，正则就捞不到，必须**持续打补丁**补上新形态——这把「与对手的猫鼠游戏」固化进了正则表里。
+整条链上能看见三件主线机制同时工作：正则文本切片负责发现函数、前缀分发负责解释语句、异常负责传 return 信号。深度计数器在每层 `callFunction` 减一；若是递归调用（比如阶乘 `fac(n)` 自调 `fac(n-1)`），减到负数即抛「Recursion limit reached」——这是 tree-walking 解释器在「JS 调用栈等于宿主调用栈」这一事实下的必要护栏。
 
-## 小结
+## 7. 教学简化说明
 
-这一章讲的东西，本质上是「**在没有 JS 引擎的环境里，凭空造一个能跑对手脚本的迷你引擎**」。它从最底层的运算符语义包装搭起，往上叠出「控制流即异常」「手写切片器」「前缀分发递归求值」，再到「函数惰性编译成闭包 + 深度计数器防溢出」。每一层都在回答同一个问题：**怎么用最少的代码，把那段不可信、会变的 JS 忠实地跑出和浏览器一样的结果**，同时把对外部引擎的依赖降到零。
+上面的演示故意省略了真实 `jsinterp.py` 里大量工程化外壳：对象字面量与成员访问、原型与方法分派、完整的运算符优先级表（这里只演示了 `+ - * /`）、`/` 消歧的状态机（这里把 `split(',')` 当一切字符串里都没引号逗号）、`switch` 的两轮匹配、正则字面量里字符组 `[]` 的转义处理、`new`/`void`/三元/`??`/`&&` 等短路运算、调试器轨迹打印、JS↔JSON 转换。它们是「让子集更宽、让站点更兼容」的工程加层，不是这一章想演的「为什么这么设计」。
 
-求值器算出的签名、解出的真 URL，最终都会写回 `info_dict` 的字段里——而这些字段怎么决定「**用哪个下载器、怎么下**」，就是下一章「**协议字段驱动的下载策略分派**」的主题。
+## 8. 小结
+
+下载器进程里手写一个 JS 解释器，不是为了做出一个能用的 JS 实现，而是为了把对手下发的脚本当数据本地吃掉——锁定行为、零依赖。整套设计就是工程最短路径的串联：文本切片 + 前缀分发省掉了三段式编译骨架，宿主异常当控制流省掉了跳转状态机，运算符逐个手写复刻换来对 JS 怪癖的精确对齐，函数惰性提取换启动零开销。
+
+下一个口子已经在等着：站点下发的 JS 把签名算出来、URL 拼好以后，info_dict 里的 `formats` 才有真链可下；但每条 format 还带着自己的 `protocol`（http/hls/rtmp/m3u8…），不同协议需要完全不同的下载策略。下一章「协议字段驱动的下载策略分派」就讲这个字段怎么驱动下载器选择。

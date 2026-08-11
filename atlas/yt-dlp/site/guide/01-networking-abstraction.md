@@ -1,206 +1,230 @@
 # 可插拔传输层：请求中立与处理器竞争
 
-想象你在写一个视频下载工具。它今天要下一个普通网页（HTTP），明天要去拉一个直播流（WebSocket），后天碰到一个被 Cloudflare 守着的站点，非得用一个带浏览器 TLS 指纹的 curl 引擎才进得去。
+> 本章属于 primitive 层。前置：无（全书地基章之一）。学完你能：用一句话讲清"为什么 yt-dlp 把发请求设计成引擎竞争，而不是写死一个 HTTP 客户端"。
 
-最直觉的写法是写一个 `download(url)` 函数，里面 `if url 以 ws 开头就用 websockets，否则用 urllib，再否则用 curl`。但这很快会变成一场麻烦——每加一个引擎，就要在所有发请求的地方插一个 if-else；某个引擎的依赖（比如 curl_cffi）用户没装，整个工具直接崩；想换一个更好用的引擎时，改动像藤蔓一样缠满整个代码库。
+## 1. 为什么需要它
 
-问题出在哪？你把「我要请求什么」和「我用什么去请求」这两件事焊死在一起了。这一章要讲的，就是怎么把这两件事彻底分开。
+yt-dlp 是一个抓视频的工具，而抓视频这件事从头到尾都在"发请求"——拉首页解析视频地址、下载数据分片、走 WebSocket 接直播流、必要时还得带上浏览器 TLS 指纹去过 Cloudflare。请求这件事是全书一切流程的底座，所以全书从这一章开始：底座搞清楚了，后面每一章（提取器、下载器、后处理器）才能假定"我只要发个请求就能拿到数据"。
 
-## 先造一张「只说要什么」的中立运单
+想象一下，如果"发请求"和"具体用什么引擎发"被焊死在一起——比如调用方写一行 `urllib.urlopen(url)`，那么一旦碰到 `wss://` 直播流、或者站点要求 curl 的 TLS 指纹，整个调用方都得改：加 `if scheme == 'wss'` 分支、加 `if needs_impersonate` 分支、引擎没装就直接崩溃。每加一个引擎就改一堆调用点，每少一个引擎就崩一片功能。
 
-要实现这种解耦，最先要做的事可能有点反直觉：让「请求」本身彻底不知道是谁在替它跑腿。
+调用方真正想说的是另一件事：我只想描述"要请求什么"——给一个 url、一组 headers、一个代理，至于这个请求最后用 urllib 还是 curl_cffi 发出去，是 ws 还是 http，调用方根本不关心。换句话说，**"发什么"和"用什么发"应该彻底分开**：分开之后，加引擎是纯增量（装了新引擎就自动能用）、删引擎是优雅降级（没装就换下一个能用的，而不是崩溃）。
 
-yt-dlp 的做法是定义一个请求对象，它只装这几样东西——一个 url、一些请求头、要不要走代理、用什么方法（GET/POST），外加一个叫 `extensions`（扩展）的小口袋。它不关心这个请求最后是被 urllib 发出去的，还是被 websockets 发出去的。
+## 2. 核心思想
 
-说人话就是：调用方只填一张标准运单，运单上写清楚「把什么东西、送到哪个地址、要不要走代理通道」，至于这张运单最后交给哪家快递公司，运单自己说了不算。
+让请求对象只懂"要什么"，让多个引擎各自亮出能力清单竞争，由一个调度器按偏好打分择优接管——把"发什么"和"用什么发"彻底解耦。
 
-这里有个细节值得停一下：为什么要单设一个 `extensions` 口袋，而不是把超时、cookie 容器、旧 SSL 这些可选能力都做成请求对象的独立字段？
+## 3. 心智模型
 
-因为新能力会一直冒出来。如果把每个能力都做成独立字段，那每加一个能力（比如后面会反复出现的「浏览器指纹伪装」），就得改请求对象的构造函数签名——所有创建请求的地方都要跟着改。而放进 `extensions` 口袋的好处是：请求对象的核心字段永远稳定，新能力只是往口袋里多塞一项，谁要用谁去口袋里掏。
+这条主线分四块：中立请求 / 引擎能力自报 / 调度器打分择优 / 异常分层降级。
 
-类比一下：扩展槽就像一封信的附言栏。信封正面（核心字段）的格式几百年不变——收件人、地址、邮编；但附言栏可以随便写，今天写「放门口」，明天写「周末送」，收件人（引擎）愿意处理就处理，不愿意就当没看见。这是这套设计的第一块底座。
+### 3.1 请求是与传输无关的中立数据对象
 
-## 让每家引擎把「承运范围」贴在门口
+调用方构造一个 Request 对象，它只有 url、headers、method、代理、扩展槽这几个核心字段，对"用哪个引擎发"一无所知。
 
-光有一张中立运单还不够。运单准备好了，得有一堆引擎来接活。但这些引擎能力参差——urllib 只懂 http/https/ftp，websockets 只懂 ws/wss，curl_cffi 能伪装浏览器指纹但得额外装库。
+> 类比一次：Request 像一张快递单——上面写"送什么、送到哪、要不要保价"，至于顺丰还是京东揽件，单子本身不挑。
 
-yt-dlp 给每个引擎定的规矩是：你必须把能力清单老老实实写出来。具体来说，每个引擎用三个集合声明自己的边界——支持哪些 url 协议、支持哪些代理协议、支持哪些特性开关。
+扩展槽（extensions）是个关键设计：超时、cookie 容器、是否要伪装、旧 SSL 兼容……这些"可选能力"都塞进这个 dict，而不是变成 Request 的独立字段。扩展槽是请求对象给未来留的活口，第 3 章会专门讲"伪装"是怎么挂进来的，本章只把它当通用机制看。
 
-这就像每家快递公司门口贴的承运范围告示：「本司承运：文件、小件包裹；不承运：活体、易燃品」。调度的人只要看一眼告示，就知道这单能不能交给你。
+### 3.2 引擎用类变量自报能力
 
-关键的一点来了：当一个引擎发现自己接不了某个请求时，它不报错，而是抛一个专门的「不支持」信号。这个区分非常重要，是后面整条降级链的命门：
+每个传输引擎（Handler 子类）用三个类变量声明自己的能力边界：
 
-- **不支持**（`UnsupportedRequest`）：意思是「这家快递不接这单」——正常现象，调度器记下来，换下一家问。
-- **无可用引擎**（`NoSupportingHandlers`）：意思是「问遍了所有快递，没一家能接」——这才是真正要报给用户看的错误，而且报错时会把每家快递各自拒绝的理由一起带上。
+- `_SUPPORTED_URL_SCHEMES`：能处理哪些协议（http/https/ftp / ws/wss）
+- `_SUPPORTED_PROXY_SCHEMES`：支持哪些代理协议（http/socks4/socks5）
+- `_SUPPORTED_FEATURES`：支持哪些特性开关（比如 all/no 代理特殊键）
 
-很多人第一次看会以为「引擎不支持某请求」是一种异常情况。其实不是——它是这套竞争机制的正常工作语言。
+这些是引擎的"招工简历"，调度器据此判断要不要把某个请求派给它。置 `None` 表示关闭该项检查。
 
-## 调度器：先按偏好排个序，再一家家问
+### 3.3 调度器打分 + 自检 + 第一个通过的接管
 
-现在运单有了，引擎也各自贴了告示。中间还差一个角色：调度器（`RequestDirector`）。它干三件事。
+每次 `director.send(request)` 的流程：
 
-第一件，按偏好排个序。调度器手里有一组「偏好函数」，每个函数拿到（引擎, 请求）就返回一个分数。调度器对每个引擎把所有偏好函数的分数加起来，按总分从高到低排。
+1. 对每个已装引擎，把所有已注册偏好函数的得分求和，作为该引擎的"偏好分"。
+2. 按分从高到低排序引擎。
+3. 从最高分开始，逐个让引擎做**能力自检**：url 协议、代理协议、特性、扩展槽，任一项不符就抛 `UnsupportedRequest` 并附原因。
+4. 第一个通过自检的引擎**立刻接管**，真正发出请求并返回响应；后面的引擎不再尝试。
+5. 全部失败 → 调度器抛 `NoSupportingHandlers`，消息里聚合每个引擎各自为什么拒绝。
 
-为什么要用「一组函数求和」，而不是给每个引擎一个固定的优先级数字？因为偏好是会叠加的，而且不同特性的偏好往往由完全不同的代码注册。比如「伪装请求要优先用 curl 引擎」是一个偏好，「兼容老用户要优先用 urllib」又是另一个偏好。它们各自独立注册、各自打分，最后加在一起——谁也不需要知道别人的存在。
+### 3.4 异常分层
 
-这就像每个偏好函数都是一个有权投票的人，投完票把票加起来，得分高的优先被问。没有任何一个人掌握「最终优先级」，最终顺序是大家投票的总和。
+- `UnsupportedRequest`：能力不匹配，不是错误，是降级信号。调度器收集后跳过。
+- `TransportError / HTTPError`：引擎运行期的网络/HTTP 错误，共同祖先是 `RequestError`，原样透传给调用方。
+- 其它非 `RequestError` 的异常：视为引擎自身 bug，记入 unexpected_errors 后继续尝试下一个引擎，不立即崩。
 
-第二件，从最高分的引擎开始，一家一家问「你这单接不接」。这一步就是前面说的能力自检：url 协议对不对、代理协议对不对、特性开关认不认、扩展口袋里的东西你领不领得走。任何一项不满足，这家就举手说「不接」，调度器记下理由，换下一家。
+## 4. 关键权衡
 
-第三件，第一家说「接」的，立刻把请求交给它真正发出去，后面排队的引擎就不再打扰了。只有当所有家都说了「不接」，调度器才抛出「无可用引擎」，并把刚才收集的每一家拒绝理由打包给用户。
+### 能力自检换可插拔与优雅降级
 
-整个过程画成流程图：
+调度器允许每个引擎在真正发请求之前先做一次"我能接这个请求吗"的自检（验协议、代理、扩展），不支持就主动让位。
 
-```
-中立请求
-  → 调度器按偏好打分排序
-  → 逐个引擎能力自检
-  → 不支持？记理由、跳下一个
-  → 通过？真发请求、返回响应
-  → 全失败？聚合每家拒绝理由、报「无可用引擎」
-```
+**换来**：换引擎、加引擎都是纯增量——curl_cffi 没装？自动落到 urllib。websocket 引擎没装？ws 请求会清楚告诉你"没引擎支持 ws 协议"，而不是在调用深处崩一个 ImportError。整条链路对"哪个引擎装了/没装"完全免疫。
 
-## 扩展口袋怎么决定一家引擎「领不领得走」
+**代价**：每个引擎必须诚实、完整地自报能力，否则就是双向灾难——少报（其实支持 ws 却只报了 http）会被永远跳过、能力闲置；多报（其实不支持 socks5 却报了）会硬接后运行时炸。这条权衡把"诚实"做成了引擎作者不可推卸的契约义务。
 
-前面能力自检里有一项是「扩展口袋里的东西你领不领得走」，这块单独拎出来讲，因为它是个很巧的设计，后面也会反复用到。
+**本质矛盾**：可扩展性 vs 能力诚实。要让插件式引擎能任意装/卸，引擎就必须把自己的能力边界主动写出来，调度器无法从外部推断一个引擎能干什么。
 
-回顾一下：可选能力（超时、cookie 容器、旧 SSL、保留头大小写……）都塞在请求的 `extensions` 口袋里。当某个引擎做自检时，它会从口袋里把自己支持的能力一个一个「领走」（pop 掉）。
+### 偏好函数求和换路由规则可独立叠加
 
-自检走完之后，调度器看口袋里还剩什么。口袋空了，说明这家引擎把请求里所有的可选能力都认领了，它完全接得住；口袋里还有剩的，说明有这家搞不定的能力，那就视为「不支持」，这家被跳过。
+引擎优先级不是写死的"urllib > requests > curl_cffi"清单，而是一组可被外部独立注册的偏好函数 `(handler, request) → int`，调度器把所有函数的得分**求和**作为引擎最终分。
 
-换句话说：一个请求能不能被某引擎接，不光看它的 url 协议对不对，还要看它口袋里的每一项能力，这家引擎是不是都点头认领了。
+**换来**：每条路由规则都可以独立注册、互不感知。第 3 章会看到：当请求要伪装时，伪装偏好函数给支持伪装的 curl_cffi 加 1000 分胜出；用户开启"prefer-legacy-http-handler"兼容选项时，另一条偏好函数给 Urllib 加 500 分。两条偏好彼此独立叠加，谁也不知道对方存在。
 
-这个设计的好处是什么？加新能力时，请求对象的签名一个字都不用改。新能力只要往 `extensions` 口袋里塞，再让支持的引擎在自检时把它领走、不支持的引擎自然剩下它、被跳过——能力就自动接上了。
+**代价**：最终排序是"多条偏好之和"，没有单一真相来源。某个引擎为什么排在第三？要把所有偏好函数的得分都加一遍才能解释，所以调度器在 verbose 模式下专门打印每个引擎的得分明细。
 
-## 从零演一遍
+**本质矛盾**：可组合性 vs 直觉可预测性。要允许任意规则叠加，就不能维持一个清晰的优先级表；要清晰的优先级，就不能让外部独立注入规则。yt-dlp 选择了前者。
 
-下面用一段从零写的 JavaScript，把这条主线完整演一遍。代码刻意写得很小，但每一块都对应文末的一个权衡点。把整段存成 `transport.js`，`node transport.js` 就能跑。
+### 可选能力塞进扩展槽换请求核心字段稳定
 
-```js
-// 「不支持」是一个普通信号，不是崩溃
-class UnsupportedRequest extends Error {}
+超时、cookie 容器、旧 SSL 兼容、伪装目标……这些可选能力**不是** Request 的独立字段，而是统一塞进 `extensions` 这个 dict。
 
-// ① 中立请求：只描述「要什么」，扩展口袋承载可选能力
+**换来**：Request 的核心字段（url/headers/method/proxies）锁死不再变。后续要加新能力（比如第 3 章的"伪装"），只要约定一个新扩展 key，引擎在自检时认领它就行，调用方不用改 Request 构造函数签名，老代码完全零侵入。
+
+**代价**：多一层"扩展认领"协商。引擎自检时必须把自己支持的扩展一个个 pop 掉，**凡是剩下的扩展都被视为"该引擎不支持"——请求被这个引擎跳过**。这一条让"扩展"和"能力探测"牢牢绑死：扩展没被认领 = 引擎能力不够 = 降级到下一个引擎。
+
+**本质矛盾**：开放扩展 vs 强类型契约。把可选能力放进 dict 才能无限扩展，但 dict 没有类型签名，只能靠"认领即支持"的运行时约定来支撑。
+
+### 聚合拒绝原因换诊断友好
+
+调度器不把"所有引擎都不行"当成一句简单报错丢出去。它把每个引擎各自因为什么拒绝、各自出了什么意外异常，分别收集到 unsupported_errors 和 unexpected_errors 两个列表，最后聚合进 `NoSupportingHandlers` 的错误消息。
+
+**换来**：用户看到的是"Urllib 不支持 ws 协议 | Websockets 不支持 cookie 扩展"——一眼就能看清是哪个引擎的哪个能力不够，知道接下来该装什么、改什么。比起一句"无可用引擎"，这是天差地别的可调试性。
+
+**代价**：每次请求至少要触发一次自检（哪怕最后只用第一个引擎），是固定开销。更微妙的是，引擎运行期抛出的非 `RequestError` 异常会被吞掉、收集后继续重试下一个——这能避免某个引擎的 bug 把整条链路打挂，但也意味着引擎自身的真实 bug 可能被掩盖在"跳到下一个引擎"的沉默里。
+
+**本质矛盾**：诊断信息 vs 性能 + bug 可见性。要给出完整拒绝原因，就要让每个引擎都跑一次自检；要把引擎 bug 和"能力不够"分开处理，就要在意外异常时吞掉重试，但这又可能掩盖 bug。
+
+## 5. 最小原理演示
+
+下面用一段 TS/JS 演透这条主线：中立请求、引擎自报能力、扩展认领、偏好打分、自检降级聚合。**每一行对应上面某条原理**，不演示原理的实现细节（完整代理校验、真网络 IO、深拷贝）一律省略。
+
+```ts
+// 不支持信号：能力不匹配时抛出，调度器据此降级到下一个引擎
+class Unsupported extends Error {}
+
+// 中立请求：只描述"要什么"，扩展槽承载可选能力
 class Request {
-  constructor(url, extensions = {}) {
+  url: string
+  scheme: string
+  extensions: Record<string, unknown>
+  constructor(url: string, opts: { extensions?: Record<string, unknown> } = {}) {
     this.url = url
     this.scheme = url.split(':')[0]
-    this.extensions = extensions
+    this.extensions = opts.extensions ?? {}
   }
 }
 
-// ② 引擎基类：用集合自报支持的协议，自检时把能认领的扩展 pop 掉
-class Handler {
-  name = ''
-  schemes = new Set()
-  // 子类重写：把自己支持的扩展从口袋里领走，返回剩下没人要的
-  claim(extensions) {
-    return { ...extensions }
+// 引擎基类：用类变量自报能力（schemes），自检时未认领的扩展视为不支持
+abstract class Handler {
+  abstract name: string
+  abstract schemes: Set<string>
+  abstract send(r: Request): string
+
+  validate(r: Request) {
+    if (!this.schemes.has(r.scheme))
+      throw new Unsupported(`${this.name}: 不支持协议 ${r.scheme}`)
+    const leftover = this._claimExtensions(r.extensions)
+    if (Object.keys(leftover).length > 0)
+      throw new Unsupported(`${this.name}: 不支持扩展 ${Object.keys(leftover).join(',')}`)
   }
-  validate(req) {
-    if (!this.schemes.has(req.scheme)) {
-      throw new UnsupportedRequest(`${this.name}: 不支持协议 ${req.scheme}`)
-    }
-    const leftover = Object.keys(this.claim({ ...req.extensions }))
-    if (leftover.length) {
-      throw new UnsupportedRequest(`${this.name}: 有扩展没人领 ${leftover.join(',')}`)
-    }
+  // 子类 override 时 pop 掉自己认领的扩展；基类默认一个都不认领
+  protected _claimExtensions(e: Record<string, unknown>): Record<string, unknown> {
+    return { ...e }
   }
 }
 
-// 两个具体引擎，各自声明承运范围、各自领扩展
-class UrllibHandler extends Handler {
-  constructor() { super(); this.name = 'Urllib'; this.schemes = new Set(['http', 'https', 'ftp']) }
-  claim(e) { const { timeout, cookiejar, ...rest } = e; return rest } // 认领 timeout、cookiejar
-  send(r) { return `[urllib] GET ${r.url}` }
-}
-class WebsocketsHandler extends Handler {
-  constructor() { super(); this.name = 'Websockets'; this.schemes = new Set(['ws', 'wss']) }
-  send(r) { return `[ws] connect ${r.url}` }
+// Urllib 引擎：接 http/https/ftp，不认领任何扩展（教学简化）
+class Urllib extends Handler {
+  name = 'Urllib'
+  schemes = new Set(['http', 'https', 'ftp'])
+  send(r: Request) { return `[urllib] GET ${r.url}` }
 }
 
-// ③ 调度器：偏好打分排序 → 逐个自检 → 第一个通过的接管
+// Websockets 引擎：接 ws/wss，认领 cookies 扩展
+class Websockets extends Handler {
+  name = 'Websockets'
+  schemes = new Set(['ws', 'wss'])
+  protected _claimExtensions(e: Record<string, unknown>) {
+    const rest = { ...e }
+    delete rest.cookies  // 引擎声明：我认识 cookies
+    return rest
+  }
+  send(r: Request) { return `[ws] connect ${r.url}` }
+}
+
+// 调度器：偏好打分排序 → 逐个自检 → 第一个通过的接管；拒绝原因全部收集
 class Director {
-  constructor(handlers, prefs = []) { this.hs = handlers; this.prefs = prefs }
-  score(h, r) { return this.prefs.reduce((s, p) => s + p(h, r), 0) }
-  send(req) {
-    const ranked = [...this.hs].sort((a, b) => this.score(b, req) - this.score(a, req))
-    const reasons = []
+  constructor(
+    private handlers: Handler[],
+    private prefs: ((h: Handler, r: Request) => number)[] = [],
+  ) {}
+  private score(h: Handler, r: Request) {
+    return this.prefs.reduce((s, p) => s + p(h, r), 0)
+  }
+  send(r: Request): string {
+    const ranked = [...this.handlers].sort((a, b) => this.score(b, r) - this.score(a, r))
+    const reasons: string[] = []
     for (const h of ranked) {
       try {
-        h.validate(req)
+        h.validate(r)
       } catch (e) {
-        if (e instanceof UnsupportedRequest) { reasons.push(e.message); continue }
-        throw e // 只有「不支持」是降级信号，别的异常原样抛
+        if (e instanceof Unsupported) { reasons.push((e as Error).message); continue }
+        throw e  // 非不支持类异常（引擎 bug）：透传，不吞
       }
-      return h.send(req) // 第一个通过自检的，立刻接管
+      return h.send(r)
     }
-    throw new Error(`无可用引擎：\n  - ${reasons.join('\n  - ')}`)
+    throw new Error(`无可用引擎：${reasons.join(' | ')}`)
   }
 }
 
-// ④ 装配：两个引擎，暂不注册偏好函数（演示纯降级链）
-const director = new Director([new UrllibHandler(), new WebsocketsHandler()])
-console.log(director.send(new Request('https://x')))   // [urllib] GET https://x
-console.log(director.send(new Request('wss://live')))  // [ws] connect wss://live
-try {
-  console.log(director.send(new Request('gopher://x')))
-} catch (e) {
-  console.log(e.message)
-  // 无可用引擎：
-  //   - Urllib: 不支持协议 gopher
-  //   - Websockets: 不支持协议 gopher
-}
+// 偏好函数示例：要伪装时给支持伪装的引擎加分（这里 CurlCffi 没注册，得 0 分）
+const preferImpersonate = (h: Handler, r: Request) =>
+  r.extensions.impersonate && h.name === 'CurlCffi' ? 1000 : 0
+
+const d = new Director([new Urllib(), new Websockets()], [preferImpersonate])
+
+console.log(d.send(new Request('https://x')))    // [urllib] GET https://x
+console.log(d.send(new Request('wss://live/x'))) // [ws] connect wss://live/x
+console.log(d.send(new Request('gopher://x')))
+// 抛: 无可用引擎：Urllib: 不支持协议 gopher | Websockets: 不支持协议 gopher
 ```
 
-跑一遍执行轨迹，正好对上前面那几步：
+跑一遍：
 
-- 请求 `https://x`：两个引擎偏好分都是 0，先排到的 Urllib 自检通过（https 在范围内，timeout 等扩展它能认领）→ 输出 `[urllib] GET https://x`。
-- 请求 `wss://live`：Urllib 自检发现 `wss` 不在承运范围 → 说「不接」、跳过；轮到 Websockets，自检通过 → 输出 `[ws] connect wss://live`。
-- 请求 `gopher://x`：两家自检全挂 → 抛「无可用引擎」，且把 Urllib 和 Websockets 各自拒绝的理由都列出来。
+- `https://x`：Urllib 偏好分 0、Websockets 偏好分 0，排序后 Urllib 先到，自检通过 → 返回 `[urllib] GET https://x`。
+- `wss://live/x`：Urllib 自检 `wss` 不在 schemes，让位；Websockets 自检通过 → 返回 `[ws] connect wss://live/x`。
+- `gopher://x`：两个引擎自检全失败 → 抛"无可用引擎"，附上每个引擎的拒绝原因。
 
-再看偏好函数这一环。它只改「试的顺序」，不改「能不能接」。注册一条偏好让 Websockets 在 https 请求时插队排第一：
+## 6. 执行轨迹
 
-```js
-const d2 = new Director([new UrllibHandler(), new WebsocketsHandler()], [
-  (h, r) => r.scheme === 'https' && h.name === 'Websockets' ? 50 : 0,
-])
-console.log(d2.send(new Request('https://x')))
-// Websockets 因偏好排到第一 → 自检发现不接 https → 落到 Urllib → [urllib] GET https://x
-```
+跟踪一次真实路径，看每个引擎的内部状态怎么变。
 
-这条轨迹点透了一个常被忽略的关系：**偏好（投票）决定顺序，能力自检（承运范围）决定能不能接**，这是两道独立的关卡。哪怕你给一个引擎投出天高的票，它接不了还是接不了，最多只是被先问一遍再被跳过。
+**初始**：已装 `[Urllib(schemes={http,https,ftp})、Websockets(schemes={ws,wss})]`，偏好函数 `preferImpersonate`（本次请求不带 impersonate 扩展，不命中）。
 
-## 四个关键权衡
+**请求 A** `wss://live/x`：
 
-把上面这些机制拆开看，每一块都是一次明确的设计选择。下面挑四条最关键的讲透——它们彼此独立，但拼在一起才构成这套可插拔传输层。
+1. 进入 `Director.send`。算偏好分：Urllib=0、Websockets=0。排序后 Urllib 在前（同分时维持原序）。
+2. 取 Urllib，调 `validate(request)`：
+   - 查 scheme：`wss` 不在 `{http,https,ftp}` → 抛 `Unsupported("Urllib: 不支持协议 wss")`。
+   - Director 把这条原因 push 进 reasons 列表，continue 到下一个引擎。
+3. 取 Websockets，调 `validate(request)`：
+   - 查 scheme：`wss` 在 `{ws,wss}` ✓
+   - 扩展槽为空，认领后无残留 ✓
+4. 自检通过 → 调 `Websockets.send(request)` → **输出** `[ws] connect wss://live/x`。Urllib 的 send 没被调用。
 
-**一、让每个引擎「能力自检 + 不支持就跳过」，换来多后端可插拔与优雅降级，代价是引擎必须诚实、完整地自报能力。**
+**请求 B** `gopher://x`：
 
-选择：引擎接请求前先过一遍能力自检，不满足就抛「不支持」。
-换来：装了 curl 引擎就自动参与竞争、没装就自动落到 urllib——加引擎和减引擎都是纯增量动作，调用方一行不改。
-代价：引擎的自报必须又诚实又完整。少报一个其实能处理的协议，它就会被永远跳过（漏报）；多报一个其实接不了的协议，它就会硬接、然后在真发请求时炸掉（误接）。这套机制把「能力边界」的维护责任，压到了每个引擎自己头上。
+1. 偏好分都为 0，Urllib 先到。
+2. `Urllib.validate`：`gopher` 不在 schemes → Unsupported，reasons 记一笔。
+3. `Websockets.validate`：`gopher` 不在 schemes → Unsupported，reasons 再记一笔。
+4. 循环结束仍无引擎通过 → **抛** `Error: 无可用引擎：Urllib: 不支持协议 gopher | Websockets: 不支持协议 gopher`。
 
-**二、用「一组偏好函数打分求和」决定优先级，换来路由规则可被独立叠加注册，代价是排序没有单一真相来源。**
+注意请求 B 抛出来的消息：它不是泛泛的"失败"，而是把每个引擎的拒绝原因拼起来——用户看到这条消息就知道"协议两个引擎都不认"，下一步要么换 url，要么装支持 gopher 的引擎。
 
-选择：引擎优先级 = 一组偏好函数返回分数之和。
-换来：不同特性各自注册各自的偏好——「伪装请求偏向 curl」「兼容老用户偏向 urllib」——互不感知、互不打架地叠加，谁也不用知道全局规则。
-代价：最终的引擎顺序是多条偏好的「和」算出来的，没有任何一个地方写着「权威优先级」。两个偏好打架时谁赢，得拿计算器算一遍才知道；调试只能靠 verbose 模式把每个引擎每条偏好的得分打出来看。yt-dlp 确实在 verbose 里专门打印这套得分，正是因为它没法一眼看出来。
+## 7. 教学简化说明
 
-**三、把可选能力塞进 `extensions` 扩展槽，而非请求对象的独立字段，换来请求核心字段稳定、新能力零侵入，代价是多一层「扩展认领」协商。**
+本章演示故意省略了：完整代理协议校验（`all`/`no` 特殊键）、真实 SSL/网络 IO、headers 大小写保留、深拷贝、urllib 向后兼容垫片（`.code`/`.getcode()`/`.info()`）、`@register_rh` 注册装饰器与类名 `RH` 后缀的发现机制。最后这一项是下一章的主题，本章只把它当"四个引擎已经装进了调度器"的既成事实使用。
 
-选择：超时、cookie、旧 SSL、伪装目标等可选能力，全部塞进 `extensions` 口袋，而不是做成请求对象的字段。
-换来：请求对象的核心字段（url、headers、method）永远不变。后续要加新能力，只要往口袋里塞一项、让支持的引擎去认领，请求对象的构造签名一个字都不用动。
-代价：引擎和请求之间多了一层「扩展认领」的讨价还价——引擎必须在自己那份自检里，把支持的扩展逐个领走（pop），凡是剩在口袋里没人领的，一律视为「该引擎不支持」，请求被跳过。换句话说，能力不是「声明了就算」，而是「被认领了才算」，这给引擎实现多了一道必须照做的流程，漏领就会让原本能处理的请求被错误跳过。
+## 8. 小结
 
-**四、调度器把「不支持的原因」和「意外崩溃」分开收集，换来「全军覆没」时给用户一份聚合诊断，代价是每次请求多一次自检开销、且引擎 bug 可能被吞掉。**
-
-选择：调度器对引擎运行期的异常分两类——能力不匹配记进「不支持原因」列表；属于已知请求异常族之外的崩溃，记进「意外错误」列表；两者都不立即中止，而是继续试下一个引擎。
-换来：当所有引擎都不接时，调度器能抛一个带完整诊断的错误——「Urllib 因为协议不支持跳过、Curl 因为缺扩展跳过、Websockets 因为意外崩溃跳过」，用户一眼就知道是哪出了问题，而不是一个孤零零的「失败了」。
-代价：每个请求至少触发一次能力自检（多数请求这开销可忽略）；更隐蔽的代价是，引擎里那些不属于「已知请求异常族」的 bug，会被当成「意外错误」收集后默默重试下一个引擎——真实 bug 就这样被吞掉、被降级链掩盖了。
-
-## 小结
-
-回头看，这一章真正立住的是两个通用机制：一个是「中立请求 + 扩展槽」，让请求对象不被新能力绑架；一个是「偏好函数路由 + 能力自检竞争」，让引擎的增减变成纯增量。它俩合在一起，把「发什么请求」和「用什么引擎发」彻底分开。
-
-不过，这里还留了一半没回答的问题：那四个具体引擎（urllib、requests、websockets、curl_cffi），到底是怎么「自己出现在调度器里」的？答案是一套「类名带固定后缀 + 注册装饰器 + 缺依赖就静默跳过」的发现机制。这套机制不只是引擎在用，提取器、后处理器都走同一条路——它是紧邻的下一章「约定胜配置的插件注册机制」的主题，那里会把它讲透。本章只把它当成「引擎已就位」的前提，到这里收束。
+把"发什么请求"和"用什么引擎发"拆开，让请求只描述意图、引擎各自亮能力清单竞争、调度器按偏好打分择优——这是全书一切网络抓取的底座。代价是引擎必须诚实自报能力、引擎排序没有单一真相、扩展槽多一层认领协商、意外 bug 可能被吞。下一章会看到，这些"已装引擎"是怎么靠一个类名后缀约定和容错导入被自动发现的，那套发现机制本身才是 yt-dlp 一切插件式扩展的真正起点。

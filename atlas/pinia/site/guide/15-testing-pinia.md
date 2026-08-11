@@ -1,183 +1,210 @@
 # 测试：以插件重塑 store 行为
 
-写单测的时候你会发现一个尴尬的事实：store 的行为几乎总要被你「改一改」才好测。
+> 本章属于 system 层。前置：插件系统：context 注入的 store 增强、Store 装配：effectScope 托管的返回值分类与状态镜像。
+> 学完你能：用一句话讲清「为什么测试库不写测试专用 store，而是预装插件在装配期重塑 store；以及它为什么必须直捣 Vue 计算属性的内部字段才能覆盖只读 getter」。
 
-比如一个购物车 store，它的 `checkout` action 会真去调支付接口——单测里你绝对不想真发请求，只想断言「它被调了、参数对」；又比如你想直接给状态塞个 `items: 2` 当初始值，省得跑一堆 setup；再或者某个 getter 是只读的，你却想临时把它「冻结」成一个固定值，好去测一个依赖它的分支。
+## 1. 为什么需要它（设计动机）
 
-可这些「测试期」才需要的能力，store 本身一个都没有。它没有「测试模式」这个开关。最朴素的冲动是去 fork 一套测试专用 store，或者往核心里塞 `if (测试)` 分支——但这两条路都会把测试的脏东西漏进生产代码。
+上一章讲 Nuxt 模块把 `defineStore` / 状态水合 / HMR 接入做到了零样板——它的思路是「在已有机制外面加一层自动化」。本章处理的是另一个看似与框架集成无关、但思路同源的场景：单测 store。
 
-本章讲 Pinia 的测试库 `@pinia/testing` 是怎么绕开这两条路的。答案很轻巧：**它一个测试专用 store 都不写，全程靠往插件队列里塞几段「重塑逻辑」，在 store 装配完成的那一刻把它的行为就地改掉。**
+具体痛点是：单测 store 时你几乎总要改写它的行为。不想真跑某个 action 的网络副作用、想给状态塞一份初始值、想临时把某个只读派生值（getter）冻结成固定值来测某个分支。但这些「测试期」能力 store 本身一个都没有，它没有「测试模式」开关。
 
-## 关键转折：插件可以什么都不返回，只动手改 store
+最朴素的两个冲动都不可行：
 
-要理解这个答案，得先回头看一个前面没怎么强调的插件侧面。
+- fork 一套测试专用 store：维护成本翻倍，业务改了要同步改测试桩
+- 往核心塞 `if (测试)` 分支：测试逻辑混进生产路径，核心代码被污染
 
-前面两章（插件系统、Store 装配）已经讲透了两件事：插件是一个收 `{ store, app, pinia, options }` 上下文、**返回扩展**、由装配器帮你合并进 store 的函数；装配器在每个 store 装配时，会在该 store 自己的作用域里逐个跑插件队列。这两套机制本章不重演。
+测试库要回答的问题是：能不能让所有「测试期行为改写」都不进核心，但又能彻底重塑 store？
 
-这里只看一个被测试库逼出来的新用法。注意插件函数的返回值其实是**可选的**——它完全可以什么都不返回，只拿到刚装配好的 store 引用，就地把它改了。换句话说，插件不一定要「申请加入」，它也可以当成一个**「装配完成回调」**来用：store 一造好，它就被叫一次，趁机把状态合并进去、把某个方法覆盖掉、把某个计算属性换掉。
+## 2. 核心思想
 
-打个比方。store 像一辆刚下生产线的车，插件系统是生产线末端的一道工位。前面讲的插件用法是「往车上装新配件」——你递一份清单，装配器帮你装好；而测试库的用法是「工人直接上手改车」——轮胎换成测试胎（桩化 action）、油表预设到某个读数（灌初始态）。车的图纸（store 定义）一个字都没动，全是出厂那一刻的现场改造。
+把测试需要的所有行为改写，全部表达成「在 store 装配完成的那一刻插入一段重塑逻辑」。
 
-这一点点转变是整章的地基。下面看测试库具体塞了哪几段改造。
+这里的关键转换是：插件不一定非要返回扩展对象让装配器合并——它完全可以不返回任何东西，只拿到刚装配好的 store 引用、就地变异它。换句话说，第 9 章把插件当作「注入新成员的增强器」用，本章把它当作「装配完成钩子」用。同一套机制，换了用法，整套测试库就有了支点。
 
-## 四段重塑，按固定顺序入队
+## 3. 心智模型
 
-`createTestingPinia` 这个工厂做的事，剥到最简就是：建一个普通 pinia 实例，往它的插件队列里**按固定顺序**塞四段逻辑，再打上一个测试标志、把它设为当前活跃实例。
+`createTestingPinia` 是一个工厂，做三件事：
 
-四段的顺序是钉死的契约：
+1. 建一个普通 pinia 实例（不写第二套）
+2. 往它的插件队列 `_p` 里按固定顺序塞四段重塑逻辑：
+   - 初始态合并（把预设状态深合并进 `store.$state`）
+   - 用户自传插件（原样插队，不经过核心的「安装前延迟队列」）
+   - 可写 getter 包装（每个只读 computed 换成可写 computed）
+   - action / 补丁 / 重置桩化（按配置用 spy 覆盖方法）
+3. 给实例打上测试标志 `_testing = true`，并把它设为当前活跃实例
 
-```
-初始态插件 → 用户自传的插件 → 可写 getter 包装 → action/$patch/$reset 桩化
-```
+此后测试里调 `useStore()` 时，第 4 章讲过的装配管线照常跑，四段插件只是在管线最末追加四个步骤，在「装配完成」那一刻依次拿到刚建好的 store 就地变异。关键不变量是：测试代码拿到的 store 与生产装配出来的 store 走过**完全相同的装配管线**，没有第二条路径。
 
-两头一看就明白为什么这个顺序不能乱：初始态必须最先，因为后面所有插件读到的状态都该已经是「预设好的」；action 桩化必须**最后**——这点很关键，是后面要讲的一条权衡。
+## 4. 关键权衡
 
-顺序定好后，测试里你照常 `useCartStore()`，装配照常进行，四段插件在「装配完成」那一刻依次拿到刚建好的 store，各改各的。你读到的，就是已经被重塑过的 store。说人话就是：测试和生产走的是**完全相同**的装配路径，只是测试在末端多了几道现场改造工位。
+### 用装配期插件重塑，而不是另写测试专用 store 或核心测试分支
 
-## action 桩化：一个三目覆盖三类可调用对象
+**选择**：在装配期插入插件，在「store 刚建好那一刻」就地改写它的状态与方法。
+**换来**：核心生产路径零污染（没有任何「如果是测试就分支」），测试与生产走完全相同的装配路径——你测到的就是生产行为，不会出现「测试桩里漏写了某个赋值」这类与真实装配不一致的偏差。
+**代价**：所有重塑都只能发生在「装配完成那一刻」这个固定时机。这意味着改写手段必须迁就这个窗口：初始态靠此刻合并进 `store.$state`、action 桩化靠此刻直接覆盖 store 上已赋值好的方法、getter 覆盖靠此刻把只读 computed 换成可写的（见下条权衡）。
 
-桩化逻辑核心就一个三目：
+本质矛盾是「测试需要彻底改写行为」与「核心代码不能因测试而分支」两个对立需求在打架。通解骨架是：找一个**已有的扩展点**作为改写窗口——任何具有「装配完成钩子」的库都可以照搬这个思路，而不必往核心里塞测试专用代码。
+
+### 把桩化与监视统一表达成 spy 包裹
+
+**选择**：所有需要被改写或被监视的可调用对象（action、`$patch`、`$reset`），统一用「spy 包裹」来表达。桩化模式换成空 spy `createSpy()`，原逻辑完全不跑；监视模式换成包住原函数的 spy `createSpy(original)`，照跑但调用可断言。
+**换来**：一套配置（全桩 / 指定名字桩 / 仅监视不桩）同时覆盖三类可调用对象，认知负担低；测试代码用 `expect(store.action).toHaveBeenCalledWith(...)` 这样的统一断言，不区分对象是 action 还是 `$patch`。
+**代价**：强制使用者必须提供一个 spy 工厂。默认会探测 `jest.fn` / `vi.fn`，找不到就直接抛错，没有静默降级。这是个不便宜的契约——但它换来的是测试库完全不必关心调用记录的实现细节。
+
+换句话说，这里折叠的是「桩化与监视是两件不同的事」与「希望用一个统一 API 同时表达两种需求」的对立。一个**带模式的包装器**把「是否执行原逻辑」这个差异折进同一个工厂调用——`createSpy()` 与 `createSpy(original)` 的参数差异就是开关。
+
+### 让 action 桩化刻意排在插件队列最末
+
+**选择**：四段插件的入队顺序是硬契约——初始态 → 用户插件 → 可写 getter 包装 → action 桩化，桩化一定最后。
+**换来**：能覆盖更早插件对 action 的改写。可观测层（DevTools 那章讲过的）会把 action 用 Proxy 包一层做归因追踪；如果桩化先于它执行，测试桩就会被可观测层覆盖；放最后则反过来——「测试桩说了算」。
+**代价**：插件入队顺序成为一个**隐式契约**。使用者自传的 `plugins` 选项会被插在桩化插件之前，被包过的 action 会被桩化干净覆盖，没法后置覆盖测试行为。如果你恰好想自己桩化某个 action，必须另想办法。
+
+这条原理在多插件系统里很常见：多个候选改写者都要碰同一个对象时，给「最末入队者胜出」一个明确语义，是钩子链的标准做法（洋葱模型的「最外层」反过来）。
+
+### 直捣 Vue 计算属性的内部字段，换「覆盖只读 getter」这一个逃生口
+
+**选择**：覆盖只读 getter 这件事，正常情况下根本不该可能——computed 是只读的。测试库选择不放弃这个能力，而是直接操作 Vue `ComputedRefImpl` 的三个非公开内部字段：缓存值 `_value`、脏标记 `_dirty`、getter 函数句柄 `fn`。
+**换来**：测试里能临时把一个只读派生值冻结成任意值、且事后能恢复成真计算。`store.myGetter = 99` 冻结、`store.myGetter = undefined` 恢复。
+**代价**：依赖 Vue 计算属性**非公开**的内部实现。一旦 Vue 改了这三个字段的名字或语义，这条逃生口就失效。它是整个测试库**唯一**触碰 Vue 内部实现之处，其它一切都建立在公开 API 上。
+
+化解的本质矛盾是「公开 API 不允许覆盖只读派生值」与「测试场景需要这种能力」在打架。逃生口的可维护性就在于它的「窄」——把对内部实现的依赖收缩到这三个字段、这一个点，而不是散落到多处。任何库在做这类「破例」时都该遵循这个原则：识别最窄、最稳定的内部实现作为唯一逃生口，把它孤立起来。
+
+## 5. 最小原理演示
+
+下面两段脚本只演两条原理：插件作为「装配完成回调」就地变异 store；可写包装器劫持只读计算属性的内部字段。**故意省略**：多框架 spy 工厂探测、深合并的纯对象判定细节、`$patch`/`$reset` 桩化分支、类型体操、`fakeApp` 副作用。
 
 ```ts
-store[action] = shouldStubAction(stubActions, action, store)
-  ? createSpy()                  // 空 spy：原逻辑根本不跑
-  : createSpy(store[action])     // 包住原函数的 spy：照跑，但记录调用
+// 演示一：插件作为「装配完成回调」就地变异 store
+
+// 一个最小 pinia：插件队列 + 注册表
+function createMiniPinia() {
+  const _p: Array<(ctx: { store: any }) => void> = []
+  const _s = new Map<string, any>()
+  return {
+    _p,
+    _s,
+    // 装配 = 跑 setup + 在「装配完成那一刻」依次跑所有插件
+    use(setup: () => any, id: string) {
+      const store = setup()
+      _p.forEach((ext) => ext({ store }))
+      _s.set(id, store)
+      return store
+    },
+  }
+}
+
+// 测试库：预装一段「重塑插件」后建实例
+function createTestingMiniPinia(initialState: Record<string, any>) {
+  const pinia = createMiniPinia()
+  // 关键：插件不返回扩展，只就地改 store —— 这是把插件当装配完成回调用
+  pinia._p.push(({ store }) => {
+    if (initialState[store.$id]) {
+      Object.assign(store.$state, initialState[store.$id])
+    }
+  })
+  return pinia
+}
+
+// 使用
+const pinia = createTestingMiniPinia({ cart: { items: 99 } })
+const cart = pinia.use(() => ({ $id: 'cart', $state: { items: 0 } }), 'cart')
+console.log(cart.$state.items) // 99 —— 初始态在装配完成那一刻被合并进来
 ```
 
-要么换成「空 spy」——调它什么也不发生，原逻辑被彻底跳过；要么换成「包住原函数的 spy」——原函数照跑，但这次调用被记下来了，事后能断言「调了几次、参数是什么」。
+```ts
+// 演示二：可写包装器劫持只读计算属性的三个内部字段
 
-`$patch` 和 `$reset` 也是可调用的，套同一个壳子，只是各自由独立开关控制（默认不桩、只被监视）。`createSpy` 这个名字也值得注意——它不是测试库自己实现的，而是个**工厂**，由调用方提供（探测 jest/vitest 全局拿到 `vi.fn` 或 `jest.fn`）。这点带出一条权衡，下面讲。
-
-## 逃生口：把只读 getter 改成「测试期可写」
-
-这是整章最取巧、也是唯一的「逃生口」。
-
-只读派生值（getter）在生产里是只读的，正常途径你改不了它。但测试里你偏偏想临时冻结它。测试库的办法是：**第四段插件里遍历 store 的原始对象，认出每个 getter（判定手法是「是 ref 且带 `effect`」，这和 storeToRefs 章同源，不重复讲），把每个替换成一个新的可写计算属性。**
-
-这个新计算属性默认完全透明——读它就是读原值，行为一点没变。它的魔法全在 setter 里：
-
-- 给它赋一个**非空值**，它就直捣原计算属性内部，把它**冻结**成这个值；
-- 给它赋 `undefined`，它就把原计算属性**恢复**成真计算。
-
-「直捣内部」捣的是哪？Vue 计算属性对象的三个**非公开**字段：缓存值、脏标记、getter 函数句柄。这是整个测试库唯一触碰 Vue 内部实现的地方。下面用一个从零写的迷你版演透它。
-
-### 迷你演示：插件变异 store + 劫持只读 getter
-
-不引真 Vue，手写一个只有三个内部字段的「计算属性」，把本章两条原理演出来：(i) 插件什么都不返回、就地改 store；(ii) 可写包装器靠那三个内部字段在「冻结」和「恢复」之间切换。
-
-```js
-// ====== 1. 迷你计算属性：只暴露逃生口要碰的三个内部字段 ======
-// 真 Vue 的 ComputedRefImpl 字段更多，但这三个（缓存值 / 脏标记 / getter 句柄）是全部
-function computed(getter) {
-  const c = {
-    _value: undefined,   // 缓存值
-    _dirty: true,        // 脏标记：true 表示下次读要重算
-    fn: getter,          // getter 句柄：真正干活的函数
-    effect: Symbol(),    // 标记「带 effect 的 ref」= 计算属性（识别用）
-    __v_isRef: true,     // 假装是个 ref
-  }
-  Object.defineProperty(c, 'value', {
-    get() {
-      if (c._dirty) { c._value = c.fn(); c._dirty = false }
-      return c._value
-    },
-  })
-  return c
-}
-const isComputed = (v) => v && v.__v_isRef && 'effect' in v  // 与 storeToRefs 章同源
-
-// ====== 2. 逃生口：把只读计算属性换成可写包装器 ======
-function writableOverride(original) {
-  const originalFn = original.fn           // 先存住真 getter
-  const freezeFn = () => original._value   // 冻结态 getter：永远吐缓存值
+// 手写一个最小 computed：三字段（缓存值 / 脏标记 / getter 句柄）
+function miniComputed<T>(getter: () => T) {
   return {
-    __v_isRef: true,
-    effect: Symbol(),
-    get value() { return original.value },          // 读：默认完全透传
-    set value(newValue) {
+    fn: getter,                  // getter 句柄（可被替换）
+    _value: undefined as unknown as T, // 缓存值
+    _dirty: true,                // 脏标记：true 表示下次读要重算
+    get value(): T {
+      if (this._dirty) {
+        this._value = this.fn()
+        this._dirty = false
+      }
+      return this._value
+    },
+  }
+}
+
+// 「可写包装器」：把只读 computed 包装成可写的
+function makeWritable(c: ReturnType<typeof miniComputed>) {
+  const originalFn = c.fn               // 留底原 getter 句柄
+  const overriddenFn = () => c._value   // 冻结态：恒返回缓存
+  return {
+    get value() {
+      return c.value                    // 读透传
+    },
+    set value(newValue: unknown) {
       if (newValue === undefined) {
-        // 恢复真计算：换回原 getter、清缓存、置脏强制重算
-        original.fn = originalFn
-        delete original._value
-        original._dirty = true
+        // 恢复态：换回原 getter、清脏标记强制重算
+        c.fn = originalFn
+        c._dirty = true
       } else {
-        // 冻结成 newValue：getter 换成「返回缓存值」、缓存值直接置为 newValue
-        original.fn = freezeFn
-        original._value = newValue
+        // 冻结态：getter 改成恒返回缓存、缓存写成新值
+        c.fn = overriddenFn
+        c._value = newValue as T
       }
     },
   }
 }
 
-// ====== 3. 迷你 store 定义（纯生产代码，零测试分支）======
-function createCartStore() {
-  const state = { count: 0 }
-  return {
-    $id: 'cart',
-    $state: state,
-    totalPrice: computed(() => state.count * 10),  // 只读 getter
-    checkout() { state.count = 0; return 'paid' }, // action（含网络副作用）
-  }
-}
+// 使用
+let base = 1
+const c = miniComputed(() => base * 10)
+const w = makeWritable(c)
+console.log(c.value) // 10 —— 真计算
 
-// ====== 4. 迷你装配器：跑完 setup 后逐个跑插件 ======
-function assemble(setup, plugins) {
-  const store = setup()
-  for (const plugin of plugins) plugin({ store })  // 插件什么都不返回，就地改
-  return store
-}
+w.value = 99         // 冻结
+console.log(c.value) // 99 —— 不再随 base 变化
+base = 100
+console.log(c.value) // 99 —— 仍是冻结值
 
-// ====== 5. 迷你 testing pinia：预装三段重塑插件（顺序与真库一致）======
-function createTestingPinia({ initialState = {}, stubActions = true } = {}) {
-  const plugins = []
-  // 插件 1：灌初始态（就地合并 state）
-  plugins.push(({ store }) => {
-    if (initialState[store.$id]) Object.assign(store.$state, initialState[store.$id])
-  })
-  // 插件 2：可写 getter 包装（认出 getter，换成可写包装器）
-  plugins.push(({ store }) => {
-    for (const key of Object.keys(store))
-      if (isComputed(store[key])) store[key] = writableOverride(store[key])
-  })
-  // 插件 3：action 桩化（刻意排最后）
-  plugins.push(({ store }) => {
-    if (stubActions) store.checkout = () => 'stubbed' // 空 spy：不跑原逻辑
-  })
-  return plugins
-}
-
-// ====== 6. 跑一遍 ======
-const plugins = createTestingPinia({ initialState: { cart: { count: 5 } }, stubActions: true })
-const store = assemble(createCartStore, plugins)
-
-console.log(store.$state.count)       // 5          —— 初始态已灌入
-console.log(store.totalPrice.value)   // 50         —— 真计算（5 × 10）
-console.log(store.checkout())         // 'stubbed'  —— 原逻辑没跑
-
-store.totalPrice.value = 999          // 冻结只读 getter（逃生口）
-console.log(store.totalPrice.value)   // 999        —— 冻结成 999
-store.totalPrice.value = undefined    // 恢复
-console.log(store.totalPrice.value)   // 50         —— 又变回真计算
+w.value = undefined  // 恢复
+console.log(c.value) // 1000 —— 重新跑原 getter
 ```
 
-这段脚本演透了两件事：第一，`createTestingPinia` 塞进去的三段插件**返回值都是 `undefined`**，它们只就地合并状态、换掉方法、换掉计算属性——这正是「插件当装配完成回调」，store 定义里没有任何测试分支；第二，给只读 getter 赋一个值就冻结、赋 `undefined` 就恢复，靠的全是手写计算属性那三个内部字段。真 Vue 的计算属性内部字段更多，但逃生口碰的就这三个，原理一模一样。
+两段演示合起来就是测试库的本质：装配期插件 + 计算属性内部字段劫持，没有任何「测试专用 store」。
 
-## 关键权衡
+## 6. 执行轨迹
 
-这一章机制密集，我们看四条。
+输入：`createTestingPinia({ initialState: { cart: { items: 2 } }, stubActions: ['checkout'] })`，测试里 `useCartStore()`。
 
-**1. 选择「预装一组插件在装配期重塑 store」，而非「写测试专用 store 或核心测试分支」。** 换来的最大好处是核心零污染：测试和生产走的是**完全相同的装配路径**——你在测试里测到的，就是生产行为本身，不会出现「测试代码路径和生产不一样」导致的假绿。代价是重塑只能发生在「装配完成那一刻」这个固定时机，所有改写都得挤进这个窗口：初始态靠此刻合并进状态对象、action 桩化靠此刻直接覆盖方法上的函数。装配**之后**你再想随手改某个 action，已经来不及了——窗口一过即关闭。
+工厂阶段发生的事：
 
-**2. 选择「把桩化与监视统一表达成 spy 包裹」。** 一套配置（全桩 / 指定名字桩 / 仅监视不桩）同时覆盖 action、`$patch`、`$reset` 三类可调用对象，统一得很干净。代价是它要求使用者**必须**提供一个 spy 工厂——少了直接抛错，传错了（传了一个已经调用过的 spy 实例，而不是工厂函数本身）也直接抛错，不给任何静默降级。换句话说，这套统一的前提是「使用者懂且只懂提供工厂」，错一点都不将就。
+1. `createPinia()` 建一个普通实例，`_p` 队列为空
+2. 初始态插件入队 → `_p[0]`
+3. 用户没有自传插件，跳过
+4. 可写 getter 包装插件入队 → `_p[1]`
+5. action 桩化插件入队 → `_p[2]`，刻意最末
+6. 打上 `_testing = true`，设为活跃实例
 
-**3. 选择「让 action 桩化插件刻意排在队列最末」。** 这是为了让它能覆盖更早插件（比如可观测层对 action 的代理包裹）对 action 的改写，保证「测试桩说了算」——不管前面谁动过 action，最后落地的一定是测试桩。代价是插件入队顺序成了一个**隐式契约**：用户自传的插件一律插在测试重塑插件**之前**，你想后置覆盖测试行为？做不到，顺序被钉死了。
+测试里调 `useCartStore()`，装配阶段发生的事：
 
-**4. 选择「为『覆盖只读 getter』这个本不该可能的能力，直捣响应式计算属性的内部实现」。** 换来测试里能临时把一个只读派生值冻结成任意值、且事后能恢复成真计算——这是写测试时特别顺手的能力，正常途径根本做不到。代价是它依赖 Vue 计算属性**非公开**的三个内部字段（缓存值、脏标记、getter 句柄）。这是整个测试库唯一的逃生口：押的是「Vue 这几个内部字段别动」，一旦未来 Vue 改了它们的实现，这条能力就失效。它换的是「现在能用」，赌的是「内部别变」。
+1. setup 跑完，原始 cart store 长这样：`$state = { items: 0 }`、`checkout` 是真函数、`total` 是只读 computed
+2. `_p[0]` 跑：`initialState.cart.items = 2` 合并进 `store.$state`，`$state` 变成 `{ items: 2 }`
+3. `_p[1]` 跑：遍历 store，发现 `total` 是 computed（凭 `isRef(v) && 'effect' in v` 识别），替换成一个新的可写 computed（默认读时透传原值）
+4. `_p[2]` 跑：遍历 actions，`checkout` 命中桩化名单，换成空 spy `createSpy()`；其余 action 包成 `createSpy(original)` 照跑可断言
 
-## 收束
+测试断言阶段：
 
-回头看，`@pinia/testing` 没有新写任何测试专用 store，也没在核心里留测试分支。它的全部本事，就是把测试需要的那些「改写行为」，翻译成「在 store 装配完成那一刻插入的几段重塑逻辑」——而这个插入点，恰好就是现成的插件机制。
+- 调 `cart.checkout()` 不执行原逻辑，但 `expect(cart.checkout).toHaveBeenCalled()` 成立
+- 读 `cart.$state.items` 是 2，来自初始态合并
+- 测试里写 `cart.total = 50`：这个赋值经 Vue 的 reactive set 陷阱路由进包装 computed 的 setter，切到「冻结成 50」态，此后读 `cart.total` 恒为 50
+- 测试末尾调 `restoreGetter(cart, 'total')`，等价于 `cart.total = undefined`：setter 切回「恢复真计算」态，下次读 `cart.total` 重新跑原 getter
 
-这背后是一个挺干净的判断：测试人体工学不必动核心，搭在已有的装配机制上就够了。核心为了配合测试，只让了两步极小的步——一个在装配期设上的测试标志，核心只在两处读它（让 `useStore` 在测试模式下忽略传入的 pinia 参数、让可观测层在测试模式下不重包 action），没有第三处。除那个碰 Vue 内部字段的逃生口外，整条测试链路都走在公开、稳定的机制之上。
+整条轨迹里没有任何「测试专用装配路径」，所有改写都发生在装配管线最末的 `_p.forEach(extender => extender({ store }))` 那一轮循环里。
 
-也正因为如此，这一章适合放在最后：它不是又一个新机制，而是把前面攒下来的「插件」「装配」「计算属性识别」原样拼起来——拼得动，就说明这些机制搭得够稳、留的扩展点够好，好到「为测试而重塑行为」这么折腾的事，都不用动核心一根毛。
+## 7. 教学简化说明
+
+本章演示故意省略了多框架 spy 工厂探测（jest/vitest 全局判定与「工厂本身 vs 工厂调用结果」校验）、深合并里对 Map/Set、ref/reactive 的判定（与状态变更模型章同源）、`$patch` 与 `$reset` 的桩化分支（与 action 同构）、桩化判定的「布尔 / 名字数组 / 谓词」三分支、类型体操与生产构建标志、`fakeApp` 选项触发的 `app.use(pinia)` 副作用。这些都是工程完整性的部分，与「插件重塑」和「计算属性逃生口」这两条原理主线无关。
+
+## 8. 小结
+
+测试库把所有「测试期改写」表达成装配期插件，让核心生产路径零污染——这是把插件机制当作「装配完成回调」用的产物；唯一的逃生口是直捣 Vue 计算属性内部字段，换「覆盖只读 getter」这一个本不该可能的能力。
+
+合上全书：从最底层的根状态、订阅原语，一路到装配管线、变更模型、插件、HMR、DevTools、SSR、Nuxt 集成和本章的测试——所有机制都建在那一个根状态和那条装配管线之上。

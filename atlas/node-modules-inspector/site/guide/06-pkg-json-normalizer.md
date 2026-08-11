@@ -1,177 +1,214 @@
----
-title: package.json 字段规范化（author/repo/license/funding）
----
+# package.json 字段规范化（author/repo/license/funding）
 
-# package.json 字段规范化：把三十年的「人肉写法」收成一份稳定结构
+> 本章属于 primitive 层。前置：无。本章是全书地基章之一。
+> 学完你能：用一句话讲清「为什么 package.json 这四个字段必须有一个集中的归一化关口」，以及这个关口做了哪几个产品级取舍。
 
-## 想象你是前端，要给每个 npm 包渲染一个头像
+## 1. 为什么需要它（设计动机）
 
-你拿到一个 `package.json`，想把作者头像、仓库链接、许可证徽章、赞助按钮画出来。看上去很简单的四件事——直到你打开真实的 npm 数据：
+上一章把「包占了多少字节」按文件类别分了桶，但前端要展示一个包，光知道体积还不够。它还得告诉用户四件事——这个包是谁写的、代码在哪、什么许可、怎么赞助。这四个信号全部来自 package.json 里那四个字段（`author`/`authors`、`repository`、`license`、`funding`）。
 
-- 作者字段 `author` 有时是个字符串 `"Foo Bar"`，有时是个对象 `{ name, email, url }`，有时甚至是个复合字符串 `"Foo Bar <foo@bar.com> (https://github.com/foo)"`；
-- 仓库字段 `repository` 有时是 `foo/bar` 这种裸简写，有时是 `git+ssh://git@github.com/foo/bar.git` 这种带一堆协议噪声的 URL；
-- 许可证字段大部分时候是个字符串 `"MIT"`，但有些老包写的是 `licenses: [{ type: "MIT" }, { type: "Apache-2.0" }]` 这种数组；
-- 赞助字段 `funding` 既可以是字符串、对象，也可以是数组。
+问题在于，这四个字段在 npm 三十年的演化里被规范允许过 N 种合法写法。一个 `author` 可以是字符串 `"Foo"`，可以是对象 `{ name: "Foo", email: "..." }`，可以是带尖括号、圆括号的复合串 `"Foo <foo@bar.com> (https://github.com/foo)"`，还可以同时填 `author` 和 `authors` 两份。`repository` 可以是 `"foo/bar"` 简写、可以是 `"git+https://..."`、可以是 `{ type, url, directory }`。`license` 老式写法是 `licenses: [{type:"MIT"},{type:"Apache-2.0"}]` 数组，新式是 `license: "MIT"` 单字符串。`funding` 既可以是字符串也可以是数组。
 
-「这个包是谁写的」这一个 UI 元素，背后面对的是 npm 三十年来在不同规范下被允许过的 N 种合法写法。前端要是每种都自己 `if` 一下，会写成噩梦。所以中间必须有一道**翻译关口**：把五花八门的输入压成稳定的几种输出形态，下游只认这几种。
+如果让前端各自兜底，头像组件猜一遍、链接组件猜一遍、徽章组件再猜一遍，那同一种「怪写法」在前端会被处理三遍，每处还都不一样。这层就是中间那个翻译器：把五花八门的输入压成稳定的几种输出形态，让前端只认一种结构。
 
-本章讲的就是这道关口怎么设计。
+## 2. 核心思想
 
-## 一句话核心：多形态 → 中间元组 → 单一展示形态
+把「识别形态」和「做裁决」拆成两步。先有一个**抽取阶段**把字符串、对象、数组都摊平到一个统一中间元组（`{ name?, email?, url? }` 三个可选字段，不掺任何平台信息）；再有一个**升级+裁决阶段**按固定优先级把 GitHub handle（能直接拼头像和链接的那种身份）叠上去、丢掉纯文本名、补上能用的链接。
 
-整个归一化只做三件事，按顺序发生：
+换句话说：输入端只关心「我能不能切出 name/email/url」，输出端只关心「前端要的是哪种窄类型」，中间那个元组是不变的核心。
 
-1. **形态分流**：用 `typeof` 和 `Array.isArray` 把字段切成 `string / object / array` 三条管道。第一眼看上去每种字段长得完全不一样，但归根到底就是这三种容器形状。
-2. **抽中间元组**：从每条管道里抽出最朴素的事实，比如「这个作者叫什么名、邮箱是啥、主页是啥」。这时候**还不知道**他是不是 GitHub 用户——只是把原始信息切干净。
-3. **升级 + 优先级裁决**：再把「平台身份」叠上去。一个 GitHub handle 可以直接换头像，是高维身份；纯文本名字只能渲染个字符串，是低维身份。最后按固定优先级裁决，吐出统一的窄类型给前端。
+## 3. 心智模型
 
-说人话就是：**先切菜，再调味，最后按菜谱装盘**。切菜和调味分开做，是为了让切菜那一步能复用——你换一种调味法，切菜逻辑不用改。
+四个字段共用同一套三阶段管线：
 
-## 一个最小演示：30 行看透三阶段
+```
+多形态输入           中间元组                窄类型输出
+(string/object/array) → { name?, email?, url? } → ParsedAuthor / ParsedRepository / ...
 
-下面这个迷你 normalizer 把上面的三阶段演透。重点不是「能跑」，是让读者一眼看到 raw input → tuple → final shape 这条转换链。
+阶段 1：形态分流      阶段 2：抽取/清洗      阶段 3：升级 + 优先级裁决
+  typeof               正则切尖括号          url/email → GitHub handle
+  Array.isArray        去协议噪声            GitHub 一票否决纯文本
+                       bugs.url 兜底         多 license 合 SPDX
+                                             多 funding 全保留
+```
+
+四个字段都遵循这个骨架，但每个字段在「阶段 3」的裁决规则不同：
+
+- **authors**：GitHub handle 一票否决纯文本；一个 handle 都没有时，从 `repository.org` 反推一个 inferred 作者
+- **repository**：去协议噪声（`git+`、`ssh://`、`git@`、`.git`、`github:` 前缀）；`repository` 整个缺失时从 `bugs.url` 砍 `/issues` 兜底
+- **license**：老式 `licenses[]` 数组合并成 `(A OR B)` SPDX 表达式，与新式单字符串走同一条 string 契约
+- **funding**：每个条目都解析为 `{ url, type, name, avatar }`，多 funding 全保留（不合并）
+
+关键不变量：**中间元组里永远只有 name/email/url**，不掺 GitHub handle / avatar 这种和具体平台绑定的信息——handle 和 avatar 是「升级阶段」才叠上去的。这种分层让抽取逻辑（切尖括号、切圆括号）可以独立复用；将来要支持 GitLab 也不必动抽取阶段。
+
+## 4. 关键权衡
+
+### 把「展示一致性」摆在「信息完整」前面
+
+`normalizePkgAuthors` 做了四个字段里最硬的产品取舍：**只要任意一个作者条目能解析出 GitHub handle，就只返回 GitHub 条目，其它纯文本作者整体丢弃**。
+
+- **选择**：GitHub handle 一票否决纯文本
+- **换来**：头像永远可点、永远有图。前端只要走「GitHub 条目」分支，就一定能拼出头像和链接，不会出现「有的包有头像、有的包只有名字」的不整齐
+- **代价**：冷门包（老 Cocos2D、学术界作者、不愿暴露 GitHub 的纯名字署名）的作者名会被静默丢掉，前端再也看不到
+
+背后的本质矛盾是**展示一致性 vs. 信息保真**：要 UI 整齐就得牺牲少数派的真实数据，要保真就得让前端处理「有的有图、有的没图」的多态。这层选了前者，并用一个 `inferred: true` 标志诚实标注哪些是反推出来的——给「想区分真作者 vs 猜的作者」的下游留个钩子。
+
+### 宁可推断也不要空白
+
+`repository` 字段缺失时，把 `bugs.url`（如果是 github.com 开头）砍掉 `/issues` 后缀当仓库链接。作者全是纯文本、没有任何 GitHub 关联时，从 `repository.org` 反推一个 GitHub 作者填上。
+
+- **选择**：跨字段推断（bugs → repo、repo.org → author）
+- **换来**：覆盖率最大化。很多老包只填了 bugs 没填 repo，或者只填了 repo 没填 author，仍能给前端一个能点的链接和一张能显示的头像
+- **代价**：推断结果不一定是事实。`bugs.url` 不一定等于仓库入口（有些项目的 issues 托管在第三方），`repository.org` 也不一定是作者本人（可能是组织）。`inferred: true` 标志是给这个代价兜底的诚实标记
+
+这里的本质矛盾是**覆盖率 vs. 准确率**：宁可给出一个「大概是对的」结果，也不要空白；但又要让下游知道这是猜的、不要把它当事实。所有推断分支都配上 `inferred` 这种「诚实标志」，是这个矛盾的通解骨架——在任何「宁可猜也不要空」的系统里（推荐系统冷启动、地址补全、姓名切分）都能认出来。
+
+### 协议噪声用一连串小 replace，不用一招吃天下
+
+repository URL 的清洗链是顺序敏感的 5+ 个 `replace`：先去 `github:` 前缀、去 `git@github.com:` 前缀；识别裸 `foo/bar` 补成完整 https URL；再去 `git+`、去 `.git` 后缀、把 `git://` 和 `ssh://` 改成 `https://`、把 `git@github.com` 改成 `github.com`。
+
+- **选择**：一长串顺序敏感的小正则 replace，而不是一招吃天下的大正则
+- **换来**：每条规则独立可读、能加注释；新协议写法只要插一条 replace 就能扩展
+- **代价**：规则之间有顺序依赖（先去 `github:` 前缀、才能用裸简写正则识别；先去 `.git` 后缀、保留的 protocol 才能用），新增 replace 时必须想清楚插在链中哪个位置；漏掉一种协议变体就只能再加一条 replace，没办法一次性兜底
+
+本质矛盾是**可读性 vs. 表达力**：把多条规则叠在一起 readable，但牺牲了「一个正则包打天下」的简洁。这种取舍在所有「协议/格式清洗」场景都会遇到——电话号国际化的多步归一、邮箱大小写/别名归一，都是同一副骨架。
+
+## 5. 最小原理演示
+
+下面这段演示只演透「多形态输入 → 中间元组 → 优先级合并」这三步，省略 funding 类型细分、SPDX 嵌套表达式、bugs 兜底等旁路：
 
 ```ts
-// ---- 阶段 1+2：复合字符串 → 中间元组（不掺平台语义）----
-type Raw = { name?: string; email?: string; url?: string }
+// 中间元组：只有 name/email/url，不掺平台信息
+type RawAuthor = { name?: string; email?: string; url?: string }
 
-function parseAuthorStr(s: string): Raw {
-  let rest = s
-  let email: string | undefined
-  let url: string | undefined
-  // 顺序敏感：先抠 <email>，再抠 (url)，剩下的当 name
-  // 为什么这个顺序？因为 email 不会含 ()，但 url 可能含 <>() 之外的各种字符
-  const em = rest.match(/<([^>]+)>/)
-  if (em) { email = em[1]!.trim(); rest = rest.replace(em[0], '') }
-  const um = rest.match(/\(([^)]+)\)/)
-  if (um) { url = um[1]!.trim(); rest = rest.replace(um[0], '') }
-  return { name: rest.trim() || undefined, email, url }
+// 升级后的窄类型：要么是 GitHub 身份、要么是纯文本
+type ParsedAuthor =
+  | { type: 'github'; github: string; inferred?: boolean }
+  | { type: 'text'; name: string; url?: string; email?: string }
+
+// 阶段 1+2：从字符串里抽出 name/email/url（写法与源码不同，演同一思想）
+function parseAuthor(s: string): RawAuthor {
+  const email = s.match(/<([^>]+)>/)?.[1]?.trim()
+  const url = s.match(/\(([^)]+)\)/)?.[1]?.trim()
+  const name = s.replace(/<[^>]+>/, '').replace(/\([^)]+\)/, '').trim() || undefined
+  return { name, email, url }
 }
 
-// ---- 阶段 3a：升级——把 url/email 升级成 GitHub handle ----
-const RE_GH_USER = /^(?:https?:\/\/)?(?:www\.)?github\.com\/([\w.-]+)\/?$/i
-function toHandle(raw: Raw): string | undefined {
+// 阶段 3a：尝试把中间元组升级成 GitHub handle
+function toHandle(raw: RawAuthor): string | undefined {
   if (raw.url) {
-    const m = raw.url.match(RE_GH_USER)
+    const m = raw.url.match(/^github\.com\/([\w.-]+)\/?$/i)
     if (m) return m[1]
   }
   return undefined
 }
 
-// ---- 阶段 3b：裁决——优先级合并出单一展示形态 ----
-type Final = { type: 'github'; github: string } | { type: 'text'; name?: string }
-
-function normalizeAuthor(input: string | Raw | (string | Raw)[]): Final[] {
-  const list = Array.isArray(input) ? input : [input]
-  const tuples = list.map(x => typeof x === 'string' ? parseAuthorStr(x) : x)
-
-  const githubs = tuples.map(toHandle).filter(Boolean) as string[]
-  if (githubs.length) {
-    // 权衡 1：只要能拿到 GitHub handle，纯文本作者整体丢弃
-    console.error(`[drop] 文本作者 "${tuples.map(t => t.name).join(', ')}" 被丢弃，因为找到了 handle: ${githubs.join(', ')}`)
-    return githubs.map(h => ({ type: 'github', github: h }))
+// 阶段 3b：GitHub handle 一票否决纯文本
+function normalizeAuthors(raws: RawAuthor[], orgFromRepo?: string): ParsedAuthor[] {
+  const parsed = raws.map(toParsed).filter(Boolean) as ParsedAuthor[]
+  const gh = parsed.filter(p => p.type === 'github')
+  if (gh.length) {
+    // 丢掉所有文本名，只留 GitHub 条目（演示「展示一致性 > 信息完整」）
+    const dropped = parsed.filter(p => p.type === 'text')
+    if (dropped.length)
+      console.error(`[normalize] 丢弃文本作者 ${dropped.map(d => `'${d.name}'`).join(', ')}，因为找到了 handle`)
+    return gh
   }
-  return tuples.map(t => ({ type: 'text', name: t.name }))
+  if (orgFromRepo)
+    return [{ type: 'github', github: orgFromRepo, inferred: true }]  // org 反推
+  return parsed
+
+  function toParsed(raw: RawAuthor): ParsedAuthor | undefined {
+    const handle = toHandle(raw)
+    if (handle) return { type: 'github', github: handle }
+    if (!raw.name) return undefined
+    return { type: 'text', name: raw.name, url: raw.url, email: raw.email }
+  }
 }
 
-// 跑一遍
-normalizeAuthor("Foo Bar <foo@bar.com> (https://github.com/foo)")
-// stderr: [drop] 文本作者 "Foo Bar" 被丢弃，因为找到了 handle: foo
-// => [{ type: 'github', github: 'foo' }]
+// 演一个具体输入
+const input = {
+  author: 'Foo Bar <foo@bar.com> (https://github.com/foo)',
+  repository: 'foo/bar',
+}
+const raw = parseAuthor(input.author)
+console.log(normalizeAuthors([raw], 'foo'))
+// stderr: [normalize] 丢弃文本作者 'Foo Bar'，因为找到了 handle
+// stdout: [{ type: 'github', github: 'foo' }]
 ```
 
-跑完这条用例，你立刻能看到「权衡 1」是怎么发生的：那条 stderr 日志就是丢弃现场。
+这段演示里，"Foo Bar" 这个看起来很正常的作者名最后被丢了——但前端拿到了一个能拼头像的稳定 handle。这就是「展示一致性 > 信息完整」那条权衡在代码里的具体落地。
 
-## 权衡 1：GitHub handle 一票否决纯文本作者（核心权衡）
+## 6. 执行轨迹
 
-这是本章最重要的一个决定，原文代码里写得很直白：
+拿一个具体输入走一遍三阶段。
 
-> 如果任意一个作者条目能解析出 GitHub handle，就**只**返回 GitHub 条目，纯文本条目整体丢弃。
+输入：
 
-**做了什么选择**：作者条目里只要有一个能拿到 GitHub handle，其它纯文本条目（哪怕里面写了真实的姓名）全部丢掉。
-
-**换来了什么**：前端头像永远可点、永远有图、永远是同一种结构。前端代码可以从「if 有头像 / else if 有名字 / else 啥也没有」简化成「直接渲染 `{type:'github'}`」，UI 一致性是质变级别的提升。
-
-**代价**：冷门包（学术界、老 Cocos2D、个人随手发的包）的作者如果只填了纯文本名字、没填 GitHub 链接，他们的名字会被**静默丢掉**，前端再也看不到。代码里用 `inferred: true` 这种诚实标志兜底，区分「真作者」和「猜的作者」，但纯文本丢就是真丢了——没有任何标记。
-
-**为什么是合理的**：从产品视角，展示一致性 > 信息保真。一个 UI 上「这个包是谁写的」如果一半有头像一半没头像，看起来就像坏掉了；而丢掉纯文本名字只影响那一小撮老包作者，且这些包通常也没人看。代码作者选择了「让 95% 的包看起来对」，而不是「让 100% 的包看起来参差」。
-
-## 权衡 2：宁可推断也不留空（bugs.url 兜底仓库 + org 兜底作者）
-
-**做了什么选择**：当 `repository` 字段缺失时，从 `bugs.url`（如果是 `https://github.com/` 开头）砍掉 `/issues` 后缀当作仓库链接；当所有作者都是纯文本（甚至连纯文本都没有）但能从 repository 字段切出 org 时，把 org 当作 inferred 作者返回。
-
-**换来了什么**：覆盖率最大化。很多老包只填了 `bugs` 没填 `repository`，按字面意思应该没仓库链接，但归一化层推断出来一个能点的链接——用户能跳到 GitHub 看 issue。
-
-**代价**：假设了「issues 入口 == 仓库入口」，绝大多数包成立，但极少数包（用 issue tracker 服务但代码托管在别处）会推断错。同时，inferred 的作者只是「猜的」，前端如果想区分「真作者」和「从 org 反推的作者」必须读 `inferred: true` 这个标志。
-
-**这个设计的诚实之处**：所有推断结果都用 `inferred: true` 显式标记，不假装是真的。换句话说，归一化层不撒谎——它说「我推断的，你看着办」。
-
-## 权衡 3：license 合并成 SPDX 字符串，funding 全部保留
-
-同一个章里出现了两种相反的处理方式，这不是不一致，是两种字段的语义不同。
-
-**license 的处理**：老式 `licenses: [{ type: "A" }, { type: "B" }]` 数组（npm 早期 legacy 字段）被合并成 `(A OR B)` 字符串，跟现代的单 `license: "MIT"` 走同一条 string 契约。
-
-**为什么合并**：许可证在语义上是「这个包的法律状态」，一个包**只能有一个法律状态**（哪怕它是「A 或 B 任选其一」）。所以合并成一个 SPDX 表达式是符合语义的。
-
-**代价**：下游拿到的字符串必须当 opaque 处理，不能假设它一定是单个 SPDX 标识符——可能是 `"MIT"`，也可能是 `"(MIT OR Apache-2.0)"`。前端展示徽章时不能拿它去查颜色映射表（如果查表只能查到第一个 token）。
-
-**funding 的处理完全相反**：`funding` 字段如果是数组，所有条目都被保留并各自解析，不合并。
-
-**为什么不合并**：funding 在语义上是「赞助渠道」，一个包**可以同时有多个并列渠道**（GitHub Sponsors + OpenCollective + Patreon），合并反而会丢信息。
-
-**说人话**：合不合并取决于「这字段在语义上是不是单值」。license 是单值（一个法律状态），所以合并；funding 是多值（多个渠道），所以全保留。这种「按字段语义决定合并策略」的设计很值得抄——别为了「统一」就一刀切。
-
-## 权衡 4：协议噪声容差靠一连串 replace
-
-repository URL 经过的清洗是这样的（顺序敏感）：
-
-```
-github:foo/bar          → foo/bar              (去 github: 前缀)
-git@github.com:foo/bar  → foo/bar              (去 ssh user@host: 前缀)
-foo/bar                 → https://github.com/foo/bar  (bare 简写识别)
-git+https://...         → https://...          (去 git+ 前缀)
-https://....git         → https://...          (去 .git 后缀)
-git://...               → https://...          (git 协议换 https)
-ssh://...               → https://...          (ssh 协议换 https)
+```ts
+{
+  author: 'Foo Bar <foo@bar.com> (https://github.com/foo)',
+  repository: 'github:foo/bar.git',
+  license: { type: 'MIT' },
+  funding: 'https://opencollective.com/foo',
+}
 ```
 
-**做了什么选择**：用一连串顺序敏感的 `replace` 清洗协议噪声，而不是写一个超级正则一次性匹掉所有情况。
+**阶段 1+2（形态分流 + 抽取）**：
 
-**换来了什么**：每条规则独立可读、可加注释，规则之间不互相干扰。最终输出的就是一个能直接喂给 `<a href>` 的干净 `https://` 链接。
+`author` 字符串按顺序切：
 
-**代价**：正则链是顺序敏感的——先去前缀再去后缀。如果你将来要支持一种新的协议写法（比如某种 ssh 变体），必须**再插一条 replace**，不能光靠现有规则覆盖。新插的位置也要小心：插错位置可能跟已有规则打架。
+- 先 `<([^>]+)>` 切出 `email = "foo@bar.com"`，剩下 `"Foo Bar  (https://github.com/foo)"`
+- 再 `\(([^)]+)\)` 切出 `url = "https://github.com/foo"`，剩下 `"Foo Bar "`
+- 剩下的 trim 当 `name = "Foo Bar"`
+- 中间元组：`{ name: 'Foo Bar', email: 'foo@bar.com', url: 'https://github.com/foo' }`
 
-**为什么这么选**：单一强大正则的可读性是噩梦（你试试写一个能同时匹 `git+ssh://git@github.com:foo/bar.git` 的正则），而且很难加注释解释每段在干嘛。replace 链虽然啰嗦，但每行都能用一句中文解释，调试时也能逐条注释掉看哪步出问题。
+`repository` 字符串走协议清洗链：
 
-## 心智模型回顾：5 步走完整套归一化
+- `github:foo/bar.git` → 去 `github:` 前缀 → `foo/bar.git`
+- 裸简写正则识别 → 补全为 `https://github.com/foo/bar.git`
+- 去 `.git` 后缀 → `https://github.com/foo/bar`
+- 从中切出 `org = "foo"`、`repoName = "bar"`
 
-把上面四个权衡串起来，整个归一化的执行轨迹是这样的：
+`license` 对象 → 取 `license.type = "MIT"`。
 
+`funding` 字符串 → 包成 `[{ url: 'https://opencollective.com/foo' }]`。
+
+**阶段 3（升级 + 裁决）**：
+
+- `author`：用 `github.com/<user>` 正则升级 url → handle = `"foo"`。因为拿到了 handle，整个作者条目变成 `{ type: 'github', github: 'foo' }`，文本名 "Foo Bar" **被丢弃**
+- `repository`：直接成 `{ url: 'https://github.com/foo/bar', org: 'foo', repoName: 'bar', repo: 'foo/bar' }`
+- `license`：直接成 `"MIT"`
+- `funding`：用 opencollective 正则匹配出 `name = "foo"`、`type = "opencollective"`，成 `[{ url, type, name, avatar }]`
+
+**最终输出**：
+
+```ts
+{
+  authors:    [{ type: 'github', github: 'foo' }],
+  repository: { url: 'https://github.com/foo/bar', org: 'foo', repoName: 'bar' },
+  license:    'MIT',
+  fundings:   [{ type: 'opencollective', name: 'foo', /* ... */ }],
+}
 ```
-[1] 形态分流          typeof + Array.isArray → 三条管道
-       ↓
-[2] 字符串拆解        复合串 "Name <email> (url)" → 抽出三段
-                    （顺序：先 email 再 url，避免误吞）
-       ↓
-[3] 平台身份升级      url/email 用正则升级成 GitHub handle
-                    （高维身份，能直接换头像）
-       ↓
-[4] 优先级裁决        作者：GitHub > 文本 > 仓库 org 推断
-                    许可证：合并成 SPDX 单字符串
-                    赞助：全保留，不合并
-                    仓库：用 bugs.url 兜底
-       ↓
-[5] 结构化输出        吐出统一的 Parsed* 窄类型
-                    （前端只认这些类型，不认原始 json）
-```
 
-输入是一个混乱的 `package.json`，输出是一份「字段确定、类型确定、可渲染」的结构。整套机制说白了就为了一个目标：**让下游永远不用 `if (typeof ...)`**。
+整条轨迹里最有意思的一步是 `author` 处理：输入里 "Foo Bar" 这个看起来很正常的作者名最后被丢了，因为系统能从 url 推出 GitHub handle `foo`，handle 比纯文本名「更值钱」。如果作者 url 不是 github.com，name 就会被保留为 `{ type: 'text', name: 'Foo Bar' }`。
 
-## 这层为什么必须独立成一章
+## 7. 教学简化说明
 
-很容易有人会问：这四个字段不就是几个 if 吗，为什么不写在渲染组件里就好？
+上面的演示故意省略了：
 
-因为这种归一化逻辑有一个特性：**它跟 UI 无关，但跟数据强相关**。同一个 `package.json`，不管是渲染成网页头像、还是塞进 CLI 表格、还是发给 LLM 当上下文，都需要这份归一化后的稳定结构。如果把它写在 Vue 组件里，CLI 拿不到；写在 CLI 里，网页拿不到。所以必须有一层**纯函数的、跟传输/渲染都无关的归一化关口**，谁需要谁来调。
+- GitHub sponsors / GitHub noreply 邮箱 / opencollective 等平台正则组（每接一个平台多一条正则）
+- 老式 `licenses[]` 数组合并 SPDX 表达式 `(A OR B)` 的分支
+- 头像走第三方代理服务（avatars.antfu.dev / opencollective 的 avatar.png）这个产品决策
+- `repository.directory` 字段拼成 `tree/HEAD/<directory>` 的 URL 约定
+- `bugs.url` 兜底仓库链接的分支
+- `funding.entry` 字段（`<type>@<name>` 格式，疑似用作去重 key）
 
-这层一旦写好，前端组件就再也不用关心「这个作者字段是字符串还是对象」——它只要调 `normalizePkgAuthors(json)`，拿到的永远是 `ParsedAuthor[]`。这是「翻译关口」存在的全部意义：**把混乱封在过去，把秩序递给未来**。
+这些都不影响「多形态 → 中间元组 → 优先级合并」的主线，是产品策略或边角补丁。
+
+## 8. 小结
+
+这一章做的是「翻译器」的活：把 package.json 三十年累积的多种合法写法压成前端能直接渲染的几种窄类型。技术本身平淡（四条正则、几个 replace），真正有意思的是产品视角的取舍——这层不假装能「忠实保留所有输入」，它明着选了「前端要什么」那一侧。
+
+下一章会把这一层的输出（authors/repository/license/fundings）连同体积、模块类型一起，喂给一个统一的 `resolvePackage` 流水线，把磁盘上一个包变成前端能直接渲染的可读节点。

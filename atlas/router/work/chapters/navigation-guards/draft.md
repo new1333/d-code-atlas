@@ -1,196 +1,292 @@
 # 导航守卫管线
 
-你刚在一个后台系统里点开「订单详情」，结果页面没跳，而是被弹回了登录页。这背后发生的事比看上去复杂：路由器要在跳转真正发生之前，先跑一圈"关卡"——有的关卡问"你登录了吗"，有的问"表单改了还没保存，确定要走吗"，有的甚至要异步去服务器查权限。关卡可能放行，也可能喊停，还可能说"别去那儿，去这儿"。这一圈关卡，就是**导航守卫管线**。
+> 本章属于 composite 层。前置：路由匹配表：从配置到 matched 链、导航失败的语义化分类。
+> 学完你能：把风格各异的导航钩子统一成「一个返回 Promise 的函数」，并讲清「放行是 resolve、拒绝和重定向都是带种类的 reject」这条统一控制流换来什么、代价是什么。
 
-## 这一圈关卡，到底难在哪
+## 1. 为什么需要它（设计动机）
 
-把"这次跳转该不该放行"这件事拆开看，你会发现它同时顶着五个互相打架的要求：
+上一章把路由配置编译成匹配表，导航一来就沿 parent 链反推出 to / from 两条 matched 链。但 matched 链只是「该渲染哪些组件」的答案，「这次跳转到底该不该放行」还没有着落——这正是本章的入口。
 
-- **要异步**：鉴权、预拉数据都得等网络，关卡不能是同步函数。
-- **能被取消**：你刚发起跳转、关卡跑到一半，用户又点了另一个链接——前一次跳转必须作废。
-- **能重定向**：关卡不仅要能说"不许去"，还得能说"改去登录页"。
-- **多个时机**：使用者想在「离开前、进入前、已经确认」几个不同节点插钩子。
-- **两套 API**：社区里同时存在"返回值式"新写法和"回调式"旧写法，得让同一条管线都认。
+想象一下：你在写一个后台管理系统。进 `/admin` 前要先去后端拿用户角色；编辑表单页要离开时弹窗「未保存，确认走？」；登录失效的请求要把用户甩去 `/login`。这些判断散得到处都是——组件里手写离开确认、全局手写鉴权拦截、各自又要支持异步。
 
-这五件事缺一个，都拼不出一个能用的守卫系统。本章要讲的就是 vue-router 怎么用一个统一的设计，把这五件事一起兜住。
+把这些诉求合起来，守卫管线必须同时扛住五件事：
 
-先交代两个地基，本章直接拿来用、不重复展开：这次跳转的起点和终点各对应一条 **matched 记录链**（它怎么从路由配置编译而来，是第 6 章的主题）；关卡喊"停"时产出的那个**失败值**，是个带种类标记、能被上层精确查询的东西（这件事是第 4 章的主题）。本章只看守卫这一侧怎么用它们。
+- **异步**：鉴权、预拉数据都是异步的，守卫不能假设它能同步返回；
+- **可取消**：守卫还在等网络时，用户又点了一次跳转，前一次必须能作废；
+- **可重定向**：登录失效就要换目的地，但「换目的地」本质是「启动一次新导航」，控制流跟「报错」完全不同；
+- **多时机**：钩子要能挂在「离开前 / 进入前 / 已确认」三个不同时机；
+- **双 API**：社区里既有回调式（`next(false)`），也有返回值式（`return false`），同一套管线要无缝兼容。
 
-## 第一步：把"从哪来 / 去哪"切成离开、更新、进入三组
+少任何一件事，守卫都拼不成可用。本章要做的，就是给这五件事一个统一的执行单元和一条统一的控制流。
 
-想象你把这次跳转的起点和终点摊在桌上：起点是一条 matched 记录链，终点也是一条。这两条链里有些记录是同一个（对象引用相等），有些只在起点出现，有些只在终点出现。
+## 2. 核心思想
 
-按"记录的引用是否相等"挨个比对，两条链就被切成三堆：
+把每一个风格各异的导航钩子，统一适配成「一个返回 Promise 的函数」；钩子的三种意图——放行、拒绝、重定向——分别对应这个 Promise 的 resolve、带「中止」种类的 reject、带「重定向」种类的 reject。
 
-- 两边都有的 → **更新**（updating）：组件还在，只是参数变了，跑 `beforeRouteUpdate`
-- 只在旧链的 → **离开**（leaving）：跑 `beforeRouteLeave`
-- 只在新链的 → **进入**（entering）：跑 `beforeRouteEnter` / `beforeEnter`
+整条管线就是一条按固定顺序串起来的 Promise 链：前一个 resolve 才跑下一个，任一 reject 立刻短路。Promise 链天然提供了「顺序 + 异步 + 短路」，前置章已经建好的失败语义化分类机制刚好提供了「带种类的 reject」——两个机制一拼，就是守卫管线的全部骨架。
 
-这里有个容易被忽略的不对称：**离开是子路由先于父路由**（旧链要先 reverse 一下），因为子组件嵌在父组件里面，卸载得从里往外拆；而进入是父先于子，跟挂载顺序一致。
+## 3. 心智模型
 
-比对靠的是记录对象本身的引用相等（遇到别名，会先折回它指向的那个原始记录再比），不比较路径字符串。这也解释了第 6 章为什么要把 matched 链做成"具体的记录对象引用"——到了守卫这一层，比对只剩一次引用比较，几乎零成本。
+钩子入队前的预备工作，是把 to / from 两条 matched 链按记录引用相等（别名归一）切成三组：
 
-## 第二步：把任意风格的守卫，统一成一个返回 Promise 的函数
+```
+from.matched = [用户列表, 用户详情]
+to.matched   = [登录]
 
-关卡写法千差万别：有人写同步、有人写 async、有人返回 false、有人调 `next(false)`、有人 `next` 一个新地址。管线想统一调度它们，第一步就是**把每一个守卫都包成一个 `() => Promise<void>`**。
+按记录引用相等比对：
+  用户列表：to 里没有 → leaving
+  用户详情：to 里没有 → leaving
+  登录：    from 里没有 → entering
 
-这个适配器内部干两件事。
+leavingRecords  = [用户列表, 用户详情]
+updatingRecords = []
+enteringRecords = [登录]
+```
 
-**第一件，准备一个"继续回调" `next`，把它当成守卫和管线之间的翻译官。** 守卫不管用哪种写法，最终表达的意图就三种：放行、拒绝、重定向。适配器让 `next` 按入参把这三种意图翻译成 Promise 的对应动作：
+为什么要切三组？因为同一条记录上可能挂着三种不同时机的钩子（`beforeRouteLeave` / `beforeRouteUpdate` / `beforeRouteEnter`），只有先知道这条记录是「要走」「要留」还是「要来」，才能判断该跑它身上的哪个钩子。
 
-- `next(false)` 或返回 `false` → reject 一个**中止**种类的失败值（"我不许你过去"）
-- `next(某个错误)` 或抛错 → reject 那个错误本身
-- `next(一个目标地址)` → reject 一个**重定向**种类的失败值（"别去那儿，去这儿"）
-- `next()` / `next(true)` / 什么都不做 → resolve（"放行"）
+接着按固定顺序把每组里的钩子串成队列：
 
-这里有个值得停下来想的问题：**为什么"重定向"也要走 reject？** 重定向明明是个正常控制流（转去启动一次新导航），不是出错。原因是——它和"拒绝"一样，都意味着"当前这条导航到此为止、别再往下跑了"。让它走 reject，整条管线就能用同一套"任一 reject 立刻短路"的逻辑，不用为重定向单开一条控制流。代价是：得为重定向单设一种失败种类，免得它和真报错混在一起，让上层分不清"是真出错了"还是"只是要换个目的地"。
+```
+leaving.reverse() 的 beforeRouteLeave   ← 子先于父离开
+→ 各记录的 leaveGuards（组合式注册）
+→ 全局 beforeEach
+→ updatingRecords 的 beforeRouteUpdate + 各记录 updateGuards
+→ enteringRecords 的 beforeEnter（路由级）
+→ enteringRecords 的 beforeRouteEnter
+→ 全局 beforeResolve
+```
 
-至于那个"带种类的失败值"长什么样、为什么能被上层按位查询、为什么能跨 realm——那是第 4 章已经搭好的地基。本章只负责一件事：**把守卫这一侧的三种意图，准确地投递成对应种类的失败值**，好让上层一个 catch 就能区分它们。
+每一段都把队列里的钩子 reduce 成一条顺序 Promise 链：前一个 resolve 才跑下一个，任一 reject 整段短路。段与段之间夹着「取消检查」（属下一章 Router 主循环的事），用来让新导航作废旧导航。
 
-**第二件，决定守卫的返回值要不要自动喂给 `next`。** 这就引出下一个话题。
+整个管线的入参只是 to / from 两条 matched 链；产物是一个 Promise——resolve 就是放行，reject 就是带种类的失败（中止 / 取消 / 重定向 / 报错）。
 
-## 第三步：靠"函数形参数量"认出你用的是新写法还是旧写法
+## 4. 关键权衡
 
-vue-router 同时支持两套写守卫的 API：
+### 用形参数量在两套 API 之间切换
+
+社区里同时存在两套写法：
 
 ```ts
-// 旧写法：回调式，签名固定 (to, from, next)
-beforeRouteLeave(to, from, next) {
-  if (要拦) next(false)
+// 旧回调式：声明三个形参，使用者自己在函数体里调 next
+router.beforeEach((to, from, next) => {
+  if (!isLogin) next(false)
   else next()
-}
+})
 
-// 新写法：返回值式，签名只有 (to, from)
-beforeRouteLeave(to, from) {
-  if (要拦) return false
-  // 什么都不 return 就等于放行
-}
+// 新返回值式：声明两个形参，直接 return
+router.beforeEach((to, from) => {
+  if (!isLogin) return false
+})
 ```
 
-两套 API 要共用同一条管线，怎么在运行时分？答案是看函数声明的**形参数量**（`Function.length`）：旧写法声明了三个参数 `(to, from, next)`，新写法只有两个 `(to, from)`。于是适配器只需一个判断：
+让两套 API 走两条不同的执行路径，整个管线就要分叉维护。这里选了一个看似 hack 的判据：**用函数声明的形参数量（`guard.length`）是否小于 3 来区分**。旧签名固定三参 `(to, from, next)`，length ≥ 3；新签名只用 `(to, from)`，length < 3。切到 `length < 3` 时，把钩子的返回值 `.then(next)` 自动喂给继续回调；否则什么都不做，等使用者自己调 next：
 
 ```ts
-const ret = guard(to, from, next)
-let call = Promise.resolve(ret)
-if (guard.length < 3) call = call.then(next) // 新写法：把返回值喂给 next 翻译
-// 旧写法：next 交给使用者，由他们在函数体里自己调
+let guardCall = Promise.resolve(guardReturn)
+if (guard.length < 3) guardCall = guardCall.then(next)
 ```
 
-新写法时，守卫的返回值（可能是 `false`、一个地址、一个 Promise）会被自动喂给 `next` 翻译；旧写法时，适配器把 `next` 递给使用者，由他们自己调。两条分支，靠一个 `length < 3` 自动切换，使用者零迁移成本。
+换来的是：两套 API 共用同一条执行管线、对使用者零迁移成本——一份守卫代码用新写法也好、旧写法也好，跑的都是同一个适配器。
 
-## 第四步：用 reduce 把一队守卫串成一条顺序链
-
-单个守卫已经是个 `() => Promise<void>` 了，一队守卫怎么排着队跑？答案朴素得有点意外——**一个 reduce**：
+代价是：判定依赖 `Function.length` 这个隐式契约。`length` 反映的是第一个有默认值之前的形参数量，默认参数、剩余参数、解构都会扰动它：
 
 ```ts
-function runGuardQueue(guards) {
-  return guards.reduce(
-    (chain, g) => chain.then(() => g()),
-    Promise.resolve()
-  )
+const g1 = (to, from, next = () => {}) => {} // length=2，被误判为新 API
+const g2 = (...args) => {}                    // length=0，被误判为新 API
+```
+
+文档要专门提醒使用者「不要给旧式守卫加默认参数」。这是为「零迁移兼容」付出的契约维护成本。
+
+**本质矛盾**：API 在演进，但已有的使用者代码不能动。库作者没法让历史代码自己升级签名，于是借 `Function.length` 这个本就存在的语言特性作隐式契约，把「版本切换」这件事从配置项挪到函数声明里。读者带走的是：当一个库要兼容多套 API、又不想让使用者感知版本号时，「在语言层面找一个稳定的隐式信号」比「加配置项」更轻。
+
+### 把拒绝和重定向都收编进带种类的 reject
+
+继续回调是整条管线的翻译中枢。它的入参有四种可能：
+
+| 使用者写法 | 入参 | 翻译成 |
+|---|---|---|
+| `next(false)` | 布尔 false | reject(中止种类) |
+| `next(Error)` | Error 实例 | reject(这个错误) |
+| `next('/login')` | 路由位置 | reject(重定向种类) |
+| `next()` / `next(true)` | 其它 | resolve |
+
+为什么「重定向」这种本质是「转去启动新导航」的正常控制流，也要走 reject？
+
+如果走 resolve，链就会继续往下跑——可既然要重定向了，当前这条导航就该终止，不该再跑后面的进入钩子。**只有 reject 才能立刻短路整条链**。又因为重定向和「真的报错」控制流相似（都要终止当前导航）、但语义完全不同（重定向要启动新导航，报错不要），所以必须为它单设一种失败种类：
+
+```ts
+const next = (valid) => {
+  if (valid === false)
+    reject(createFailure(FailureType.aborted, { from, to }))
+  else if (valid instanceof Error) reject(valid)
+  else if (isRouteLocation(valid))
+    reject(createFailure(FailureType.redirect, { from: to, to: valid }))
+  else resolve()
 }
 ```
 
-把它想象成一条流水线（这是本章唯一一个比方）：每个工位是一个守卫，前一个工位盖了"放行"章（resolve），下一个工位才开始干活；任何一个工位喊"停"（reject），整条线立刻停，后面的工位碰都不用碰。这正是 reject 的短路特性白送的——不用写任何"如果前面失败就跳过后面"的判断，Promise 链自己就会停。
+换来的是：上层只需一个 catch 就拿到结构化失败原因，且与顺序链天然契合（一个 reject 立刻短路）。失败种类的表示复用了前置章「导航失败的语义化分类」，本章不必自己造一套。
 
-完整的守卫顺序是固定的：
+代价是：「重定向」得借 reject 表达，听起来违反直觉——它明明是正常控制流。这是为「让 reject 同时承担中止 + 重定向两种终止」付出的语义代价：必须有可靠的失败种类机制兜底，否则重定向会和真报错混在一起。
 
-```
-离开 beforeRouteLeave → 全局 beforeEach → 更新 beforeRouteUpdate
-→ 路由级 beforeEnter → 组件 beforeRouteEnter → 全局 beforeResolve
-```
+**本质矛盾**：控制流要统一（一条链、一种短路机制），但失败语义要精确（中止 / 取消 / 重定向 / 报错各不相同）。读者带走的是：当一套异步管线既要支持「正常终止」（重定向）又要支持「异常终止」（报错）时，把它们都收进 reject、再用「种类」区分，比给正常控制流单开一条旁路更简洁——旁路一多，链就断了。
 
-每一段都是这样一条 reduce 出来的链，段与段之间还会插"取消检查"（一旦发现有了更新的导航，整条管线作废）。这些段的**拼接**和取消检查由更上层的导航主循环负责，本章交付的是组成它的零件：切三组、适配器、顺序链。
+### 在导航期提前拉懒加载 chunk 并原地替换记录
 
-## 原理演示
-
-把上面四步合起来，下面这个几十行的程序就能演透守卫管线的核心。它故意省略了懒加载、keep-alive、组件就绪回放等细节，只聚焦"切三组 + 适配器 + 形参判别 + 顺序链 + 任一 reject 短路"。用 `tsx`/`bun` 直接跑即可：
+路由组件普遍写成工厂函数：
 
 ```ts
-// ---- 失败种类（只演示守卫会产出的两种；真实的可恢复设计见第 4 章）----
-const FAIL = { ABORTED: 'ABORTED', REDIRECT: 'REDIRECT' } as const
+const routes = [
+  { path: '/admin', component: () => import('./Admin.vue') }
+]
+```
 
-// ---- 把任意风格的守卫包成 () => Promise<void> ----
-function guardToPromise(guard: any, to: any, from: any): () => Promise<void> {
-  return () =>
-    new Promise<void>((resolve, reject) => {
-      // 「继续回调」：三种意图 → resolve / 带种类的 reject
-      const next = (valid?: any) => {
-        if (valid === false) reject({ kind: FAIL.ABORTED, from, to })
-        else if (valid instanceof Error) reject(valid)
-        else if (valid && typeof valid === 'object' && 'path' in valid)
-          reject({ kind: FAIL.REDIRECT, from: to, to: valid })
-        else resolve()
-      }
-      const ret = guard(to, from, next)
-      let call = Promise.resolve(ret)
-      if (guard.length < 3) call = call.then(next) // 形参数量判 API
-      call.catch(reject)
-    })
+按惯性，组件 chunk 该等渲染时再拉。但守卫管线已经在跑异步钩子了——它本来就在等网络。顺势在这里把组件 chunk 也拉了，渲染时直接命中已解析对象，零额外等待。
+
+具体做法是：抽取组件守卫这一步，对工厂函数式组件立即调用触发 chunk 请求，解析后原地写回它所属的记录：
+
+```ts
+guards.push(() => componentPromise.then(resolved => {
+  const comp = isESModule(resolved) ? resolved.default : resolved
+  record.mods[name] = resolved              // 给 data-loaders 等插件用
+  record.components[name] = comp            // 原地替换：下次直接命中
+  const guard = (comp.__vccOpts || comp)[guardType]
+  return guard && guardToPromiseFn(guard, ...)()
+}))
+```
+
+换来的是：导航走完时组件已就绪、渲染零额外等待；首次解析后记录被原地替换成已解析对象，后续导航直接命中，**全生命周期只请求一次 chunk**。
+
+代价是：导航管线与模块加载耦合——加载失败要被翻译成可读错误；记录在导航期会被 mutating（任何并发读到这条记录的代码都要假设它的 components 字段会变）；DEV 模式下还要校验 `import()` 没被误写成 `() => import()`。
+
+**本质矛盾**：渲染必须等组件就绪（串行），但 chunk 请求本可以更早发出（并行）。读者带走的是：当管线里已经有一段在等异步（守卫等网络），那么这段时间里能并行启动的工作都应该顺手启动——把「拉取」与「等待」重叠，而不是把拉取留到下一段串行等待时才开始。
+
+### 让组合式守卫与组件生命周期绑定
+
+`onBeforeRouteLeave` / `onBeforeRouteUpdate` 让任意组件（不限路由组件）都能挂守卫。怎么把守卫挂到「正确的记录」上？答案是 `inject(matchedRouteKey)`——组件渲染时，RouterView 会向它注入「你现在所属的匹配记录」，组件内的组合式 API 就把守卫加入该记录的 leaveGuards / updateGuards Set。
+
+注册和注销绑到组件生命周期：`onMounted` 加入、`onUnmounted` 移除、keep-alive 的 `onActivated` 重新加入、`onDeactivated` 移除。
+
+换来的是：不限路由组件、任意组件都能挂守卫，且随组件存活自动清理，不用使用者手动卸钩。
+
+代价是：必须专门处理 keep-alive——同一组件实例可能被复用到不同路由上。重新激活时不能直接复用旧记录引用，必须重新读当前的 `activeRecordRef.value`，否则会把守卫挂到上一条记录上。
+
+**本质矛盾**：守卫在概念上属于某条记录，但组件实例属于它自己（可能被 keep-alive 复用到多条记录）。读者带走的是：当一套 API 要让副作用「跟数据走」而不是「跟实例走」时，不能假设实例与数据是一对一的——必须为「实例会被复用到不同数据」单设一条重激活路径。
+
+## 5. 最小原理演示
+
+下面这个几十行的适配器，演透三件事：① 用 `length < 3` 在两套 API 之间切换；② 继续回调把四种入参翻译成 resolve / 带种类的 reject；③ 把一组守卫 reduce 成顺序链、任一 reject 短路。完整工程还有更多东西（懒加载替换、keep-alive 重激活、DEV 警告、组件就绪回收集），都在「教学简化」里省略。
+
+```ts
+// 失败种类：复用前置章「导航失败的语义化分类」的位标志 + 工厂
+const FailureType = {
+  aborted: Symbol('aborted'),
+  redirect: Symbol('redirect'),
+  error: Symbol('error'),
+} as const
+
+function createFailure(type: symbol, payload: any) {
+  return { type, ...payload }
 }
 
-// ---- 一队守卫 reduce 成顺序链，任一 reject 短路 ----
+function isRouteLocation(x: any) {
+  return typeof x === 'string' || (x && typeof x.path === 'string')
+}
+
+// 把任意风格的守卫适配成 () => Promise<void>
+function guardToPromiseFn(guard: Function, to: any, from: any) {
+  return () => new Promise<void>((resolve, reject) => {
+    // 继续回调：守卫意图的翻译中枢
+    const next = (valid?: any) => {
+      if (valid === false)
+        reject(createFailure(FailureType.aborted, { from, to }))
+      else if (valid instanceof Error)
+        reject(createFailure(FailureType.error, { cause: valid }))
+      else if (isRouteLocation(valid))
+        reject(createFailure(FailureType.redirect, { from: to, to: valid }))
+      else resolve() // true / undefined / 函数都视作放行
+    }
+
+    // 调一次守卫：旧 API 自己调 next，新 API 由我们把返回值喂给 next
+    const guardReturn = guard(to, from, next)
+    let guardCall = Promise.resolve(guardReturn)
+    if (guard.length < 3) guardCall = guardCall.then(next)
+    guardCall.catch(reject)
+  })
+}
+
+// 把一组守卫 reduce 成顺序链：前一个 resolve 才跑下一个，任一 reject 短路
 function runGuardQueue(guards: Array<() => Promise<void>>) {
-  return guards.reduce((chain, g) => chain.then(() => g()), Promise.resolve())
+  return guards.reduce((p, g) => p.then(() => g()), Promise.resolve())
 }
 
-// ---- 凭引用相等切离开/更新/进入三组 ----
-function extractChangingRecords(to: any, from: any) {
-  const leaving: any[] = [], updating: any[] = [], entering: any[] = []
-  const len = Math.max(from.matched.length, to.matched.length)
-  for (let i = 0; i < len; i++) {
-    const rf = from.matched[i]
-    if (rf) to.matched.includes(rf) ? updating.push(rf) : leaving.push(rf)
-    const rt = to.matched[i]
-    if (rt && !from.matched.includes(rt)) entering.push(rt)
-  }
-  return { leaving, updating, entering }
-}
+// 跑一遍：length 如何决定走哪条 API 分支
+const newApiGuard = (to: any, from: any) => false           // length=2，新 API
+const oldApiGuard = (to: any, from: any, next: Function) => // length=3，旧 API
+  setTimeout(() => next(), 100)
+
+guardToPromiseFn(newApiGuard, { path: '/b' }, { path: '/a' })()
+  .catch(f => console.log(f.type))   // aborted
+guardToPromiseFn(oldApiGuard, { path: '/b' }, { path: '/a' })()
+  .then(() => console.log('放行'))    // 100ms 后：放行
+
+// 整条链：第二段被中止，第三段根本不会跑
+runGuardQueue([
+  guardToPromiseFn(() => {}, { path: '/b' }, { path: '/a' }),
+  guardToPromiseFn(newApiGuard, { path: '/b' }, { path: '/a' }),
+  guardToPromiseFn(() => console.log('跑到我了'), { path: '/b' }, { path: '/a' }),
+]).catch(f => console.log('链短路：', f.type)) // 链短路：aborted
 ```
 
-跑一条轨迹：从 `/users/123`（matched = `[列表, 详情]`）跳 `/login`（matched = `[登录]`），详情上有个离开钩子返回 `false`。
+## 6. 执行轨迹
 
-```ts
-const listRec   = { beforeRouteLeave: () => {} }    // 列表：放行
-const detailRec = { beforeRouteLeave: () => false } // 详情：要拦
-const loginRec  = {}
+输入：从 `/users/123`（matched 链 = `[用户列表, 用户详情]`）跳到 `/login`（matched 链 = `[登录]`）。用户详情上有一个 `beforeRouteLeave` 返回 `false`。
 
-const from = { matched: [listRec, detailRec] }
-const to   = { matched: [loginRec] }
+**切分三组**：
 
-const { leaving } = extractChangingRecords(to, from)
-// → [listRec, detailRec]，reverse 后 → [detailRec, listRec]（子先于父离开）
+```
+from.matched = [用户列表, 用户详情]
+to.matched   = [登录]
 
-const queue = leaving
-  .reverse()
-  .map(rec => guardToPromise(rec.beforeRouteLeave, to, from))
+逐项按引用相等比对：
+  用户列表：to 里没有 → leaving
+  用户详情：to 里没有 → leaving
+  登录：    from 里没有 → entering
 
-runGuardQueue(queue).catch(fail => console.log('导航结束：', fail.kind))
-// detailRec 的离开钩子返回 false → next(false) → reject({kind: ABORTED})
-// → 链短路 → 打印：导航结束：ABORTED
-// 全局 beforeEach 那一段根本没机会跑
+leavingRecords  = [用户列表, 用户详情]
+updatingRecords = []
+enteringRecords = [登录]
 ```
 
-这条轨迹说明了一件事：**只要离开组里有一个钩子说"不"，整条管线当场短路**，后面那些全局前置、进入钩子碰都不会碰。这正是顺序链 + reject 短路带来的强保证。
+**离开组逆序**：`leavingRecords.reverse()` 得到 `[用户详情, 用户列表]`——子路由先于父路由离开（与挂载顺序相反）。
 
-## 关键权衡
+**抽取守卫入队**：用户详情上挂着 `beforeRouteLeave`，被收进待执行队列。
 
-上面那些机制，每一条背后都有个"为什么这么设计"的故事。
+**跑队列**：
 
-**权衡一：用形参数量判 API。** 选了"看 `guard.length < 3`"这条路 → 换来两套 API 共用同一条管线、使用者零迁移成本，旧项目不重写一个钩子就能继续跑 → 代价是判定依赖 `length` 这个隐式契约：默认参数、剩余参数（`...args`）、解构都会扰动它，而且旧 API 那条"带 next 回调"的分支写起来更绕。说人话就是——它把"区分两套写法"这件本该显式声明的事，悄悄藏进了函数签名里，省了你一个配置项，但埋了个"别在守卫参数里用 `...args`"的隐性约束。
+```
+用户详情的 beforeRouteLeave 被调：
+  返回 false
+  → 继续回调走 false 分支
+  → reject(createFailure(aborted, { from, to }))
+  → Promise 链立刻短路
 
-**权衡二：三种意图统一编码成 resolve / 带种类的 reject。** 选了"放行是 resolve、拒绝和重定向是带不同种类的 reject" → 换来上层只需一个 catch 就能拿到结构化的失败原因，且和顺序链天然契合（一个 reject 立刻短路）→ 代价是"重定向"这种本质正常的控制流也得借 reject 来表达，必须为它单设一种失败种类，否则会和真报错混在一起。这是把"控制流"和"错误"塞进同一个通道换来的简洁——好处是管线只有 resolve / reject 两种走向，坏处是第一次看到"重定向居然是 reject"的人会有点反直觉。
+整条链以 aborted 失败终止。
+```
 
-**权衡三：导航期提前拉懒加载 chunk，并原地替换记录。** 组件常常写成 `() => import('./Detail.vue')` 这种懒加载工厂。选了"在抽取组件守卫这一步、立刻调用工厂触发 chunk 请求，解析后把组件原地写回它所属的记录" → 换来导航走完时组件已经就绪、渲染零额外等待，而且首次解析后，后续导航直接命中那个已被替换的对象（整个生命周期只请求一次 chunk）→ 代价是导航管线和模块加载耦合了：加载失败得被翻译成可读错误，而且记录在导航期间会被改动。一个直观的画面：原本记录里放的是一张"提货单"，导航一开始我们就去把货取来，直接把提货单换成真货——下次再来，看到的就是真货本身。这个机制还有个副作用好处：到了全局 `beforeResolve` 那一段，所有组件保证都已解析完毕，不会再有 `() => Promise` 残留。
+**输出**：导航以「被守卫中止」失败终止。用户列表的 `beforeRouteLeave` 根本不会被调到（链已经短路）；全局 beforeEach、登录页的 beforeEnter 也都不会跑。上层一个 catch 就能凭 `failure.type === aborted` 区分出这是「被守卫拦下」，而不是报错或重定向——这是前置章「失败语义化分类」换来的精确语义。
 
-**权衡四：组合式守卫和组件生命周期绑死。** `onBeforeRouteLeave` / `onBeforeRouteUpdate` 让你在任意组件（不限于路由组件）里注册守卫。选了"通过 inject 拿到当前所属的匹配记录，把守卫的注册 / 注销绑到组件的挂载、卸载、keep-alive 激活 / 停用" → 换来不限位置、任意组件都能挂守卫，且随组件存活自动清理、不会内存泄漏 → 代价是得专门处理 keep-alive 的边界：同一个组件实例可能被缓存复用到不同路由（没卸载），所以重新激活时不能想当然地还认旧记录，必须重新核对"我现在到底属于哪条记录"。换句话说，这个设计把守卫的存活权交给了组件，省了手动注销，但为 keep-alive 这个复用场景多打了一份补丁。
+如果把用户详情上挂的钩子换成 `return '/login'`，同样的链路会 reject 一种 `redirect` 种类的失败，上层凭种类识别后启动一次新导航去 `/login`——这就是「重定向借 reject 表达」的实际走法。
 
-这四条权衡合起来，回答了本章开头那个问题：异步、可取消、可重定向、多时机、双 API 这五件互相打架的事，是怎么被一套统一设计兜住的——靠的就是"统一成 Promise + 顺序链短路 + 失败语义化"这三板斧。
+## 7. 教学简化说明
 
-## 小结
+本章演示故意省略了：懒加载组件 chunk 的拉取与原地替换（守卫管线里那段 `componentPromise.then(...)`）、keep-alive 重激活时重新读 `activeRecordRef.value`、DEV-only 弃用警告与「继续回调被调两次」守护、组件就绪回调（`next(vm => ...)`）的按名收集与陈旧导航门禁、effect scope 上下文透传（`runWithContext`）、五守卫段之间的「取消检查」与完整全排序。
 
-导航守卫管线的核心，可以浓缩成一句话：**把每个守卫适配成一个返回 Promise 的函数，用一条 reduce 串起来的顺序链跑它们，守卫的放行 / 拒绝 / 重定向三种意图，分别对应这条链上 Promise 的 resolve 和带不同种类的 reject。** 切三组、形参判 API、顺序链短路，都是为这套统一模型服务的零件。
+完整全排序（哪段先哪段后、段与段之间夹取消检查）属下一章 `navigate()` 的事；本章只演透「单段内一个守卫怎么被适配、整段怎么串成链」。
 
-值得再强调的是，本章交付的是**零件**：切分函数、适配器、顺序链。真正把这些零件按完整顺序拼起来、并在每一段之间插上"取消检查"的，是更上层的导航主循环——那是后面的事。
+## 8. 小结
 
-如果导航成功放行了，紧接着有个用户体验上的小细节要处理：新页面渲染后，滚动条该停在哪？是回到顶部，还是恢复你上次离开这个页面时的位置？这就是紧邻下一章「滚动位置恢复」要解决的问题——它会把"滚动可见性"和"导航生命周期"绑在一起，而不是和数据到达的时刻绑在一起。
+守卫管线的骨架只有三步：把任意风格的钩子统一成 Promise 工厂、把意图翻译成 resolve / 带种类的 reject、reduce 成顺序链。Promise 链天然给了「顺序 + 异步 + 短路」，前置章的失败语义化分类给了「带种类的 reject」——两个机制一拼，五件事（异步、可取消、可重定向、多时机、双 API）就一次扛下了。
+
+下一章会从「位置恢复」这个侧面再看一次导航生命周期：滚动位置为什么不能在数据到达时就应用、为什么必须等到 nextTick 之后且校验过 `to === currentRoute.value` 才动手。

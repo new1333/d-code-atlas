@@ -1,249 +1,262 @@
 # YoutubeDL 编排器：贯穿各阶段的 info_dict 主管线
 
-你给一个链接，它可能直接就是一个视频；也可能是一个播放列表；而播放列表里的某个条目，压根不是视频，只是一个"请你去这个新地址再解析一次"的中间跳板。你还要一次下多个格式、裁好几段、下完自动转码嵌字幕。
+> 本章属于 system 层。前置：info_dict 数据总线与提取器骨架、协议字段驱动的下载策略分派、声明式后处理流水线与链式 info 变换、格式选择 DSL、输出模板引擎、可插拔传输层、统一 cookiejar。
+> 学完你能：用一句话说清"为什么 yt-dlp 把整条下载流水线收束成一个胖协调器，换来了什么、付出了什么"。
 
-换你写这个程序，这几层嵌套的"解析 → 选格式 → 下载 → 后处理"会怎么组织？最直觉的做法是让每一步自己往下调下一步——解析完自己选格式，选完自己开下载，下完自己跑后处理。可一旦嵌套深一点、插件多一点，这种"互相直接调"很快就会变成一团状态乱飞、谁也插不进去的代码。
+## 1. 为什么需要它
 
-这一章讲的，就是把这条完整流水线拢成一个对象来管的那层设计。前面几章你已经见过各个零件：提取器怎么抓、格式选择 DSL 怎么选、下载器怎么按协议分派、后处理链怎么拼。这一章要看的是：**谁把这些零件按什么顺序串起来、用什么数据把它们缝成一条线。**
+上一章把登录态从浏览器密钥环里解密出来，收束到一个统一的 cookiejar——登录态这件事办成了。再往前几章，格式选择被压成 DSL、后处理拼成声明式链、下载器按协议字段自己分派、请求引擎按能力竞争上岗。每一块都已经能独立工作，但它们之间还差一个"指挥"——本章讲的就是把这条完整流水线收束成一个对象的那层设计。
 
-## 为什么需要一个"协调器"
+想象你给了 yt-dlp 一个 URL。这个 URL 可能直接指向一个视频；可能是一个播放列表，里面每条又是另一个 URL；列表里某个条目可能是一个嵌入页，得再跟进一次才能拿到真视频。用户还要同时下视频和音频两种格式、裁两段时间段、下完合并再嵌字幕、转码、写元数据。
 
-先把前面几章的零件摆出来看：提取器是可插拔的（注册表里挂一堆）、下载器是可插拔的（按协议选一个）、后处理器也是可插拔的（用户在命令行配一串）。这些插件彼此不认识，却要协作完成一次下载。
+如果没有一个统一的中枢，结果就是：提取器为了拿播放列表里每条的真视频，得自己写"再跟进一次"的代码；下载器为了知道是不是多格式，得自己读用户配置；后处理器为了知道有没有合并需求，得提前和下载器商量。每个插件都在跟其它插件互相打听，状态在函数间乱飞。
 
-那"这次提取出来的结果，下一步该走哪条路"这个决定，谁来下？提取器只知道自己那点事，它不该负责"接下来下哪个格式"；下载器更不知道后面要不要合并。
+需要一个对象来做三件事：第一，决定"这个半解析结果下一步走哪条路"；第二，把同一个描述字典（`info_dict`）在阶段间传递，让每个阶段对它做纯变换；第三，全局唯一地持有所有插件都要用的基础设施——登录态、请求引擎、去重归档、进度回调、重试策略。
 
-还有一类东西，是所有插件都要用、但谁都不该自己造一份的：登录态、发请求的引擎、记录"下过哪些了"的去重归档、进度回调、重试策略。要是每个插件各自维护一份，马上就乱套。
+这个对象就是 `YoutubeDL`。
 
-所以这个系统需要一个中枢对象，干两件事：
+## 2. 核心思想
 
-1. **决定流程**——拿到一个半成品结果，判断它下一步该解析、该下载，还是该展开成一个列表。
-2. **持有底座**——把上面那些所有插件都要用的基础设施攥在自己手里，插件要用就跟它要。
+整套流水线被建模成一件简单的事：**对一个字典的递归分派 + 阶段化纯变换**，由一个**独占所有横切基础设施的胖协调器**把各阶段串起来。
 
-这个中枢就是 `YoutubeDL`。说人话就是，它既是**调度员**（谁先走谁后走），又是**仓库管理员**（登录态、请求引擎、归档都锁在我这，要用拿号来领）。
+类比送快递：每个分拣员不关心包裹最终送到哪，只看包裹上的标签（`_type`）决定下一步交给谁——是不是要再分拣一次、是不是要拆成几个子包裹、是不是可以直接装车。所有分拣员共用同一个调度中心查地图、看车牌、记已送达地址，但调度中心不替分拣员决定怎么处理包裹，只把"该到哪一站"这件事统管起来。
 
-> 提一句去重：提取器 / 下载器 / 后处理器各自的内部原理，前面章节都作为核心权衡讲透了，本章不重述。我们只关心协调器在**什么时机**调用它们、用**什么数据**把它们缝起来。
+## 3. 心智模型
 
-## 核心机制一：一个类型标记字段，决定下一步走哪条路
+协调器手里有几张表：
 
-这是整个编排器最关键的一个设计。先看提取器返回什么。
+- **提取器注册表**：按 key 索引的字典，按数组顺序匹配 URL
+- **后处理器分桶表**：按 8 个执行阶段（`pre_process` / `after_filter` / `video` / `before_dl` / `post_process` / `after_move` / `after_video` / `playlist`）分桶挂载
+- **四类钩子列表**：进度钩子、后置钩子、后处理器钩子、关闭钩子
+- **去重归档**：启动时全量预加载到内存 set
+- **几个计数器**：下载返回码、播放列表嵌套层数、已见过的播放列表 URL 集合
+- **预编译好的格式选择器**：启动时就编译完，不是首次下载时才编（这样 `-f` 的语法错误能尽早暴露）
 
-提取器解析完一个链接，并不一定直接给你一个"可以下载的视频"。它可能给你：
-
-- 一个**完整视频**（有 formats、能直接下）
-- 一个**待跟进的 URL**（"我解析出来这只是个跳板，真东西在另一个地址，麻烦你再解析一次"）
-- 一个**透明转发的 URL**（"我是个嵌入页，自己有点元数据比如标题，但我不是真视频，真视频在那个内层地址，请把我的元数据带过去"）
-- 一个**播放列表**（"我下面挂了一堆条目，每个条目你单独处理"）
-
-提取器怎么告诉协调器"我返回的是这几种里的哪一种"？答案特别朴素：**往字典里塞一个 `_type` 字段**，没塞就当 `video`。协调器拿到字典，就看 `_type` 决定动作：
+下载一条 URL 的主流水线长这样：
 
 ```
-拿到的字典 ──看 _type──►  video           → 选格式 → 下载 → 后处理
-                        url              → 递归回入口，把那个新 URL 再解析一次
-                        url_transparent  → 先解析内层，再把外层元数据覆盖上去
-                        playlist         → 把列表上下文挂到每个子条目上，逐条递归
+extract_info(url)            遍历提取器表，找第一个声明"我能处理这个 URL"的
+  ↓
+__extract_info(url, ie)      [装饰器套住] ie.extract(url) → 拿到带 _type 的字典
+  ↓
+process_ie_result            按 _type 分派
+  ├ url             → 递归回 extract_info
+  ├ url_transparent → 先解析内层，再把外层元数据覆盖上去
+  ├ playlist        → 给每个子条目叠加上下文，逐条递归
+  └ video           → process_video_result
+                       ├ 字段清洗 → 过滤
+                       ├ 格式选择 → 笛卡尔积（格式 × 时间区间）
+                       └ 每个 (格式, 区间) 组合：process_info
+                           ├ 写附属文件（字幕、缩略图、描述）
+                           ├ 按协议字段选下载器，开下
+                           ├ 动态追加合并器/修复器到后处理列表
+                           ├ 跑后处理链（动态 + 静态）
+                           └ 写归档
 ```
 
-这个设计妙在哪？**提取器的职责变得极轻。** 它不必自己去把播放列表全展开、不必自己跟进嵌套的 URL——只负责把自己看到的那一层如实报告成一个带 `_type` 的字典，剩下的展开全交给协调器的递归。于是任何嵌套深度（列表里套列表里套跳板）都用**同一条递归路径**处理。这就是用"一个标记字段做分派 + 递归展开"换来的简洁。
+字典贯穿全程——从提取器到归档，对象身份保持不变。
 
-代价也很实在：分派函数变成了一个多分支开关，而且递归天然有无限循环的风险——万一某个播放列表指向自己呢？所以协调器额外维护两个东西兜底：当前播放列表**嵌套到了第几层**、以及**已经见过的播放列表 URL 集合**。进了 playlist 分支层数加一、URL 记进集合；见到重复 URL 就跳过；层数归零时清空集合。
+## 4. 关键权衡
 
-### 透明转发到底在转发什么
+### 4.1 类型标记字段做结果分派，换取提取器只产半成品
 
-`url_transparent` 这个分支稍微细说，因为它最能体现"字典贯穿全程"的思路。
+提取器不用把活全干完。它只需要返回一个带 `_type` 标记的字典，剩下的事交给协调器：拿到 `playlist` 就展开子条目逐条递归，`url` 就跟进一次，`url_transparent` 就先解析内层再把外层嵌入页的标题等元数据覆盖上去，`video` 才进入下载分支。
 
-想象一个嵌入页：它自己有个标题、上传者、描述，但它本身不是视频文件，真正的视频藏在它指向的另一个站点地址里。你当然希望最后下载的文件名用这个嵌入页的标题，而不是内层那个冷冰冰的视频 id。所以处理顺序是：先把内层真实 URL 解析一遍，拿到真视频的 info；再把外层（嵌入页）的元数据**覆盖**到内层结果上——但有几个字段是豁免的（`_type`、`url`、`ie_key`，非裁剪片段时还豁免 `id`、`extractor`），这些得用内层真视频的；最后拿着合并后的结果再走一次分派。
+**换来**：提取器职责极轻——不必自己把整个播放列表全展开、不必自己跟进嵌套 URL；任意深度的嵌套都统一处理。
 
-"透明"两个字的意思就是：外层的元数据像一层透明的膜，盖在内层真视频上面透传下去。
+**代价**：分派函数 `process_ie_result` 变成一个多分支开关；递归天然带无限循环风险——比如某个播放列表的子条目又指回了它自己。源码靠两个计数兜底：维护 `_playlist_level` 记录当前嵌套层数、维护 `_playlist_urls` 记录当前这一轮已见过的播放列表 URL，发现重复就跳过，`finally` 里层数归零时清空已见集合。
 
-## 核心机制二：一个字典从提取一路流到后处理，分叉时才拷贝
+这里化解的**本质矛盾**是"嵌套结构的开放性"和"控制流的有限性"。任何站点的播放列表都可能再嵌套任意深的列表，但运行时的栈与去重必须有限。把"何时停止递归"从提取器（无法知道全局）拿到协调器（手握全局计数）来做，是这个分派的本质骨架——碰到树形/图形嵌套结构时，"在统一入口做防循环记账"是通解。
 
-上一章（数据总线）已经讲透了一个字段极丰富的字典充当系统的通用语言。本章不重讲那个字典里有哪些字段，只看它**在阶段之间怎么流动**。
+### 4.2 一个字典贯穿全程，分叉时浅拷贝并主动剥离运行时私有状态
 
-协调器的设计是：**同一个字典对象，从提取一路流到下载、再到后处理，阶段之间不重新装箱。** 每个阶段的函数签名都统一成"吃一个字典、吐一个字典"，谁也不必关心别的阶段需要什么参数——因为大家都在读写同一个东西。
+字典对象从提取一路流到后处理，阶段间不重新装箱。只在需要分叉——多格式 × 多时间区间的笛卡尔积——时浅拷贝一份，且拷贝时主动删掉两个运行时私有键：`__postprocessors`（动态追加的 PP 列表）和 `__pending_error`（待决错误）。
 
-但有一种情况必须分叉：用户要**多个格式**（同时下 720p 和 1080p），或者要**多个时间段**（下第 1–10 秒和第 30–40 秒）。这时一个字典不够用了，得对每个"格式 × 时间段"组合各备一份。协调器的做法是：**只在需要分叉时，浅拷贝一份字典**，而且拷贝时会主动**剥掉两个运行时私有键**——动态后处理列表和待决错误。
+**换来**：各阶段函数签名统一（都吃一个字典）、阶段间无需显式传参；外部引用的对象身份在"原地清空再灌入新内容"（`clear()` + `update()`）后仍保持不变——`process_info` 末尾甚至有一条 `assert info_dict is original_infodict` 硬断言，强制保证外部持有的引用仍指向被原地修改的那个对象。
 
+**代价**：字典无编译期 schema，业务字段（`title` / `formats` / `duration`）和 `__` 前缀的运行时私有字段混居，只靠命名约定区分；浅拷贝导致 `formats` 这种嵌套子字典在副本间共享引用，源码注释明说"理想应深拷贝但字典可能含不可深拷对象"而放弃。所以下载循环里改顶层键是安全的，但直接改 `formats[0][...]` 会波及原 info——这是源码明确承认的已知陷阱。
+
+这里化解的**本质矛盾**是"分叉需要独立状态"和"外部引用需要稳定身份"。分叉要拷贝、稳定要不拷贝。解法是分叉时拷贝顶层并丢弃运行时状态、主干用原地替换保证身份不变——这是"流式管线 + 分叉加工"类问题的通用骨架。
+
+### 4.3 静态后处理注册 + 运行时动态追加双轨制
+
+用户配置的后处理器（转码、嵌字幕、写元数据）在协调器初始化时就按 8 个阶段挂到静态表里；而"多格式合并器、容器修复器"这类取决于实际下载情况的后处理器，在下载过程中动态追加到当前字典的 `__postprocessors` 私有列表里。执行时把动态列表拼在静态表前面一起跑：
+
+```python
+for pp in (additional_pps or []) + self._pps[key]:
+    info = self.run_pp(pp, info)
 ```
-原始字典 info
-   ├─ 组合1 → 浅拷贝（剥掉运行时私有键）→ 下载
-   ├─ 组合2 → 浅拷贝（剥掉运行时私有键）→ 下载
-   └─ 组合3 → 浅拷贝（剥掉运行时私有键）→ 下载
+
+**换来**：声明式的稳定后处理链（用户写的）和运行时按需扩充的修复（检测到多格式才追加合并器、检测到 `m4a_dash` 容器才追加修复器）共存。
+
+**代价**：后处理的最终执行顺序分散在两处——静态注册序 + 运行时追加序，且**动态追加的永远先于用户配置的跑**。这和直觉相反：你以为是用户明说的后处理先跑、然后才是补救的修复；实际恰恰相反，合并和容器修复必须先把"残缺的产物"修成"完整的产物"，用户的转码才能在完整产物上做。调试时必须同时盯两处。
+
+这里化解的**本质矛盾**是"用户声明的稳定管线"和"运行时才能确定的补救需求"。前者需要提前可见、可配置；后者必须等真下载完了才知道。双轨制让两者并存，代价是顺序的隐式性——任何"声明式 + 必须按运行时事实补救"的管线都会撞上这个权衡。
+
+### 4.4 协调器独占所有横切关注点（门面模式）
+
+登录态（cookiejar）、代理、请求引擎（request_director）、去重归档、四类钩子、格式选择器编译，全部由这一个协调器对象持有。提取器、下载器、后处理器通过注册时被反向塞回协调器引用（`ie.set_downloader(self)`），从这里取用基础设施——比如提取器要发请求时调 `self._downloader.urlopen`，而不是自己持有一个 session。
+
+**换来**：插件只需写自己的核心逻辑；所有底座（发请求、读 cookie、记归档、报进度）从协调器取用；插件之间零耦合。横切资源还设计成 `cached_property` 懒加载，避免构造协调器时就强制触发可能失败的浏览器 cookie 解密，把错误延迟到真正发请求的那一刻。
+
+**代价**：协调器沦为数千行、状态与职责高度集中的上帝对象。`YoutubeDL.py` 单文件超过 4000 行，构造函数 `__init__` 一口气建好七八张表、十几个计数器、四套钩子，谁都依赖它、它什么都管。任何重构都得先扛住它的体重。
+
+这里化解的**本质矛盾**是"插件之间的解耦"和"共享基础设施的统一"。插件想彼此无感，但又都得用同一套 cookie、同一套代理、同一套进度回调。把基础设施收束到唯一一个对象手里，是绕不开的解——也是这套设计最显著的代价来源。
+
+### 4.5 装饰器圈出统一的容错/重试边界
+
+策略很集中：直播等待和重新提取走循环重试，可预期的提取错误走告警，按用户容错策略决定吞掉还是上抛。这套策略集中写在一个装饰器 `_handle_extraction_exceptions` 里，只套在真正发起提取的少数内层方法上：
+
+```python
+while True:
+    try:
+        return func(self, *args, **kwargs)
+    except ReExtractInfo as e:
+        continue                          # 重新提取循环（直播等待/重试的灵魂）
+    except GeoRestrictedError as e: ...
+    except ExtractorError as e: self.report_error(...)
+    break
 ```
 
-为什么剥这两个键？因为它们是"上一次下载残留的运行时状态"——这次还没开始下，不该带着上次的待决错误和动态后处理往下走；但业务字段（标题、id、formats）得照常带。这两个私有键都带 `__` 前缀，靠命名约定跟业务字段区分。
+**换来**：提取阶段的容错策略只写一次；被装饰的方法本身只写正常路径，不用每个分支都考虑"要不要重试"。
 
-这里有个连作者自己都在注释里承认的陷阱：**浅拷贝**意味着嵌套的子字典（比如 `formats` 数组里的每个格式对象）在副本之间还是共享引用的。理想应该深拷贝，但字典里可能含有不可深拷贝的对象，于是放弃了。代价就是：改顶层键没问题，可你要是直接去改 `info['formats'][0]['url']`，会波及原始字典。
+**代价**：控制流被装饰器隐式化——从调用点 `extract_info(url)` 看不出来这次提取其实可能被自动重试若干次，那个隐藏的 `while True` 把"等直播开播"和"重新解析"都吞进去了。读到 `extract_info` 的代码想当然认为它一次成功，遇到直播场景调试时才会发现循环藏在装饰器里。
 
-还有个有意思的细节。单视频下载的核心步骤里有个"原地替换"：每个阶段可能返回一个**新**字典，但协调器会把新字典的内容 `clear()` 掉原来的、再 `update()` 进去——这样对象身份（内存里那个引用）始终不变。结尾甚至有个硬断言来保证：不管中间经过多少个返回新字典的阶段，外面早就拿走引用的代码，最后指向的还是被原地更新过的同一个对象。说人话就是：**为了让外面那些拿走引用的代码不失效，宁可把内容掏空重灌，也不换壳。**
+这里化解的**本质矛盾**是"业务代码的线性可读"和"网络场景的反复重试需求"。业务想看到的是直线流程，但真实下载场景必须支持直播等待、瞬时失败重试。把"反复重试"包进装饰器、让业务只看直线，是循环重试问题的通解骨架——也解释了为什么这层装饰器只套在内层方法而不是整条流水线上（外层套了反而会让所有阶段都隐式重试，更难追）。
 
-## 核心机制三：静态注册 + 运行时动态追加，后处理走双轨
+## 5. 最小原理演示
 
-后处理这条链（上一章已讲透：声明式拼装 + 链式变换）在这里有个编排器特有的玩法。后处理器分两类来源：
-
-- **静态注册**：用户在命令行配的那些（转码、嵌字幕、写元数据……），在协调器初始化时就按 8 个阶段（`pre_process` / `after_filter` / `video` / `before_dl` / `post_process` / `after_move` / `after_video` / `playlist`）挂进一张静态表。
-- **运行时动态追加**：有些后处理器**只有下载时才能确定要不要**——"多格式合并器"得等检测到这次确实下了多个格式才需要；"容器修复器"得等知道用了哪种下载器、下了什么容器才追加哪个。
-
-动态追加的那些，被协调器塞进当前字典的一个私有列表里（就是上面拷贝时要剥掉的那个动态后处理列表）。执行后处理时，协调器把**动态列表拼在静态表前面一起跑**。注意这个顺序，因为它跟直觉相反：**动态追加的（合并、修复）永远先于用户配置的后处理执行。** 为什么？因为合并和修复是"把下载产物整成可用形态"的打底步骤，必须先做完，用户配的转码、嵌字幕才能在一个正确的文件上操作。
-
-这个双轨制换来的是两全：既有一份声明式、可配置、稳定的后处理链，又能在运行时按实际情况扩充。代价是：**后处理的最终执行顺序散在两处**（静态注册序 + 运行时追加序），调试时得同时盯两处才能搞清楚为什么某个后处理器先跑了。
-
-## 核心机制四：协调器把所有横切基础设施攥在手里
-
-前面说过协调器要当仓库管理员。具体攥了哪些？登录态、代理、发请求的引擎、去重归档（一个内存集合，启动时全量预加载）、四类钩子（进度 / 后置 / 后处理器 / 关闭）、预编译好的格式选择器。
-
-插件怎么用这些东西？注册的时候，协调器会**把自己反向塞回插件**（`ie.set_downloader(self)`）。于是提取器想发请求，就找协调器要；想读登录态、想记归档，全从协调器这个引用上取。换来的是：插件只需要写自己的核心逻辑，所有底座都从协调器拿，插件之间**零耦合**——提取器不需要知道下载器存在，下载器不需要知道后处理器存在。
-
-代价呢？这个协调器顺理成章地长成了**数千行、状态与职责高度集中的上帝对象**。这是本章最显眼的代价，也是"一个胖协调器串起一切"这条路的必然结果。
-
-还有个值得拎出来的细节：登录态、请求引擎这些重资源，协调器没有在构造时就建好，而是**懒加载**——第一次真正用到（发第一个请求）时才构造。推断的动机有二：一是避免一启动就触发可能失败的浏览器登录态解密，把这种可能报错的操作推迟到真要用时；二是让插件在第一个请求发出前，还有机会改写这些配置。
-
-## 核心机制五：用一个装饰器圈出统一的容错 / 重试边界
-
-下载这件事有很多"不是出错、是要等等再来"的场景：直播还没开始、站点限流要重试。协调器怎么处理？它把这套容错策略**集中写在一个装饰器里**，只套在真正发起提取的那几个内层方法上。装饰器的核心是一个隐藏的重试循环：
-
-- 遇到"重新提取"信号 → 提示一下，再试一次（这就是直播等待和重试的实现）；
-- 遇到地区限制、提取错误 → 报个错，返回空；
-- 遇到通用异常 → 按用户的容错策略决定吞掉还是上抛。
-
-换来的是：被装饰的方法本身**只写正常路径**，所有"出错怎么办、要不要重试"的策略只写一次。代价是：**控制流被装饰器隐式化了**。你从调用点看一次提取调用，完全看不出来它背后可能被自动重试了好几轮——那个重试循环藏在装饰器里。
-
-## 把五个机制缝起来：完整执行轨迹
-
-现在用一个最小的 TS 程序把上面五个机制串起来演一遍。输入是一个播放列表 URL，挂两个条目：A 是普通视频，B 是个 `url_transparent` 跳板（指向另一个站点的真视频）。这条轨迹一次走完"递归展开 + 透明转发 + 分叉拷贝 + 动静态后处理 + 归档"。
-
-为什么用 TS 不用原仓库的 Python？这里的机制（递归分派、字典流转、拷贝剥离）没有任何 Python 特有语义依赖，TS 的联合类型 + 字典字面量 + 解构剥离反而能把它表达得干净，读者也最容易跑通。
+下面这段几十行的 TS 演示，刻意只演透五件事：类型标记字段分派、递归展开、字典贯穿、分叉时拷贝剥离运行时状态、动静态后处理合并。其余样板（格式 DSL 解析、下载限速、ffmpeg 调用、cookie 解密）一律不演示。
 
 ```ts
-// orchestrator.ts —— 演透协调器五机制，提取器/下载器/后处理器都是注入的桩
-type Type = 'video' | 'url' | 'url_transparent' | 'playlist'
-type Fmt = { format_id: string; protocol: string }
-type PP = { name: string; run: (i: Info) => Info }
+type Type = 'video' | 'url' | 'url_transparent' | 'playlist';
+
+// 描述字典：业务字段 + 两个下划线开头的运行时私有键
 type Info = {
-  _type?: Type
-  url?: string
-  ie_key?: string
-  entries?: Info[]
-  formats?: Fmt[]
-  title?: string
-  id?: string
-  webpage_url?: string
-  __pps?: PP[]          // 运行时私有：动态追加的后处理器
-  __pendingErr?: string // 运行时私有：待决错误
+  _type: Type;
+  url?: string;
+  entries?: Info[];
+  formats?: { protocol: string; format_id: string }[];
+  title?: string;
+  __pps?: PP[];           // 动态追加的后处理器
+  __pendingErr?: string;   // 待决错误
+};
+
+type PP = (info: Info) => Info;
+const mergerPP: PP = (info) => info;   // 桩：合并多格式
+
+// 协调器独占所有横切基础设施，插件从这里取用
+interface Orchestrator {
+  ies: { suitable: (url: string) => boolean; extract: (url: string) => Info }[];
+  formatSelector: (formats: Info['formats']) => Info['formats'][];
+  pickDownloader: (fmt: Info['formats'][0]) => { download: (i: Info) => void };
+  staticPPs: PP[];            // 用户声明、初始化时挂的静态 PP
+  archive: Set<string>;        // 去重归档
 }
 
-// ---- 协调器：独占横切基础设施（机制四）----
-class Orchestrator {
-  ies: { suitable: (u: string) => boolean; extract: (u: string) => Info }[] = []
-  staticPPs: Record<string, PP[]> = {}   // 静态注册的后处理（按阶段分桶）
-  archive = new Set<string>()            // 去重归档
-  seenPlaylistUrls = new Set<string>()   // 防循环
-  level = 0
-
-  // 分叉时浅拷贝 + 剥离两个运行时私有键（机制二）
-  static copy(info: Info): Info {
-    const { __pps, __pendingErr, ...rest } = info
-    return { ...rest }
-  }
-
-  // 入口：找声明"我能处理"的提取器，拿到带 _type 的半成品
-  extract(url: string): Info {
-    const ie = this.ies.find(h => h.suitable(url))
-    if (!ie) throw new Error(`no extractor for ${url}`)
-    return ie.extract(url)
-  }
-
-  // ★ 机制一：按 _type 分派 + 递归展开
-  processResult(r: Info): Info | undefined {
-    switch (r._type ?? 'video') {
-      case 'url':
-        return this.processResult(this.extract(r.url!))         // 递归回入口
-      case 'url_transparent': {
-        // 先解析内层真 URL，再把外层元数据覆盖上去（豁免 _type/url/ie_key 等少数字段）
-        const inner = this.extract(r.url!)
-        const merged = { ...inner, ...strip(r, ['_type', 'url', 'ie_key']) }
-        return this.processResult(merged)                       // 带合并后的元数据再分派
-      }
-      case 'playlist': {
-        if (r.webpage_url && this.seenPlaylistUrls.has(r.webpage_url)) return  // 防循环
-        if (r.webpage_url) this.seenPlaylistUrls.add(r.webpage_url)
-        this.level++
-        try { for (const e of r.entries!) this.processResult(e) }   // 逐条递归
-        finally { this.level-- }
-        return r
-      }
-      case 'video':
-        return this.downloadVideo(r)
+// 容错装饰器：把可重试错误转成循环，业务方法只写正常路径
+function withRetry<T>(fn: () => T): T | undefined {
+  while (true) {
+    try { return fn(); }
+    catch (e: any) {
+      if (e?.retry) continue;       // 重新提取循环
+      console.warn('extract failed:', e?.message);
+      return undefined;
     }
   }
+}
 
-  downloadVideo(info: Info) {
-    const formats = info.formats!
-    const fork = Orchestrator.copy(info)                // 分叉拷贝，剥运行时私有键（机制二）
-    for (const fmt of formats)
-      pickDownloader(fmt.protocol).download(fmt)        // 协议字段选下载器（前面章已讲）
-    if (formats.length > 1)                             // 多格式 → 动态追加合并器（机制三）
-      (fork.__pps ??= []).push({ name: 'FFmpegMerger', run: i => i })
-    // 动态(__pps) + 静态 合并执行，动态在前（机制三）
-    for (const pp of [...(fork.__pps ?? []), ...(this.staticPPs.post ?? [])]) pp.run(fork)
-    this.archive.add(`${fork.id}`)                      // 归档（机制四）
-    console.log(`  ✓ 归档 ${fork.id}（archive 共 ${this.archive.size} 条）`)
+// 入口：遍历提取器表找匹配的
+function extract(ydl: Orchestrator, url: string): Info | undefined {
+  return withRetry(() => {
+    const ie = ydl.ies.find(h => h.suitable(url));
+    if (!ie) throw new Error('no suitable extractor');
+    return ie.extract(url);
+  });
+}
+
+// 分派器：按 _type 决定下一步，半成品一律递归回入口
+function processResult(ydl: Orchestrator, r: Info): Info | Info[] | undefined {
+  switch (r._type) {
+    case 'url':
+      // 半成品：递归回入口
+      return r.url ? processResult(ydl, extract(ydl, r.url)!) : undefined;
+
+    case 'url_transparent': {
+      // 先解析内层真视频，再把外层嵌入页的元数据覆盖上去
+      const inner = r.url ? extract(ydl, r.url)! : r;
+      const innerProcessed = processResult(ydl, inner) as Info;
+      return processResult(ydl, {
+        ...innerProcessed, ...r,
+        _type: innerProcessed._type, url: innerProcessed.url,
+      });
+    }
+
+    case 'playlist':
+      // 上下文叠加到每个子条目、逐条递归
+      return r.entries!.map(e => processResult(ydl, { ...e, title: e.title ?? r.title }));
+
+    case 'video':
+      return downloadVideo(ydl, r);
   }
 }
 
-const strip = (i: Info, keep: string[]) =>
-  Object.fromEntries(Object.entries(i).filter(([k]) => !keep.includes(k)))
-const pickDownloader = (proto: string) => ({
-  download: (fmt: Fmt) => console.log(`    ↓ [${proto}] 下 ${fmt.format_id}`),
-})
+// 分叉时剥离运行时私有状态，业务字段带过去
+function fork(info: Info): Info {
+  const { __pps, __pendingErr, ...rest } = info;
+  return { ...rest };
+}
 
-// ---- 注入桩，演一条完整轨迹 ----
-const ydl = new Orchestrator()
-ydl.staticPPs.post = [{ name: 'EmbedSubtitle', run: i => i }]   // 用户配的静态 PP
-ydl.ies = [
-  { suitable: u => u.startsWith('https://list'),
-    extract: () => ({ _type: 'playlist', webpage_url: 'https://list/x', entries: [
-      { _type: 'video', id: 'A', title: '普通视频',
-        formats: [{ format_id: '720p', protocol: 'https' }] },
-      { _type: 'url_transparent', url: 'https://embed/b', ie_key: 'Embed', title: '嵌入页标题' },
-    ] }) },
-  { suitable: u => u.startsWith('https://embed'),
-    extract: () => ({ _type: 'video', id: 'B', title: '真视频原始标题',
-      formats: [{ format_id: '1080p', protocol: 'https' },
-                { format_id: 'audio', protocol: 'http' }] }) },
-]
-
-console.log('=== 入口：播放列表 URL ===')
-ydl.processResult(ydl.extract('https://list/x'))
+function downloadVideo(ydl: Orchestrator, info: Info): Info {
+  const picked = ydl.formatSelector(info.formats!);
+  for (const fmt of picked) {
+    const copy = fork(info);                  // 分叉
+    copy.formats = [fmt];
+    const fd = ydl.pickDownloader(fmt);       // 协议字段选下载器
+    fd.download(copy);
+    if (picked.length > 1) {
+      (info.__pps ??= []).push(mergerPP);     // 多格式 → 动态追加合并器
+    }
+  }
+  // 动态追加的先跑，用户挂的静态后跑
+  for (const pp of [...(info.__pps ?? []), ...ydl.staticPPs]) info = pp(info);
+  ydl.archive.add(info.title!);               // 归档
+  return info;
+}
 ```
 
-（配一个最小 `package.json` 加 `tsx` 依赖，`bun run orchestrator.ts` 或 `npx tsx orchestrator.ts` 即可跑出下面的轨迹。）
+实际源码里，这段逻辑分散在 `extract_info` / `process_ie_result` / `process_video_result` / `process_info` / `run_all_pps` 五个方法、合计数百行——上面的几十行是它的骨架投影。
 
-```
-=== 入口：播放列表 URL ===
-    ↓ [https] 下 720p
-  ✓ 归档 A（archive 共 1 条）        ← A 走 video，单格式，无动态合并器
-    ↓ [https] 下 1080p               ← B 走 url_transparent：先解析内层 B，外层标题覆盖上去
-    ↓ [http] 下 audio
-  ✓ 归档 B（archive 共 2 条）        ← B 多格式 → 动态追加 FFmpegMerger → 先于静态 PP 跑
-```
+## 6. 执行轨迹
 
-对着代码看几个要点：
+给协调器一个播放列表 URL，里面有两个条目：条目 A 是普通视频、条目 B 是一个 `url_transparent`（嵌入页，真视频在另一个站点）。看看上面那套机制怎么走。
 
-- **机制一**：列表里的 A 和 B 怎么处理，不是协调器主动判断的，是靠 `_type` 走到对应分支；B 的 `_type` 是 `url_transparent`，于是先解析内层 `https://embed/b`，再把外层标题"嵌入页标题"盖到内层（内层的"真视频原始标题"被覆盖），最后带着合并元数据走 video 分支下载。
-- **机制二**：B 进入 `downloadVideo` 时先 `copy` 一份（剥掉运行时私有键），业务字段照常带过去。
-- **机制三**：B 是多格式，于是往 `fork.__pps` 追加一个 `FFmpegMerger`；执行时 `[...__pps, ...staticPPs.post]`，合并器排在用户配的 `EmbedSubtitle` **前面**。
-- **机制四**：下载器、后处理器、归档集合，全挂在协调器这一个对象上。
+**第 1 步 · 入口分派**：`extract_info(playlist_url)` 遍历提取器表，命中播放列表提取器 `PlaylistIE`，调它的 `extract()` 拿到 `{ _type: 'playlist', entries: [A, B], title: '歌单' }`。进入 `process_ie_result`，分派键是 `'playlist'`。
 
-## 小结
+**第 2 步 · 防循环记账**：进入 playlist 分支前，`_playlist_level` 从 0 加到 1，`playlist_url` 加入 `_playlist_urls`。
 
-这一章讲的是把一整条"解析 → 选格式 → 下载 → 后处理"流水线拢成一个协调对象的那层设计。要带走的是这几个权衡：
+**第 3 步 · 子条目上下文叠加**：用 `ChainMap` 把 `{ playlist: '歌单', playlist_index: 1 }` 叠到 A 上、把 `{ playlist: '歌单', playlist_index: 2 }` 叠到 B 上，逐条递归。
 
-- **一个 `_type` 标记字段 + 递归分派**，换来提取器职责极轻、任意嵌套深度统一处理，代价是分派函数成了多分支开关、还得额外维护防循环的层数和已见 URL 集合。
-- **一个字典贯穿全程、分叉时才浅拷贝并剥掉运行时私有键**，换来各阶段函数签名统一、对象身份在原地替换后仍不变，代价是字典无编译期 schema、浅拷贝让嵌套子字典共享引用（连作者自己都承认的陷阱）。
-- **静态注册 + 运行时动态追加的后处理双轨制**，换来声明式稳定链与按需扩充共存，代价是执行顺序散在两处、动态的总排在静态的前（跟直觉相反）。
-- **协调器独占所有横切基础设施（门面）**，换来插件零耦合、底座集中，代价是它长成数千行的上帝对象。
-- **用装饰器圈出统一容错 / 重试边界**，换来正常路径与容错策略分离，代价是控制流被隐式化（藏了个重试循环）。
+**第 4 步 · 条目 A（普通视频）**：A 的 `_type` 是 `'video'`。进入 `process_video_result`：清洗字段、跑 `'pre_process'` 和 `'after_filter'`、用预编译好的格式选择器对 `A.formats` 求值，选出 1 个格式。笛卡尔积只有 `(fmt1, 全长)` 一项，`fork(A)` 剥离运行时私有键、跑 `process_info`：写缩略图、按协议字段选 `HttpFD` 下载、跑后处理（这里没动态 PP，只跑用户挂的静态 PP）、写归档。
 
-你大概也注意到了，这五个权衡的代价几乎都指向同一件事：**协调器为了把流程收得清晰可控，自己变得越来越胖、越来越像一个什么都管的上帝对象。** 这是"用一个中枢串起一切"这条路绕不开的账单。
+**第 5 步 · 条目 B（透明转发）**：B 的 `_type` 是 `'url_transparent'`。先 `extract_info(B.url, process=False)` 拿到内层真视频 info，把 B 外层的非豁免字段（标题、缩略图等）覆盖到内层上，再递归分派。内层是个 `'video'`，所以走第 4 步同样的流程，但标题用的是 B 覆盖后的标题。
 
-那这个胖协调器手里的那些配置（要哪些后处理器、用什么格式选择串、开哪些兼容选项）是哪儿来的？它们都是从命令行那一长串选项翻译过来的。下一章「CLI 层：从命令行表面到 ydl_opts 与声明式流水线」就看这一层：怎么把巨大的命令行表面压成一个参数字典和一条声明式流水线，再喂给本章这个协调器。
+**第 6 步 · 多格式动态追加**：假设 A 用户配的格式选择器选出了 2 个格式（视频 + 音频）。下载循环跑两轮：先下视频到 `f{format_id}` 临时文件、再下音频到另一个 `f{format_id}` 临时文件；下载过程中检测到 `requested_formats.length > 1`，把 `FFmpegMergerPP` 实例 `append` 到 `A.__postprocessors`。下载完后 `fixup()` 看下载器名是 `hlsnative` 又把 `FFmpegFixupM4aPP` 追加进同一列表。
+
+**第 7 步 · 动静态后处理合并**：跑 `run_all_pps('post_process', additional=A.__postprocessors)`。先跑动态追加的（合并 → 修复 m4a）、再跑静态挂的（用户配的转码、嵌字幕），顺序符合"先修完整再加工"。
+
+**第 8 步 · 收尾**：`MoveFilesAfterDownloadPP` 把临时文件移到最终位置、跑 `'after_move'`、`_playlist_level` 从 1 减到 0、`finally` 清空 `_playlist_urls`。归档里多了两条记录：`ExtractorKey A.id` 和 `ExtractorKey B.innerVideoId`。
+
+整条轨迹演透的四件事：递归展开（playlist → A、B）、透明转发（B 覆盖到内层）、分叉拷贝剥离（多格式分叉时 `__pps` 清零）、动静态后处理（合并先跑、用户挂的转码后跑）。
+
+## 7. 教学简化说明
+
+本章演示故意省略了：真实提取器的样板代码（`_download_webpage` / `_search_regex` / geo 假 IP 重试）、格式选择 DSL 的词法分析与 AST 求值、下载器的限速/断点续传/分片并发、后处理器里具体的 ffmpeg 调用、cookie 解密路径、请求引擎竞争、错误翻译表、交互式格式选择（`-` 选择器）、`--load-info-json` 回退重下、各种 `compat_opts` 兼容垫片——这些都是前置章或下游章的内容。
+
+演示代码用 TS 写只是为了把"分派 + 递归 + 字典流转"这套控制流和数据流写干净。这套机制没有任何 Python 特有的语义依赖（递归与字典流转在 TS 里同样成立），原仓库用 Python 实现纯粹因为它是 yt-dlp 的主语言。
+
+## 8. 小结
+
+`YoutubeDL` 把"下载一个 URL"压成了一个胖协调器：一个 `_type` 字段决定下一步走哪条路，同一个字典贯穿全程，所有横切基础设施都被它独占——插件要用底座都得回头找它。
+
+代价也直接：4000 多行的单文件、控制流藏在装饰器里、后处理顺序要同时盯两处。下一章讲 CLI 层怎么把巨大的命令行表面压成一个 `ydl_opts` 字典、再喂给这个胖协调器。

@@ -1,355 +1,226 @@
----
-title: WebContainer：浏览器里跑真 pnpm
----
-
 # WebContainer：浏览器里跑真 pnpm
 
-## 想象这样一个网页
+> 本章属于 system 层。前置：devframe RPC、Backend 抽象。
+> 学完你能用一句话讲清：为什么 WebContainer 选了一条简陋的 stdout 前缀通道，又为什么这个选择让浏览器侧只能轮询。
 
-你点开一个网址，输入 `vue@3.4.0 lodash`，几秒后看到完整的依赖图——每个包的版本、模块类型、安装体积、谁依赖谁、谁该升级。整件事在你浏览器里发生，没装本地 Node、没污染本地磁盘。
+## 1. 为什么需要它
 
-要让这件事成立，得有一个能在浏览器里真跑 Node 的运行时——这就是 WebContainer 干的事。它把一个能跑 Node 的虚拟机塞进浏览器（依赖 SharedArrayBuffer，所以页面要带 COOP/COEP 两个 header，这点不展开）。但把 Node 跑起来只是故事的一半，另一半是：**浏览器里跑的 pnpm 进程，怎么把分析结果送回前端？**
+上一章留了一个 Backend 接口，让 dev、static、webcontainer 三种形态能在同一份代码里切换；但 webcontainer 这态到底是怎么实现的，浏览器里怎么真跑起 pnpm、装好的包又怎么传回前端，上一章只用一个 `isDynamic` 一笔带过，本章就来填这个坑。
 
-这一章讲的不是 WebContainer 自己怎么实现的，而是上层应用怎么用它把"任意访问者输入一个包名就能跑真安装"这件事跑通。前置你已经读过 devframe RPC 和 Backend 抽象两章——本章就站在它们肩膀上。
+想象你刚看到一个有意思的 npm 包，想知道它依赖了什么、装出来多大、模块格式合不规范。两条老路都不舒服：本地 `pnpm i` 要 Node 环境、要污染磁盘、要等几分钟；上 npmjs 看静态信息，版本号有，但 `workspace:` 协议怎么解析、`overrides` 改了什么、phantom dependency 有没有，统统看不到。这些信息天生要在装好 `node_modules` 之后才能算出来，纯静态分析根本读不到。
 
-## 一、最底层：浏览器只能"读"子进程的 stdout
+可要让任意网页访客都能跑 `pnpm install`，又不能要求他们装本地工具。WebContainer 这个把 Node 跑在浏览器里的运行时正好把"真安装"和"零安装"两个原本矛盾的能力合并了：浏览器里跑的是真 Node，能 `pnpm install` 任意包。剩下的问题只有一个：浏览器里跑的这个进程，分析结果怎么传回来。
 
-先说一个让人有点意外的事实：WebContainer API 给浏览器暴露的能力里，**最容易拿到的是 stdout**。每次你在 WebContainer 里 spawn 一个进程，它返回一个 `process` 对象，里面有 `process.output` 这个流——浏览器可以把它 pipe 到一个 `WritableStream`，每来一段 stdout 都能立刻拿到。
+## 2. 核心思想
 
-```ts
-const process = await wc.spawn('node', ['__server.mjs'])
-process.output.pipeTo(new WritableStream({
-  write(chunk) {
-    console.log('got chunk:', chunk)
-  },
-}))
+把一个真正能跑 Node 的运行时塞进浏览器，然后用一段魔法前缀把它的 stdout 变成结构化数据通道。
+
+说人话就是：server 进程每次往 stdout 喷东西，都先在前面贴一个固定的小标签；浏览器收到一段 stdout 就先看标签，标签在的，这是给程序读的数据；标签不在的，这是给用户看的日志。
+
+## 3. 心智模型
+
+WebContainer 是 StackBlitz 做的浏览器内 Node 运行时：能在网页里跑真 Node 进程、有虚拟 fs、能 spawn 子进程。浏览器和它跑的进程之间，能直接消费的口子就是进程的 stdout——WebContainer API 把它包成 ReadableStream，前端 `pipeTo` 一个 WritableStream 就能逐 chunk 读到。
+
+标签协议用的固定字符串是 `::node-modules-inspector::`。一条 stdout 行只有两种身份：
+
+- **是数据**：前缀 + JSON，三种 case 之一
+  - `{ status: 'heartbeat', heartbeat: <ts> }` —— 心跳，每 100ms 一次
+  - `{ status: 'error', error: ... }` —— 报错
+  - payload 本身（没有 status 字段）—— 分析结果
+- **是日志**：没前缀，pnpm 之类的普通子进程输出，写给用户看
+
+数据从 server 喷出来到浏览器落地，流向是这样：
+
+```
+server 进程 console.log(前缀 + JSON)
+  → WebContainer 的 process.output pipe
+    → 浏览器 WritableStream.write(chunk)
+      → onChunk(chunk)
+        → 前缀命中 → 剥前缀、parse、按 status 分流到 result / heartbeat / serverError
+        → 前缀没命中 → 当日志写给 xterm 终端 UI
 ```
 
-反向通道就不一样了。要把数据从浏览器送回 WebContainer 里的进程，要么写 `process.stdin`（要求进程主动读 stdin），要么改虚拟 fs 让进程下一次读文件时拿到新内容——两条路都要 server 端配合，都要持续监听。说人话就是：**stdout 是免费的，反向通信要花钱**。
+整套生命周期六步：
 
-这一节先记住一句话：在 WebContainer 这个组合里，**stdout 是宿主感知子进程的唯一便宜通道**。后面所有花活，都是怎么把这一条便宜通道榨干。
+1. 用户在落地页输入包名
+2. 浏览器惰性 boot WebContainer（一个全局单例 Promise）
+3. 在虚拟 fs 上清空 `/app`、写最小 `package.json`、写构建期 inline 好的 `__server.mjs`
+4. 顺序 spawn `node --version`（自检）和 `pnpm install <用户输入>`（真装包）
+5. 后台 spawn `node __server.mjs`（不阻塞，stdout 持续被 onChunk 消费）
+6. 浏览器侧 dispatcher 轮询 stdout 拿 result，返回伪装成 devframe 的 Backend
 
-## 二、协议层：一个魔法前缀，把 stdout 撕成两条流
+## 4. 关键权衡
 
-既然 stdout 是唯一便宜的通道，那 server 端的进度日志和数据 payload 都得从同一条 stdout 出来。问题来了：浏览器怎么知道哪一行是给用户看的进度、哪一行是程序要读的数据？
+### stdout 前缀当唯一通道，换零协议层
 
-作者的答案朴素得可爱——**给数据加个前缀**。
+server 进程所有结构化数据都靠 `console.log(PREFIX + stringify(...))` 喷出来，浏览器靠 onChunk 接收。
 
-整个协议就一个常量：
+**换来**：根本不用配 WebSocket、不用 postMessage、不用任何 RPC 框架。server 端就是一个最普通的 Node 脚本，和你本地跑 `node foo.mjs` 没有任何区别。这也是为什么前面 devframe RPC 那套传输适配机制（websocket / 静态 dump / MCP）在 webcontainer 这态完全没出现：传输被压缩到一根 stdout 管子。
+
+**代价**：通道是单向的。浏览器只能等 server 主动喷，没法反向发请求。想做"问答式" RPC，唯一办法是把每次问答压缩成"启动时一次性产出"：server 启动就开始算，算完一次性把 payload 喷出来；浏览器那边轮询 stdout，等到 result 出现就算这次"调用"完成。心跳、错误、单次结果都靠"持续读 stdout"感知，没法做"我现在要查一下 X"这种反向调用。
+
+**化解的本质矛盾**：传输要双向（RPC 的天然需求）vs WebContainer API 只暴露了 stdout 这一根浏览器侧能直接消费的管子。这条权衡把"双向"的需求改造成了"单向 + 一次性产出"，绕开了双向通道的实现成本——本质上是承认"问答"这个抽象在 WebContainer 里不适用，于是把每次问答重写成一次启动。
+
+### 把整个 server bundle 成字符串塞进前端，换运行时只写一个文件
+
+构建期用 rollup 把 `src/node/webcontainer/server.ts` 及它依赖的所有东西（含整个 `node-modules-tools`）inline 成单个 `runtime/webcontainer-server.mjs`；Nuxt 模块再读这个文件，用 `JSON.stringify` 包一层，作为 `WEBCONTAINER_SERVER_CODE` 字符串常量暴露给前端。运行时浏览器只要一行 `wc.fs.writeFile('/app/__server.mjs', CODE_SERVER)` 就把完整分析器放进了虚拟机。
+
+**换来**：运行时启动 server 的逻辑极简。没有 fetch、没有动态 import、没有 require resolver。整个分析器作为字符串跟着前端 JS bundle 一起到了用户浏览器，落盘到虚拟 fs，spawn 一个 `node __server.mjs` 就拉起来了。
+
+**代价**：构建链变复杂。要配 rollup 的 `alias`（把 `node-modules-tools` 指向源码）、`commonjs` + `nodeResolve` + `esbuild`，还要 `inlineDynamicImports: true` 把所有动态 import 拍平。产物体积也不小，整个 server 端代码加依赖都进了前端 bundle。
+
+**本质矛盾**：服务端代码完整度（要带依赖、要能跑）vs 运行时启动的简单度（不能在浏览器里跑 npm install）。这条权衡把"装配"提前到构建期完成，运行时就只剩"落盘 + spawn"两步。也是同一个思路在 Rust / Go 单文件二进制里反复出现：把所有依赖打进一个交付物，换运行时的启动可预测。
+
+### WebContainer 全局只 boot 一次，每次 install 先 rm -rf /app
+
+WebContainer API 一个页面只能 boot 一次，代码层用一个模块级 `_promise` 把 `WebContainer.boot()` 的 Promise 缓存起来，第二次调 `getContainer()` 直接命中缓存。但每次 install 之前，都先 `wc.fs.rm('/app', { recursive: true, force: true })` 再 `mkdir`。
+
+**换来**：SPA 里多次装包不必重启 VM，第二次 install 是秒级而不是首次那种数秒延迟。同时每次 install 都拿到一个干净的 `/app`：上一次的 `node_modules` 不会污染本次分析。
+
+**代价**：WebContainer 实例本身（内置的 Node/pnpm 二进制、网络栈、虚拟 fs 的其它部分）是跨 install 复用的，状态有粘性。`rm /app` 是显式的"应用层重置"，不是 VM 层重置。如果哪天往 `/app` 之外写了东西（比如 `/tmp` 缓存、用户 home 目录配置），那些状态会泄漏到下一次 install。
+
+**本质矛盾**：单例的启动成本（boot 几秒）想被均摊 vs 单例实例的状态在多次操作间会累积。这条权衡划了一条清晰的线：VM 重启的代价大，所以 boot 单例；但应用层状态隔离的代价小，所以每次 install 自己清自己的工作目录。这条线在所有"启动贵、清理便宜"的运行时里都看得到：进程池、数据库连接池、容器编排。
+
+### 假装自己是 devframe Backend，但只实现 3 个方法
+
+WebContainer 里跑的 server 内部其实复用了 devframe RPC 那套 `createInspectorRpcHandlers(...)`，但浏览器侧没有 devframe 的传输层（websocket client / 静态 dump fetcher），所以手写一个 `{ call(method, ...args) }` 对象：`nmi:get-payload` 走上面那条轮询循环；`nmi:get-packages-npm-meta` 和 `nmi:get-packages-npm-meta-latest` 不走 WebContainer，直接走浏览器自己的 IndexedDB。这个 dispatcher 包成 `Backend.functions` 返回给上层。
+
+**换来**：上层 90% 的代码（拿 Backend、调 functions.getPayload、跑 computed payload cascade、渲染依赖图）完全不感知后端形态，和 dev 模式、static 模式用的是同一份代码。
+
+**代价**：webcontainer backend 只实现了 3 个 function，没有 `getPublint`、`openInEditor`、`openInFinder`——这些在 `Backend` 接口里都是可选的。上一章已经讲过 UI 必须按 functions 是否存在来条件渲染，这里我们看到的是具体落点：浏览器里跑的依赖分析，本来就开不了本地编辑器，也跑不了 publint（那是 node 原生模块）。
+
+**本质矛盾**：复用上层抽象 vs 这态后端天生缺能力。Backend 接口的可选 functions 是这条矛盾的产物：不强制要求所有 backend 都实现所有方法，但把"方法不存在时怎么办"的责任甩给 UI。也是同一个矛盾在 React Server Components、Electron 主进程 IPC 里反复出现：抽象层想统一，但具体运行时各有各的"做不到"。
+
+## 5. 最小原理演示
+
+下面这段 TS 演示「前缀协议 + 单例 + 后台进程」三件套如何用最少的代码跑通"宿主调度子进程"模式。不演示真的 WebContainer（要 COOP/COEP header + service worker，太重），用 setTimeout 模拟一台假虚拟机；也不演示 IndexedDB 缓存、终端 UI 渲染、心跳超时数值的精细调优。
 
 ```ts
-export const WEBCONTAINER_STDOUT_PREFIX = '::node-modules-inspector::'
-```
-
-server 端只要往 stdout 写"数据"，就先拼这串前缀；写普通日志就不用。浏览器那边拿到一段 chunk，先看它以前缀开头吗——是，就剥掉前缀、解析后用；不是，就当成普通进度，原样写到终端 UI 给用户看。
-
-server 端 `__server.mjs` 实际就喷三种东西：
-
-```ts
-// 注意：下面演示用 JSON.stringify 简化。真源用的是 structured-clone-es 的 stringify，
-// 那是一个支持 Map/Set/Date 的 JSON 超集——一旦 payload 里有 Map 字段，原生 JSON.stringify
-// 会序列化失败（变成 "{}"），真源选这个库就是为了避开这个坑。
-const PREFIX = '::node-modules-inspector::'
-
-// 1. 心跳：每 100ms 喷一次，告诉浏览器"我还活着"
-setInterval(() => {
-  console.log(PREFIX + JSON.stringify({ status: 'heartbeat', heartbeat: Date.now() }))
-}, 100)
-
-// 2. 数据：分析完成时喷一次（payload 对象本身，没有 status 字段）
-console.log(PREFIX + JSON.stringify(await rpc.getPayload()))
-
-// 3. 错误：抓到异常时喷一次
-catch (err) {
-  console.log(PREFIX + JSON.stringify({ status: 'error', error: err }))
+// 假运行时：模拟 WebContainer 那台浏览器里的虚拟机
+type FakeContainer = {
+  fs: {
+    rm: (path: string): void
+    writeFile: (path: string, content: string): void
+  }
+  spawn: (
+    cmd: string,
+    args: string[],
+    onChunk?: (chunk: string) => void | boolean,
+  ) => Promise<{ exit: Promise<void> }>
 }
-```
 
-浏览器那侧的接收回调只做一件事——**按前缀分流**：
+// 模块级单例缓存：WebContainer API 一个页面只能 boot 一次
+let _boot: Promise<FakeContainer> | null = null
+function fakeBoot(): Promise<FakeContainer> {
+  if (!_boot) _boot = Promise.resolve(makeFakeContainer())
+  return _boot
+}
 
-```ts
-const onChunk = (chunk: string) => {
-  if (chunk.startsWith(PREFIX)) {
+const PREFIX = '::nmi-demo::'
+
+// 宿主侧：浏览器里跑的调度逻辑
+async function installInWebContainer(userInput: string) {
+  const wc = await fakeBoot()
+
+  // 复用同一个 VM 实例，但工作目录每次都清空——上次装的不该污染这次分析
+  wc.fs.rm('/app')
+  wc.fs.writeFile('/app/package.json', '{ "name":"demo","private":true }')
+  // server 代码构建期已 inline 成字符串常量；运行时只是 writeFile 一次
+  wc.fs.writeFile('/app/__server.mjs', SERVER_CODE)
+
+  // 真装包——pnpm 的输出不走前缀，全显示给用户看
+  const installer = await wc.spawn('pnpm', ['install', userInput])
+  await installer.exit
+
+  // 后台启 server：onChunk 是 stdout 的唯一消费口
+  let result: any
+  let heartbeat = Date.now()
+  let serverError: any
+
+  await wc.spawn('node', ['__server.mjs'], (chunk) => {
+    // 前缀命中 → 结构化数据，按 status 分流；前缀没命中 → 当日志写给终端 UI
+    if (!chunk.startsWith(PREFIX)) return
     const parsed = JSON.parse(chunk.slice(PREFIX.length))
     if (parsed.status === 'heartbeat') heartbeat = parsed.heartbeat
     else if (parsed.status === 'error') serverError = parsed.error
-    else result = parsed               // 没 status 字段 → 就是 payload 本体
-    return false                       // 已经处理过了，不要再往终端 UI 写
-  }
-  // 不以前缀开头 → 返回 undefined，外层把它当日志写到 xterm
-}
-```
+    else result = parsed
+    return false // 已经处理过这块，别再写到终端了
+  })
 
-最关键的一行是 `return false`。这是宿主侧的一个约定——回调返回 false 表示"这块我已经吃掉了，别再让用户看见"。正是因为这个返回值，前缀协议能在终端里"隐身"：用户从头到尾看不到一串 `::node-modules-inspector::` 的乱码，只看到 pnpm 的安装进度。
-
-说人话：**前缀 + 返回值，相当于在一条 stdout 里偷偷划了一条暗道**。明面上 pnpm 的进度照常流到终端，暗道里心跳和数据悄悄送到前端的状态机。
-
-## 三、调度层：单例 boot + 清空 + 串行 spawn
-
-跑通协议之后，整个 install 流程的逻辑骨架就清晰了。先说"环境准备"——boot 一次就够。
-
-### 3.1 WebContainer 全局只 boot 一次
-
-WebContainer API 有个硬限制：一个页面只能 boot 一次。第二次调 `WebContainer.boot()` 会报错。代码用一个模块级的 `_promise` 把这件事管起来——第一次调用时发起到 boot 的 Promise 并缓存，之后再调直接拿缓存：
-
-```ts
-let _promise: Promise<WebContainer> | null = null
-
-export function getContainer() {
-  if (!_promise) {
-    _promise = WebContainer.boot()
-      .then(wc => { /* log */ return wc })
-      .catch(err => { /* log */ throw err })
-  }
-  return _promise
-}
-```
-
-把 `_promise` 想成一块**谁都能看到的公共留言板**：第一个发起 boot 的人在板上钉了一张"Promise 在跑"的字条，后面所有调用都看这张字条、不再发起新的 boot。这是单例依赖注入最朴素的形态——按一个公共变量做按地址精准投递。
-
-### 3.2 每次新安装前清空 `/app`
-
-WebContainer 的 fs 是有"记忆"的——你这次安装留下的 `node_modules`，如果不显式删，下次 install 时它还在那儿。这意味着如果用户先装 `vue@2` 再装 `vue@3`，第二次的依赖图里会混着第一次的残留。
-
-所以 install 入口固定干一件事：**先把工作目录 `/app` 整个删掉，再 mkdir 重建**。
-
-```ts
-const ROOT = '/app'
-
-await wc.fs.rm(ROOT, { recursive: true, force: true })
-await wc.fs.mkdir(ROOT, { recursive: true })
-await wc.fs.writeFile(join(ROOT, 'package.json'), CODE_PACKAGE_JSON)
-await wc.fs.writeFile(join(ROOT, '__server.mjs'), CODE_SERVER)
-```
-
-注意写入的 `package.json` 是**最小骨架**——只有 `name/private/type:module` 三个字段，本身没有任何依赖。所有依赖都靠后面的 `pnpm install <用户输入>` 从命令行注入。这是个有意的小巧思：写文件的成本固定，依赖完全由用户的输入参数决定。
-
-### 3.3 串行 spawn：四步走
-
-环境准备好了，接下来是 spawn 子进程。注意：spawn 之后要么 `await process.exit`（等它跑完），要么不 await（让它在后台跑）。两种用法在本节都会出现。
-
-整个 install 链路里串行 spawn **四次**：
-
-```ts
-await exec('node', ['--version'])                                 // ① node 自检
-await exec('pnpm', ['--version'])                                 // ② pnpm 自检
-await exec('pnpm', ['install', ...args])                          // ③ 真装包（要 await 装完）
-const server = exec('node', ['__server.mjs'], false, onChunk)     // ④ 后台 server（不 await）
-```
-
-每一步的意图不一样：
-
-- **① node --version**：纯自检。WebContainer 内部带了一份 port 过的 Node，但 boot 完后第一次跑 Node 命令可能要做 JIT 预热；这条命令相当于"先把 Node 拉起来确认能用"。它的 stdout 直接进终端 UI，让用户也看到环境信息。
-- **② pnpm --version**：同样是自检。pnpm 是后面真要装包的工具，先确认它的可执行文件能找到、版本号能正常打印——避免到了第③步才发现 pnpm 本身有问题。
-- **③ pnpm install**：真正干活的步骤。这一步**必须 await**——不装完，后面 server 就没有 node_modules 可分析。它的 stdout 不走前缀协议，直接显示给用户当作"安装进度条"。
-- **④ node __server.mjs**：后台常驻。这一步**故意不 await**——它启动后会一直跑、每 100ms 喷一次心跳。我们用 `wait=false` 让它脱离主调用栈，但通过 `onChunk` 回调持续消费它的 stdout。
-
-③ 和 ④ 的对比最能体现 spawn 的两种用法：**装包是一次性任务，跑完即止；server 是常驻服务，启动后只关心它的输出**。
-
-## 四、问答层：用单向通道伪造"问答"
-
-到这里只剩最后一个难点。前端调 `getPayload()` 想拿分析结果时，它面对的现实是：
-
-- 数据从 server 的 stdout 出来，但 stdout 回调是另一个调用栈——回调里写 `result = parsed`，调用方没办法直接 `await` 这个赋值。
-- server 也接收不到前端的"请求"——前面说过反向通道要花钱。
-
-作者的解法很直白：**轮询**。`getPayload` 进入一个 while 循环，每 100ms 醒一次，检查 `result` 是不是已经被 stdout 回调填上了：
-
-```ts
-case 'nmi:get-payload': {
-  heartbeat = Date.now()        // 进入循环前先重置心跳
-  serverError = undefined
+  // 通道是单向的，浏览器没法「请求」server，只能轮询它喷出来的 stdout
   while (!result && !serverError) {
-    if (Date.now() - heartbeat > 10000)
+    if (Date.now() - heartbeat > 10_000)
       throw new Error('Server heartbeat timeout')
-    await new Promise(r => setTimeout(r, 100))
-  }
-  if (!result) {
-    if (serverError) throw serverError
-    throw new Error('Failed to get dependencies')
-  }
-  return result
-}
-```
-
-这里有个细节：循环条件是 `!result && !serverError`——既检查"出结果了没"，也检查"出错了没"。两个变量都是 stdout 回调那边赋值的。换句话说，**前端不是在等"答"，而是在等"对方任何状态变化"**。
-
-心跳还有第二个用处：**超时检测**。如果 10 秒内没收到新的心跳，说明 server 卡死了，循环主动抛 timeout。心跳间隔 100ms、超时 10s，意味着正常情况前端最多等 0.1s 量级感知到结果，异常情况最多卡 10s 才报错。
-
-为什么不用 Promise + resolve？两个独立调用栈之间要传 Promise，得在外面维护一个 `let resolve; ...; resolve(parsed)`——多一层状态。作者选了更土但更短的轮询写法，反正都要有定时器查 timeout。
-
-## 五、最小演示：一段脚本跑通整个套路
-
-下面这段演示不依赖真的 WebContainer——用一个假运行时把"前缀协议 + 单例 + 后台进程 + 轮询"四件套演透。直接 `node demo.mjs` 或 `bun run demo.mjs` 就能跑（演示用原生 JSON.stringify 简化；真源 server 端用的是 structured-clone-es 的 stringify，那是一个支持 Map/Set/Date 的 JSON 超集——payload 里有 Map 字段时原生 JSON.stringify 会失败，真源选这个库就是为了避开这个坑）。
-
-```js
-// demo.mjs —— 用假运行时演透 stdout 前缀协议 + 轮询
-const PREFIX = '::node-modules-inspector::'
-
-// 假运行时：能 spawn、能把 stdout 喂给回调；不真的跑 Node，用 setTimeout 模拟
-function fakeBoot() {
-  return {
-    fs: {
-      _files: {},
-      async rm(root) { delete this._files[root] },
-      async mkdir() {},
-      async writeFile(path, content) { this._files[path] = content },
-    },
-    async spawn(cmd, args, { onChunk } = {}) {
-      // 假装我们是 __server.mjs：每 50ms 喷一次心跳，60 步后喷 payload 然后退出
-      if (cmd === 'node' && args[0] === '__server.mjs') {
-        let ticks = 0
-        const timer = setInterval(() => {
-          if (ticks < 60) {
-            onChunk?.(PREFIX + JSON.stringify({ status: 'heartbeat', heartbeat: Date.now() }))
-            ticks++
-          } else {
-            onChunk?.(PREFIX + JSON.stringify({ packages: [{ name: 'vue', version: '3.4.0' }] }))
-            onChunk?.('some random log line\n')   // 普通日志，不该被前缀吃掉
-            clearInterval(timer)
-          }
-        }, 50)
-        return { exit: Promise.resolve(0) }
-      }
-      // 其他命令（node --version / pnpm --version / pnpm install）：喷一行普通日志即可
-      onChunk?.(`${cmd} ${args.join(' ')}: ok\n`)
-      return { exit: Promise.resolve(0) }
-    },
-  }
-}
-
-let _container
-function getContainer() {
-  if (!_container) _container = fakeBoot()       // 单例：只 boot 一次
-  return _container
-}
-
-async function install(args) {
-  const wc = getContainer()
-  await wc.fs.rm('/app')                         // 关键：每次 install 必须清空
-  await wc.fs.mkdir('/app')
-  await wc.fs.writeFile('/app/package.json', '{"name":"app"}')
-  await wc.fs.writeFile('/app/__server.mjs', '/* bundled */')
-
-  let result, heartbeat = Date.now(), serverError
-  const onChunk = (chunk) => {
-    if (chunk.startsWith(PREFIX)) {
-      const parsed = JSON.parse(chunk.slice(PREFIX.length))
-      if (parsed.status === 'heartbeat') heartbeat = parsed.heartbeat
-      else if (parsed.status === 'error') serverError = parsed.error
-      else result = parsed
-      return false                               // 已处理，外层别再写到终端
-    }
-    console.log('[terminal]', chunk.trim())      // 普通日志照常显示
-  }
-
-  await wc.spawn('node', ['--version'], { onChunk })           // ① node 自检
-  await wc.spawn('pnpm', ['--version'], { onChunk })           // ② pnpm 自检
-  await wc.spawn('pnpm', ['install', ...args], { onChunk })    // ③ 真装包
-  await wc.spawn('node', ['__server.mjs'], { onChunk })        // ④ 后台 server
-
-  // getPayload：轮询等 result 被填上
-  while (!result && !serverError) {
-    if (Date.now() - heartbeat > 10000) throw new Error('Server heartbeat timeout')
     await new Promise(r => setTimeout(r, 100))
   }
   if (serverError) throw serverError
   return result
 }
 
-const payload = await install(['vue@3.4.0', 'lodash'])
-console.log('got payload:', payload)
+// 容器内：跑在虚拟机里的脚本，console.log 全带前缀
+const SERVER_CODE = `
+const PREFIX = '${PREFIX}'
+const heartbeat = setInterval(() => {
+  console.log(PREFIX + JSON.stringify({ status: 'heartbeat', heartbeat: Date.now() }))
+}, 100)
+try {
+  // 真实场景下：createInspectorRpcHandlers({ mode:'dev', ... }) + await rpc.getPayload()
+  const payload = { packages: ['vue@3.4.0', 'lodash@4.17.21'] }
+  console.log(PREFIX + JSON.stringify(payload))
+} catch (err) {
+  console.log(PREFIX + JSON.stringify({ status: 'error', error: String(err) }))
+} finally {
+  clearInterval(heartbeat)
+}
+`
+
+// 假运行时实现（这部分只是测试桩，不演原理）
+function makeFakeContainer(): FakeContainer {
+  const files = new Map<string, string>()
+  return {
+    fs: {
+      rm: (_p) => {},
+      writeFile: (p, c) => { files.set(p, c) },
+    },
+    async spawn(cmd, args, onChunk) {
+      const isServer = cmd === 'node' && args[0] === '__server.mjs'
+      if (isServer) {
+        const interval = setInterval(() => {
+          onChunk?.(PREFIX + JSON.stringify({ status: 'heartbeat', heartbeat: Date.now() }))
+        }, 100)
+        setTimeout(() => {
+          clearInterval(interval)
+          onChunk?.(PREFIX + JSON.stringify({ packages: ['vue@3.4.0', 'lodash@4.17.21'] }))
+        }, 300)
+      }
+      return { exit: Promise.resolve() }
+    },
+  }
+}
 ```
 
-跑一遍的输出大致是这样：
+读这段代码时盯紧两件事。第一，server 端没有任何"接收请求"的逻辑：它启动就开始算，算完就喷。第二，宿主侧没有任何"发请求"的逻辑：它启动了 server 之后就在那里轮询 stdout 等 result。这就是把双向 RPC 压成"单向 + 一次性产出"后的具体形状。
 
-```
-[terminal] node --version: ok
-[terminal] pnpm --version: ok
-[terminal] pnpm install vue@3.4.0 lodash: ok
-[terminal] some random log line
-got payload: { packages: [ { name: 'vue', version: '3.4.0' } ] }
-```
+## 6. 执行轨迹
 
-注意：**心跳一行都没出现在终端**——因为它以前缀开头，被回调 `return false` 拦下来了。这就是前缀协议"隐身"的效果。
+输入：用户在落地页输入 `vue@3.4.0 lodash`，按 Enter。
 
-演示虽然用了假运行时，但它把整个套路的形状演透了：单例 boot → 清空 + 写两个文件 → 四步串行 spawn → 后台 server 喷前缀流 → 轮询等结果。真源把假运行时换成 `WebContainer.boot()`、把假 spawn 换成 `wc.spawn`，骨架完全一样。
+**boot 阶段**。第一次访问，模块级 `_promise` 是 null，`WebContainer.boot()` 触发，几秒延迟后 WebContainer 实例就位，终端 UI 上印一行 `> WebContainer is booted.`。后续若再装包，这个 Promise 直接命中缓存，跳过这段。
 
-## 六、关键权衡
+**写文件阶段**。浏览器调 `wc.fs.rm('/app', { recursive: true })` 清空工作目录，再 `mkdir('/app')`，然后写两个文件。一个是 `package.json`，只有 `name/private/type:module` 三个字段，本身没有依赖，依赖全靠命令行注入；另一个是 `__server.mjs`，构建期 inline 的那一大坨字符串。
 
-这一章讲的是"宿主怎么调度子进程"这种系统级机制，权衡高度集中在「为什么选 stdout 前缀」这个根选择上。下面 5 条都从这条根选择里生出来——读完会理解整个设计的来龙去脉。
+**自检 + 装包阶段**。先 `spawn('node', ['--version'])` 和 `spawn('pnpm', ['--version'])` 把环境信息写进终端。接着 `spawn('pnpm', ['install', 'vue@3.4.0', 'lodash'])` 真装包。这条 spawn 不传 onChunk，所以 pnpm 的所有输出（`Resolving...` / `Packages: +5` / `Done`）原样流到 xterm 终端 UI 给用户看。`await process.exit` 等装完。
 
-### 权衡 1：选 stdout 前缀做唯一通道 → 换来零协议层 → 代价是双向通信全断
+**启 server 阶段**。`spawn('node', ['__server.mjs'])` 这次第三个参数 `wait=false`，不阻塞。server 在后台跑，stdout 通过 onChunk 持续被消费。server 进程内部六件事：拉起 devframe RPC handlers（mode 是 `'dev'`，跳过 build 期的 publint + npm-meta 预热）、起一个 100ms 的 `setInterval` 喷心跳、调 `rpc.getPayload()` 开始分析、分析完喷 payload、catch 到错误就喷 error、finally 里清掉心跳定时器。
 
-**做了什么**：server 端不挂 WebSocket server、不监听 postMessage、不读 stdin——所有要传给前端的东西，一律 `console.log(PREFIX + stringify(...))`。
+**stdout 分流阶段**。浏览器这一头的 onChunk 每收到一段就先看前缀。命中前缀的，剥掉、parse、按 status 落到 `heartbeat` / `serverError` / `result` 三个闭包变量之一，`return false` 告诉外层别再写到终端。没命中前缀的，交给 xterm 当日志显示。
 
-**换来什么**：完全没有协议层。不用握手、不用序列化 RPC、不用维护连接状态。浏览器侧的接收逻辑只有十几行（一个 startsWith + 一个 switch）。整个 WebContainer 适配层加起来不到 160 行。
+**轮询完成阶段**。上层调 `backend.functions.getPayload()`，进 dispatcher 的 `case 'nmi:get-payload'`：先把 `heartbeat` 重置成 now、`serverError` 清空，然后进 while 循环，`!result && !serverError` 期间每 100ms 醒一次，检查心跳是否在 10 秒内。result 一旦被填上就立即跳出，返回给上层。上层拿到 payload 后，`Landing.vue` 把 `backend.value` 和 `rawPayload` 都设上，前端从输入框视图切到 `<MainEntry />` 渲染依赖图。
 
-**代价是什么**：浏览器**只能"读"，不能"问"**。前端想要一次新的分析结果怎么办？没法发请求让 server 重算——只能 kill 旧 server、重写 `__server.mjs`、重启。前端的 `getPayload` 是一个"等结果出现"的轮询循环，不是"发起请求"的 RPC 调用。心跳、错误、超时也都靠轮询感知——100ms 一次的检查、10s 才报 timeout，反应速度比真正的双向通信慢一个量级。
+## 7. 教学简化说明
 
-### 权衡 2：选"把 server 整段 bundle 内联进前端" → 换来运行时只写一个文件 → 代价是构建变复杂
+本章演示故意省略了：真的 WebContainer boot（依赖 SharedArrayBuffer、要 COOP/COEP header、要 service worker）、真的 pnpm install（联网、虚拟 fs 解析）、`structured-clone-es` 这个支持 Map/Set/Date 的 JSON 超集序列化库、IndexedDB 缓存与 TTL（已在 npm 元信息拉取一章展开）、xterm 终端 UI 渲染、心跳间隔（100ms）和超时阈值（10s）的具体调优依据。这些都是工程细节，不是核心原理。原理就是上面那一行：贴前缀、读前缀、轮询。
 
-**做了什么**：构建期用 rollup 把整个 server 入口（包括 `node-modules-tools` 这种重量级依赖）打成一个单文件 `runtime/webcontainer-server.mjs`；Nuxt 模块在构建时读这个文件、用 `JSON.stringify` 把它变成一个 JS 字符串常量 `CODE_SERVER`，挂在前端的 virtual module 上。
+## 8. 小结
 
-**换来什么**：运行时拉起一个完整的分析器只要**一次 `wc.fs.writeFile('__server.mjs', CODE_SERVER)`**。不用从 CDN 拉、不用解压、不用按文件树建目录——一行 writeFile，server 就在那儿了。
-
-**代价是什么**：构建链复杂。rollup 要配 alias 把 `node-modules-tools` 指向源码、配 commonjs + nodeResolve + esbuild、配 `inlineDynamicImports: true`。Nuxt 模块还要给 `_prepare` 阶段开个逃生口（那个阶段 rollup 还没产出，返回空字符串）。构建产物里那个字符串常量可能几十 KB 起。
-
-### 权衡 3：选"全局只 boot 一次" → 换来 SPA 内多次 install 不重启 VM → 代价是状态有粘性
-
-**做了什么**：模块级 `_promise` 缓存 `WebContainer.boot()` 的结果，第二次调 `getContainer()` 直接返回缓存。
-
-**换来什么**：用户在落地页连续装不同包时，WebContainer 实例只 boot 一次——首次有数秒延迟，之后每次 install 只走"清空 + 装包 + 起服务器"流程。虚拟机本身（网络栈、内置的 node/pnpm 二进制）跨多次 install 复用。
-
-**代价是什么**：fs 状态有粘性。上一次的 `node_modules` 不删会污染下一次分析——所以每次 install 入口必须显式 `rm -rf /app` + `mkdir`。这条"必须清空"的约束是单例 boot 的直接后果，没法省。如果哪天有人忘了在 install 开头清空目录，bug 立刻出现：用户先装 vue@2 再装 vue@3，第二次的依赖图里会混着第一次的 vue@2。
-
-### 权衡 4：选"伪装成 devframe Backend，但只实现 3 个方法" → 换来前端 90% 代码不感知后端形态 → 代价是高级能力必须 UI 优雅降级
-
-**做了什么**：手写一个 `{ call(method, ...args) }` 的 dispatcher 对象——按 method 名 switch，把 `nmi:get-payload` 路由到上面的轮询循环、把 `nmi:get-packages-npm-meta` 路由到浏览器 IndexedDB。最后返回的 Backend 对象只声明三个 functions：`getPayload / getPackagesNpmMeta / getPackagesNpmMetaLatest`。
-
-**换来什么**：前端的 90% 代码（payload 级联、过滤器、可视化、状态管理）完全不感知后端是 webcontainer 还是 dev 服务器还是静态 dump——它们都长一个 Backend 形状。
-
-**代价是什么**：webcontainer backend **不支持** `getPublint / openInEditor / openInFinder / getReferencePayload*`——这些方法在这个 backend 里压根不存在。UI 必须按 `functions.xxx` 是否存在来条件渲染：能调 publint 的按钮要隐藏、能"在编辑器打开"的菜单项要 disable。如果前端忘了做这个降级，用户点了按钮就会调到 `undefined`，直接报错。
-
-### 权衡 5：选"npm 元信息走浏览器直连 npm registry" → 换来 WebContainer 内不挂网络、boot 快 → 代价是浏览器自己要管 IndexedDB 缓存与 TTL
-
-**做了什么**：依赖列表来自 WebContainer（pnpm 装出来的真实结果），但每个包的 npm 在线元信息（最新版、发布时间、是否废弃）由前端直接 `fetch` npm registry，结果存浏览器 IndexedDB。
-
-**换来什么**：WebContainer 内部的 server 用的是 `driverMemory()`——进程结束即失，不用管持久化。WebContainer 内的网络访问受限（要经 service worker 代理），不如浏览器原生 fetch 直接。boot 也快——不用预热 npm-meta 缓存。
-
-**代价是什么**：浏览器侧要自己管 IndexedDB（两个 store：`nmi:npm-meta` 和 `nmi:npm-meta-latest`）+ TTL 策略（按发布时长 5h~15d）。这套机制和 `npm-meta-fetch` 那一章重合，这里不展开——只要知道"分工是有意的"就行。
-
-## 七、端到端执行轨迹
-
-把上面所有件拼起来，输入 `vue@3.4.0 lodash` 时整个流程长这样：
-
-```
-1. 用户在落地页输入 → 触发 install(['vue@3.4.0', 'lodash'])
-2. getContainer() → 首次 boot WebContainer（数秒延迟，后续 install 复用）
-3. wc.fs.rm('/app') → mkdir → writeFile(package.json) → writeFile(__server.mjs)
-4. spawn node --version       → 自检，stdout 进终端 UI
-   spawn pnpm --version       → 自检，stdout 进终端 UI
-   spawn pnpm install ...     → 真装包，stdout 进终端 UI（用户看进度）
-   spawn node __server.mjs    → 后台启动，stdout 走 onChunk 分流：
-       ↳ 每 100ms 喷一行心跳 → 更新 heartbeat 变量
-       ↳ 分析完成喷一行 payload → 写入 result 变量
-       ↳ 异常喷一行 error    → 写入 serverError 变量
-5. dispatcher.call('nmi:get-payload')
-   ↳ while(!result && !serverError): 检查心跳、sleep 100ms、循环
-   ↳ result 有值 → 返回 payload
-6. backend.functions.getPayload() 返回 → fetchData
-   → backend.functions.getPackagesNpmMeta(specs) 走浏览器 IndexedDB
-7. rawPayload 填上 → Landing.vue 切到 <MainEntry />，渲染依赖图
-```
-
-整个过程用户感受到的是：输入包名 → 看几秒安装进度 → 看到依赖图。背后是单例 VM + 一次性 writeFile + 单向 stdout 协议 + 100ms 轮询，把"网页里跑真 pnpm"这件事跑通了。
-
-## 小结
-
-这一章讲的是"宿主怎么用最少的协议把子进程调度起来"。三个关键件：
-
-- **stdout 前缀协议**——把同一条 stdout 撕成"给用户看的日志"和"给程序读的数据"两条流，靠一个魔法字符串和回调的 `return false` 隐身。
-- **单例 boot + 清空目录**——一次 WebContainer 实例复用多次 install，代价是每次 install 必须显式清空工作目录。
-- **后台 server + 轮询**——用单向通道伪造问答：server 喷数据、浏览器轮询变量，靠心跳同时承担"我还活着"和"卡死检测"两个角色。
-
-四步串行 spawn（node 自检、pnpm 自检、pnpm install、node __server.mjs）把这个套路落到具体命令上。整章的核心选择是"宁可让浏览器轮询，也不在 server 端建反向通道"——这是把 WebContainer 这套机制压在 160 行内的根本原因。
+这一章把上一章 Backend 接口里的"webcontainer 形态"展开了：一台浏览器内的虚拟机、一段构建期内联好的 server、一根靠前缀协议分流的 stdout 管子，再加一个伪装成 devframe 的轮询 dispatcher。它的支点就一条：既然只有 stdout 这根管子能用，那就把它当唯一传输通道，把所有"问答式 RPC"都改造成"启动时一次性产出 + 轮询"。代价是双向通道的丧失，红利是协议层的彻底清零。下一章转向另一种复用同一份 RPC handlers 的方式——CLI 的多形态（dev/build/check/report/mcp），那里没有 stdout 协议问题，但要面对 ANSI 表格与 JSON 双输出格式。

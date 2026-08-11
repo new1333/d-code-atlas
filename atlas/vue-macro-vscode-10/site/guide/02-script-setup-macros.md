@@ -1,188 +1,195 @@
-# `<script setup>` 与内置宏：编译器替你写完那套样板
+# <script setup> 与内置宏的设计动机
 
 > 本章属于 primitive 层。前置：编译期宏的本质。
-> 学完你能用一句话讲清：Vue 为什么把那组 `define*` 宏硬编码进官方编译器、它们去糖成什么形状，以及这个决定为什么反过来逼出了一个叫 Vue Macros 的项目。
+> 学完你能讲清：内置宏到底把声明式 `<script setup>` 去糖成了什么形状，以及为什么这套宏被硬编码进官方编译器——这正是 Vue Macros 之所以存在的痛点。
 
-## 1. 为什么需要它：接线样板拖累了 Composition API
+上一章把宏的存在方式说清楚了：编译期是「变换提示」、运行时被彻底擦除。Vue 用户其实很少需要自己造宏，因为官方编译器里早就内置了一组——`defineProps`、`defineEmits`、`defineModel`、`defineExpose`、`defineOptions` 那一串。这一章就看这些内置宏具体把用户的声明式写法「去糖」成了什么，以及为什么这套宏被焊死在编译器里。
 
-上一章讲了「编译期宏」这个概念——它是只在编译期存在、运行时被擦得干干净净的伪函数，用编译期变换换来了零运行时开销和更声明式的写法。但那个回答留下了一个具体的口子：Vue 官方到底内置了哪几个宏？它们把用户写的代码变成什么形状？又为什么非得「内置」、没法让用户自己加？这一章就接这个口子。
+## 1. 为什么需要它：三层接线样板
 
-回到还没有 `<script setup>` 的年代。用 Composition API 写一个组件，你得套三层跟业务无关的壳：
+回到 `<script setup>` 出现之前。用 Composition API 写一个组件，你得这么开头：
 
 ```js
 export default defineComponent({
-  props: { msg: String },           // 声明①：props 单独写在选项里
-  emits: ['update'],                // 声明②：emits 也单独写
-  setup(props, { emit }) {
-    const count = ref(0)            // 业务逻辑
+  props: { msg: String },        // ① props 在外面单独声明
+  emits: ['update'],             // ② emits 也在外面单独声明
+  setup(props, { emit }) {       // ③ 套一层 setup 包装函数
+    const count = ref(0)
     function inc() { count.value++ }
-    return { count, inc }           // 声明③：模板要用什么，逐个塞进 return
+    return { count, inc }        // ④ 模板要用的，逐个手写 return
   }
 })
 ```
 
-每个组件都得写 `setup` 包装函数、把模板要用的变量逐个塞进 `return`、再把 props 和 emits 单独声明到选项里。组件一多，这套跟业务无关的「接线」重复得让人发麻，Composition API 本该有的简洁被这层脚手架抵消了大半。`<script setup>` 就是为消灭这三件接线样板而生的。
+四件与业务无关的事每写一个组件就得重做一遍：套 `setup` 包装、把模板要用的所有变量塞进 `return`、props 和 emits 在外面再声明一次、`defineComponent` 包一层。组件越多，这层接线重复得越让人麻木，Composition API 本来该有的简洁被这层脚手架抵消了大半。
 
-## 2. 核心思想：把声明式语法「去糖」成等价的 setup()
+更要命的是 props 的类型：在 `<script setup>` 之前，props 的 TS 类型与运行时声明各写一遍，类型推导跟运行时校验是脱节的。`defineProps<T>()` 这种写法出来之后，类型与运行时声明第一次合到了一处——这件事也只有编译期能做，普通 JS 工具拦不住。
 
-`<script setup>` 解决接线样板的方式不是给你一套更短的 API，而是让编译器替你把样板写完。你写的声明式代码，会被逐行「去糖（desugar）」成等价的 `setup() { return {...} }` 加上组件 options。你只声明「想要什么」，编译器生成「怎么接进 Vue 运行时」的全部接线。
+## 2. 核心思想：糖在写法，运行时什么都没变
 
-去糖这个词，可以想象成把一块压缩毛巾泡进水里：它本是紧凑的一小块（声明式源码），泡开后展开成完整的一大块（运行时实际需要的形态）。形状、功能都没变，只是从紧凑写法展开成了运行时要的样子。
+一句话：**编译器把声明式 `<script setup>` 逐行机械去糖成等价的 `setup() + options`**。用户只声明「我要什么」（顶层变量、几个宏调用），编译器替他补出「怎么接进 Vue 运行时」的全部接线。
 
-## 3. 心智模型：一张绑定表撑起整个去糖
+这句话的关键不在「补接线」，而在「**等价**」二字——`<script setup>` 没引入任何新的运行时模型。它编译出来的产物，仍然是 Vue 一直就认的那套 options + setup() 函数。糖的甜味全在写法那一侧，运行时一侧什么都没变。
 
-去糖的过程可以拆成几步，核心是编译器在内存里维护的一张「绑定表」：
+这一点也解释了为什么宏必须擦除：既然运行时模型没变，那宏本身就不该在产物里出现——它只是给编译器看的「请帮我补出 X」的指令。
 
-1. 你在 `<script setup>` 顶层写普通的 JS/TS（变量、函数、import）。
-2. 编译器遍历这段顶层代码，把所有顶层绑定登记进一张表，记下名字和种类（普通常量、ref、函数）。
-3. 命中 `define*` 宏调用时，按这个宏的硬编码规则改写：props 类宏抽成选项层的声明；expose 类宏抽成 setup 返回的 exposed 对象；model 类宏同时生成选项层声明和一个本地代理 ref。
-4. 把绑定表里的顶层绑定自动塞进生成的 `setup()` 返回对象，模板就能看见它们了。
-5. 模板被编译成 render 函数，直接内联进 `setup()` 的闭包，复用同一批绑定。
-6. 宏调用本身在最终产物里被删得干干净净，它们从头到尾只是给编译器看的变换提示。
+## 3. 心智模型：一张绑定表加几次改写
 
-整条流程的灵魂就是那张绑定表：它让「顶层写什么」和「模板能用什么」自动对齐，不用你手写 `return` 去维护这层对应关系。
+把去糖的内部状态想成三个东西在变：
 
-## 4. 关键权衡（本章重头戏）
+1. **绑定表（binding table）**：编译器扫一遍 `<script setup>` 顶层，把每个名字连同它的种类登记进去（普通常量、`ref` 包装、函数、可能从 import 来的）。这张表后面要做两件事——决定哪些东西自动 `return` 给模板、模板里见到这个变量要不要 `.value` 解包。
+2. **宏改写**：命中一个 `define*` 调用，就按这条宏硬编码的规则把它搬到该去的地方：
+   - `defineProps` → 搬到 options 的 `props` 字段
+   - `defineEmits` → 搬到 options 的 `emits` 字段
+   - `defineExpose` → 搬到 setup 返回值之外的「显式暴露通道」
+   - `defineModel` → 同时生成 `props` 声明、`emits` 声明、再加一个本地代理 ref
+3. **自动 return**：绑定表里所有顶层绑定（无论种类），自动塞进生成的 `setup()` 返回对象。模板里就能直接用。
 
-这套机制看着顺手，背后是几个有得有失的决定。
+最后，模板被编译成 render 函数，内联进 setup() 闭包，与用户写的顶层绑定共享同一个作用域；而那些 `define*` 调用本身，在最终产物里**一行不剩**。
 
-### 4.1 硬编码固定宏：开箱即用，但别想自己加
+```
+<script setup> 顶层
+   │
+   ├── 顶层声明 ──► 绑定表 ──► setup() 的 return 对象（模板可见）
+   │
+   └── define* 调用 ──► 按规则改写 ──► options.{props, emits, expose}
+                                     └─► (defineModel) 本地代理 ref
 
-Vue 选择把 `defineProps`、`defineEmits`、`defineModel` 这一组宏直接硬编码在官方编译器里，而不是做成可扩展的插件。
+   宏调用节点本身：编译完删除
+```
 
-- **选择**：固定一组宏、行为写死在编译器里。
-- **换来**：零运行时开销（宏都被擦了）、零配置（不用 import）、跨所有 Vue 项目行为完全统一。
-- **代价**：宏的语义彻底由官方说了算，用户既不能加新宏，也不能改现有宏的行为。官方在 issue 里明确表态过，自定义宏的实现复杂度目前太高，暂不提供公开 API。
+## 4. 关键权衡
 
-**本质矛盾**：是「开箱即用的统一性」和「可扩展性」在打架。选了前者，就得接受后者被锁死。而这个被锁死的口子，正是本书主角 Vue Macros 之所以存在的原因——既然官方编译器不让你加宏，那就绕到编译管线外面自己加。
+> 这是本章重头戏。这四条权衡解释了内置宏为什么长成今天这样——尤其是「为什么用户没法扩展它」这一条，直接接通了全书主角 Vue Macros 的存在理由。
 
-### 4.2 顶层自动暴露给模板：方便了模板，就关紧了后门
+### 硬编码一组宏换零运行时零配置，代价是用户不可扩展
 
-编译器选择把 `<script setup>` 的顶层绑定自动塞进 `return`，让模板直接能用。
+官方编译器（`@vue/compiler-sfc` 的 `compileScript`）里直接写死了一组宏的识别与展开规则：`defineProps`、`defineEmits`、`defineExpose`、`defineModel`、`defineOptions`、`defineSlots`、`withDefaults`、`useSlots`、`useAttrs`。用户在 `<script setup>` 里写它们，既不用 `import`，也不会在产物里留下调用痕迹。
 
-- **选择**：顶层绑定自动暴露给自身模板。
-- **换来**：彻底消灭手写 `return { ... }`。
-- **代价**：组件实例对父组件改成默认关闭。父组件通过 template ref 或 `$parent` 拿到的实例，看不见任何内部绑定，必须用 `defineExpose` 显式点名才能暴露。
+这个选择换来了三样好处：零运行时开销（宏是编译期伪函数）、用户零配置（写出来就能用，不用注册）、跨项目行为完全统一（任何 Vue 3 项目都认同一组宏）。
 
-这里有个反直觉的对称设计：「暴露给模板」和「暴露给父组件 ref」这两条通道，默认值正好相反，模板全开、父组件全关。
+代价是把扩展权完全收走了。用户既不能加新宏，也不能改写现有宏的展开规则。Vue 维护者曾在 issue #6392 里明确表态：自定义宏的复杂度目前太高，官方暂不提供公开 API。这不是文档没写，是设计上故意关上的门。
 
-**本质矛盾**：是「便利」和「封装」在打架。模板要看见内部状态才方便渲染，这是组件自己的事，全开无妨；但父组件能不能戳到内部，是封装边界问题，默认关紧才能防止组件实现被外部耦合。一条通道管「对内自洽」，另一条管「对外有界」，所以默认值才得反过来。
+**它化解的本质矛盾**：「宏必须由编译器认识才能正确展开」与「用户想要官方没提供的、更激进的语法糖」之间的矛盾。Vue 官方把这矛盾往「保守、可控」一侧压到底；这恰恰是 Vue Macros 整个项目存在的理由——它在官方编译器之外另开一条管线，专门补这一刀。这个矛盾会在第 7 章（宏的设计原型）和第 11 章（双轨制）继续展开。
 
-### 4.3 长得像函数，却没有函数的本事
+### 模板默认全开、父组件默认全关：同一条绑定两个相反默认值
 
-宏调用在写法上跟普通函数一模一样（`defineProps(['msg'])`），但上一章讲过，它根本没有函数语义，运行时不存在这次调用。本章只补一个新侧面：这个决定直接限制了宏能怎么用。
+顶层绑定自动塞进 `setup()` 的返回对象，意味着模板对它们是「默认开放」的——你写了什么，模板里就能直接用。但对父组件而言，组件实例是「默认关闭」（closed by default）的：通过 template ref 或 `$parent` 拿到的实例，访问不到任何内部绑定，必须显式 `defineExpose([...])` 才把指定项暴露给父组件。
 
-- **选择**：让宏调用在写法上像函数。
-- **换来**：最小的学习成本，照着函数写就行，不用学新语法。
-- **代价**：宏不能放进 `if` 里按分支调用，不能搬进 composable 函数里复用，也不能被普通 JS 工具当函数来分析。它只活在 `<script setup>` 这个被编译器识别的上下文里，脱离这个上下文就退化成一个未定义的标识符。
+这个选择换来了「消灭手写 `return`」与「不破坏组件封装」两件事的同时成立。代价是心智不对称——同一条 `count` 绑定，自己的模板看得见、父组件 ref 拿不到，初学者常常在 `parentRef.value.count` 是 `undefined` 上卡很久。
 
-**本质矛盾**：是「借函数的写法降低学习门槛」和「保住函数的组合复用能力」在打架。借了写法的壳，就丢了函数能被自由组合的魂。这也是为什么 Vue Macros 后来要专门下功夫做宏的组合化：内置宏的这套约束，恰恰是工程上最疼的地方。
+**它化解的本质矛盾**：「消灭样板要求默认开放」与「组件封装要求默认关闭」之间的矛盾。Vue 把这条线划在了「模板 / 父组件」这条边界上：向自己的模板全开，向父组件全关。两侧的默认值相反，但各自的理由都站得住。
 
-### 4.4 defineModel：一个宏顶三件套，代价是去糖变重
+### 宏长得像函数，但没有任何函数语义
 
-双向绑定过去要手写三件套：一个 prop 声明、一个 emit 声明、一个本地 ref（读时取 prop、写时 emit）。`defineModel()` 把这三件缩成一行。
+宏的写法就是函数调用的样子：`defineProps([...])`、`defineModel()`。用户照普通函数写就行，几乎零学习成本。
 
-- **选择**：用一个宏同时声明 prop + emit + 本地代理 ref。
-- **换来**：双向绑定从三件套缩成一行，心智负担大幅下降。
-- **代价**：这个宏的去糖规则明显比 `defineProps` 重，它要生成一个带 `get`/`set` 的代理 ref：`get` 时读 prop 值，`set` 时触发 emit。展开逻辑非平凡，反过来也抬高了「用户想自造一个类似宏」的门槛。
+代价在第 1 章已经点过，这里换一个角度强调它对**组合性**的限制。宏不能放在 `if` 里按分支条件调用，也不能搬进一个 composable 函数里复用，更不能被普通的 JS 工具（打包器、tree-shaker、ESLint 规则）当成函数来分析。原因不神秘：宏依赖编译器在 `<script setup>` 上下文里按调用名识别，一旦搬出这个上下文，它就只是个普通标识符——而运行时根本不存在对应的函数。
 
-**本质矛盾**：是「源码尽可能简洁」和「去糖规则尽可能简单」在打架。宏能承载的模式越重，源码就越短，但去糖器的实现、以及用户模仿它的成本就越高。这条权衡恰好说明，去糖不只是机械替换文本，它能承载真正非平凡的语义改写。
+**它化解的本质矛盾**：「写法要像普通 JS 才好上手」与「语义必须特殊才能触发编译期变换」之间的矛盾。Vue 选了「看起来像、其实不是」这条路，把语义特殊性藏在编译器里，换取最低的写法门槛。
 
-## 5. 最小原理演示：40 行去糖器
+### defineModel 一个宏打包双向绑定的三件套
 
-下面这段代码不追求复刻官方编译器，只演透「去糖」这一个动作：它把声明式的顶层语句，变成等价的 `setup()` 返回结构加选项层声明。三个带圈序号分别对应上面心智模型的第 2、3、4 步。
+`const m = defineModel()` 一行写完，背后同时生成了三样东西：一个 `modelValue` prop 声明、一个 `update:modelValue` emit 声明、一个本地可读写的代理 ref（读等于取 prop 值，写等于 emit 更新事件）。
+
+这一选择换来了双向绑定从「手写三件套」缩成一行，对常用模式是个明显的减负。代价是该宏的展开规则比其它宏重得多——它要生成一个带 `get`/`set` 的代理对象，把读写翻译成两条不同的运行时通道。这反过来证明「去糖」能承载非平凡的模式，但也意味着用户想自己造一个类似的宏（比如「带校验的双向绑定宏」），需要复刻一整套等价的运行时产物——这正是上一条权衡说的「扩展权被收走」的具体落地。
+
+**它化解的本质矛盾**：「想让常用模式一行写完」与「模式越复杂、编译器展开规则越重」之间的矛盾。
+
+## 5. 最小原理演示：一个去糖器
+
+下面是一个极简的去糖器——输入顶层语句的结构化描述，输出等价的 `setup()` + 选项。代码只演示「登记绑定 → 命中宏改写 → 擦除宏调用」这三步，每一步对应上面心智模型里的一个原理点。不演示真实的 AST 解析、TS 类型推导、sourcemap、defineModel 的代理 ref 包装。
 
 ```ts
-// 简化的「<script setup> 去糖器」
-// 输入：顶层语句列表，每条用最小节点描述（名字 + 种类 + 可选的宏信息）
-// 输出：等价的 setup() 返回结构 + 选项层声明
+// 简化的 <script setup> 去糖器
+// 输入：顶层语句的极简结构化描述（真实编译器走的是 AST，这里用结构化数据替代以聚焦去糖动作）
+// 输出：等价的 setup() 函数体 + 组件 options
 
-type BindingKind = 'const' | 'ref' | 'fn'
-type MacroKind = 'props' | 'emit' | 'expose'
+type Stmt =
+  | { kind: 'macro'; name: 'defineProps' | 'defineEmits' | 'defineExpose' | 'defineModel'; arg?: any }
+  | { kind: 'const'; name: string; isRef?: boolean }   // isRef: true 表示被 ref(...) 包装
+  | { kind: 'fn'; name: string }
 
-interface TopStatement {
-  name: string
-  kind: BindingKind
-  macro?: MacroKind        // 命中宏调用时填，如 props 宏
-  macroArg?: string[]      // 宏的参数，如 defineProps(['msg']) 的 ['msg']
-}
+type Binding = { name: string; unwrapInTemplate: boolean }
 
-interface DesugarResult {
-  options: Record<string, string[]>   // 选项层声明（props / emits）
-  setupReturn: string[]               // setup() 返回的绑定名
-  exposed: string[]                   // defineExpose 暴露给父组件的
-}
+function desugar(stmts: Stmt[]) {
+  const options: Record<string, any> = {}
+  const bindings: Binding[] = []
 
-function desugarScriptSetup(stmts: TopStatement[]): DesugarResult {
-  const bindings: Record<string, BindingKind> = {}   // ① 绑定表
-  const options: Record<string, string[]> = {}
-  const exposed: string[] = []
-
+  // 扫一遍顶层：命中 define* 就按硬编码规则搬到 options；普通声明登记进绑定表，
+  // 顺便记下模板里要不要 .value 解包
   for (const s of stmts) {
-    if (s.macro) {                                   // ② 命中宏调用，按硬编码规则改写
-      if (s.macro === 'props')  options.props  = s.macroArg ?? []
-      if (s.macro === 'emit')   options.emits = s.macroArg ?? []
-      if (s.macro === 'expose') exposed.push(...(s.macroArg ?? []))
-      continue                                       // 宏产物归选项层/exposed，调用节点删掉
+    if (s.kind === 'macro') {
+      if (s.name === 'defineProps') options.props = s.arg
+      else if (s.name === 'defineEmits') options.emits = s.arg
+      else if (s.name === 'defineExpose') options.expose = s.arg
+      else if (s.name === 'defineModel') {
+        options.props = ['modelValue']
+        options.emits = ['update:modelValue']
+      }
+      continue   // 宏调用不进绑定表——它的产物只落到 options 层
     }
-    bindings[s.name] = s.kind
+    bindings.push({
+      name: s.name,
+      unwrapInTemplate: s.kind === 'const' && !!s.isRef,
+    })
   }
 
-  const setupReturn = Object.keys(bindings)          // ③ 用绑定表生成 return
-  return { options, setupReturn, exposed }
+  // 绑定表里的所有顶层绑定自动塞进 setup() 的 return（模板可见 = 默认开放）
+  const returned = bindings.map(b => b.name).join(', ')
+
+  // 宏调用本身从产物里彻底删除——它们从头到尾只是给编译器看的指令
+  options.setup = `(__props) => {
+  /* 用户原顶层代码（宏调用已被擦除；defineProps 的左值会被替换成取 __props） */
+  return { ${returned} }
+}`
+
+  return options
 }
 ```
 
-三步一一对应：第 ① 步建绑定表，第 ② 步识别宏调用并改写成选项层或 exposed，第 ③ 步用绑定表生成 return。宏调用在循环里走的是 `continue` 分支，等于在最终产物里被删掉——这就是「运行时不存在」在代码里的落点。
+骨架就这三步。真实编译器要复杂得多——它要在真正的 AST 上走、要处理 TS 类型推导、要生成 defineModel 那种带 `get`/`set` 的代理 ref、还要保留 sourcemap 让产物能回溯到用户源码。但去糖这个动作的核心——「扫一遍 → 命中改写 → 自动 return + 删除宏」——就是上面这点东西。
 
-## 6. 执行轨迹：拿一段真实写法走一遍
+## 6. 执行轨迹：一行具体输入走完三步
 
-输入是这段声明式源码：
+输入（声明式 `<script setup>`）：
 
 ```js
-// <script setup>
 const props = defineProps(['msg'])
 const count = ref(0)
 function inc() { count.value++ }
 ```
 
-去糖器把它表达成这样一个语句列表（伪节点）：
+**第一遍扫描**——逐行处理：
 
-```
-[ {name:'props', kind:'const', macro:'props', macroArg:['msg']},
-  {name:'count', kind:'ref'},
-  {name:'inc',   kind:'fn'} ]
-```
+| 源码 | 处理 | 状态变化 |
+|---|---|---|
+| `const props = defineProps(['msg'])` | 命中 `defineProps`，宏改写 | `options.props = ['msg']`；调用节点删除，左值 `props` 改为取 `__props` |
+| `const count = ref(0)` | 普通常量声明，进绑定表 | `bindings = [{ name: 'count', unwrapInTemplate: true }]` |
+| `function inc() {...}` | 普通函数声明，进绑定表 | `bindings += [{ name: 'inc', unwrapInTemplate: false }]` |
 
-跑一遍 `desugarScriptSetup`，中间态和产物如下：
+**生成 return 对象**——绑定表里所有名字自动暴露给模板：`return { count, inc }`。注意 `props` 不在里头，因为它已经被抽到 `options.props` 去了，模板里要用直接写 `{{ msg }}` 而不是 `{{ props.msg }}`。
 
-| 步骤 | 状态 |
-|------|------|
-| 遍历完 props 语句 | 选项层 `{ props: ['msg'] }`，绑定表 `{}` |
-| 遍历完 count | 绑定表 `{ count: 'ref' }` |
-| 遍历完 inc | 绑定表 `{ count: 'ref', inc: 'fn' }` |
-| 生成 return | `setupReturn: ['count', 'inc']` |
-
-注意 props 这条：它走的是宏分支，产物归选项层，自己不进绑定表，所以也不出现在 return 里——这对应一个细节，props 在模板里本就经由 props 机制可见，不需要再被 setup 返回一次。最终输出的等价形态（简化后）长这样：
+**最终产物**（去糖后的等价形态，已简化）：
 
 ```js
-function setup(__props) {
-  const props = __props         // props 宏的产物：拿到入参
-  const count = ref(0)
-  const inc = () => { count.value++ }
-  return { count, inc }         // 顶层绑定自动暴露给模板
+export default {
+  props: ['msg'],          // defineProps 改写到选项层
+  setup(__props) {
+    const props = __props  // 宏调用擦除后，左值变成取 setup 入参
+    const count = ref(0)
+    function inc() { count.value++ }
+    return { count, inc }  // 顶层绑定自动暴露给模板
+  }
 }
-// 选项层：{ props: ['msg'] }
 ```
 
-`defineProps(['msg'])` 这行调用在产物里已经不存在了，它只留下两样东西：选项层的一条 `props` 声明，和 setup 里的 `const props = __props`。这就是去糖的全貌：声明式输入，机械展开成 setup() 返回值加选项层。
+宏在产物里一行不剩。读这段产物，就像读一个普通手写的 options + setup() 组件——这正是「去糖」想要的效果。
 
 ## 7. 教学简化说明
 
-这段演示故意省略了不少东西：完整的 SFC 解析（template / style / 自定义块）、TypeScript 类型到运行时声明的完整推导、sourcemap、`defineModel` 那个带 get/set 的代理 ref 包装细节、import 解构里「值 import 还是类型 import」的区分，还有普通 `<script>` 与 `<script setup>` 共存的合并规则。这些都是真实编译器要处理的工程细节，但不影响你看清「去糖」这个核心动作。另外，去糖时维护一张「绑定表」是这个演示对实现机制的还原：你能观察到「顶层绑定自动暴露给模板」这个行为，官方编译器内部确实靠类似方式登记顶层绑定，但具体数据结构文档没有明说，这里按最直观的形态来表达。
+本章演示故意省略：完整 SFC 解析（template / style / 自定义块的处理）、TS 泛型 props 到运行时声明的完整推导、sourcemap 生成、`defineModel` 的代理 ref 包装细节、import 解构里「值 import vs 类型 import」的边界区分、`<script>` 与 `<script setup>` 共存时的合并规则、`withDefaults` 给仅类型 props 生成默认值的具体步骤。这些会在后续章节随用随补，本章只演透「去糖」这一个动作。
 
 ## 8. 小结
 
-说到底，`<script setup>` 和它那组 `define*` 宏，就是编译器替你写掉了 Composition API 的接线样板：用一次去糖换来了声明式的写法，代价是这组宏被硬编码、没法扩展。而这个「不能扩展」，正是 Vue Macros 被逼出来的原因。
-
-但这些宏到底是在编译管线的哪一步、用什么方式被识别和改写的？为什么必须靠 AST 而不是正则去抓它们？下一章「SFC 编译管线与宏的注入时机」就接着拆这条管线。
+`<script setup>` 没有发明新的运行时模型，它只是把用户写的声明式顶层代码机械展开成 Vue 一直就认的 `setup() + options` 形态——宏是这套展开规则的指令。这套机制把扩展权彻底收走，正是 Vue Macros 要补的缺口。下一章我们跟进编译管线，看 `compileScript` 在哪个阶段识别宏调用、为什么必须挂在那一步。

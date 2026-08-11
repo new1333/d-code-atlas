@@ -4,305 +4,268 @@ title: 收藏夹树形结构与本地缓存
 
 # 收藏夹树形结构与本地缓存
 
-## 场景：一个会爆量、又不能一次拉完的列表
+> 本章属于 composite 层。前置：侧边栏内容列表、知乎 JSON API 写操作客户端。
+> 学完你能：用一句话讲清「为什么收藏夹要切成多级树、为什么同一棵树要混用两种分页协议、为什么判停要多道闸、为什么缓存只服务选单」。
 
-想象一下你打开知乎的收藏页。你创建的夹子、你关注的夹子加起来可能有几十个；随便点开一个夹，里面可能塞着一百多条收藏。如果按热榜那种「首屏一口气全量拉」的玩法去加载收藏夹，会发生两件事：
+## 1. 为什么需要它（设计动机）
 
-- 请求超时——数据太多；
-- 把浏览器实例和 Cookie 一通烧，烧到反爬限频，整个扩展都用不了。
+上一章把评论区做成父子两层、用游标分页续传，解决了「分页深、不重复、可展开收起」。但评论区只是「一篇回答下的两层小数据」——一旦把视角放大到「我所有的收藏」，问题立刻换了一个量级：一个人可能创建了几十个夹、关注了几十个夹、每个夹里又可能有上百条收藏项，全量加起来轻松上千条。
 
-而如果你干脆不缓存，那每次「把这篇文章收进收藏夹」时弹出的选单，都得重新拉一遍夹子列表——用户操作一次就拉一次，体验也极差。
+把这么大的集合按热榜那种扁平列表「首屏一次拉完」会撞上两堵墙：
 
-所以核心矛盾就一句话：**数据会爆量，但单次请求又贵又脆**。这一章讲的就是怎么在这两端之间搭一座桥——把数据切成「展开才加载的多级树」，再配上「带续传点的本地缓存」。
+- **反爬限频**：单次请求拉一千条，要么超时，要么把浏览器实例和 Cookie 烧到失效。
+- **首屏白白浪费**：用户大多只想看其中一两个夹，把全部夹和项都拉回来毫无意义。
 
-> 在开始之前先点一句去重：树形事件驱动刷新、状态化渲染、把 HTML 解析成节点这套机制，已在第 5 章『侧边栏内容列表』里讲透了，本章只看它的新侧面——「多级递归取孩子 + 展开时按需懒加载」。同样，写操作走 JSON API、伪造请求头、Cookie 校验那一套，已在第 4 章『知乎 JSON API 写操作客户端』讲透，本章只看「选单跨次操作时复用带续传点的缓存」这个新侧面。这两块原理下面不再重演。
+扁平列表还表达不出「夹包含项」这层关系。收藏夹天然是三级结构——「我创建的/我关注的 → 收藏夹 → 收藏项」——一级展开才进入下一级。
 
-## 第一层基本件：把「夹」抽象成一个自带分页状态的小对象
+更要命的是另一个高频场景：「在某条内容上点收藏 → 弹一个选单 → 选个夹」。这个选单每次都要重新拉一遍夹列表，体验极差；但不缓存又怕过期，新建夹后选单里看不到新夹用户会炸。
 
-先看最底层那块。热榜那章里，一个列表项就是一条数据，扁平、互不相关。但收藏夹不能这么建模——一个「夹」自己就带着「里面装了多少条」「上次加载到第几条」「还有没有更多」这些状态，而这些状态只属于这个夹，不属于整棵树。
+所以本章面对的矛盾是：**数据天然会爆量、且分布在三种层级 + 两种数据源里**，但**反爬与请求成本让单次拉取必须克制**，同时**选单这种高频路径又必须复用**。
 
-所以最自然的设计是：**把分页状态挂到每个夹对象本身**。一个夹长这样（简化）：
+前置章已经讲透的两件事，本章只看它们的新侧面：「侧边栏内容列表」教过的「树协议 + 事件驱动刷新 + 状态化渲染」在本章升级为**多级递归取孩子 + 展开时按需懒加载**；「写操作 API 客户端」教过的「统一请求构造 + Cookie 校验」在本章被**带续传点的缓存**复用——这两块原理不重演。
+
+## 2. 核心思想
+
+把一个一次拉不完的集合，切成「**展开才加载的多级树**」+「**两种分页协议并存**」+「**带续传点的本地缓存**」，再用**多重「还有没有更多」的判定互相兜底**——任何单一手段都不够，必须四件一起上。
+
+说人话就是：**承认数据拉不完，转而让用户每次只点亮一小片**；**承认接口不可靠，转而让多道判定互证**。
+
+## 3. 心智模型
+
+### 3.1 三级树 = 取孩子函数按 contextValue 分派
+
+VSCode 的 TreeDataProvider 协议只问一件事：`getChildren(element?)`。收藏夹把它当成一个分派器：
+
+- 没传 element（根级）→ 返回「点击加载收藏夹」按钮，或两个二级根节点「我创建的」「我关注的」
+- element 是「我创建的根 / 我关注的根」→ 返回该分组的夹列表
+- element 是「夹」→ 返回该夹内的收藏项列表，外加可能的「加载更多」按钮
+
+**夹对象本身带着四元状态**：`items[]`（已加载项）、`currentOffset`（偏移游标）、`isLoaded / isLoading`（防重入双标志）、`hasMore`（是否还有下一页）。分页状态**内聚到每个夹对象本身**——没有一张全局分页表。展开哪个夹，就读哪个夹自己的游标。
+
+### 3.2 选单缓存 = 数据 + 续传点 + 时间戳
+
+`CollectionCache` 这个静态对象只存四件东西：夹列表、总数、上次到第几页（`lastPage`）、时间戳。命中时连同 `lastPage` 一起返回，下次接着往后翻；30 分钟过期。
+
+注意：**这个缓存只服务「点收藏时弹出的选单」，不服务侧边栏树**。树每次刷新都走真实拉取；选单才走缓存。两条路径完全不交叉。
+
+### 3.3 总流程（A → B → C → D）
+
+```
+A. 用户点开收藏视图
+   → 根级返回「点击加载」按钮（零请求）
+B. 点击 → 拉 HTML 第 1 页 → 解析出「我创建的」「我关注的」两组夹
+   → 渲染成两个二级根节点
+C. 展开某夹 → 该夹 isLoaded=false
+   → 立即返回占位项、同时异步拉接口首页（offset=0）
+   → 首页回来 → 去重 + 追加 + 偏移前移 + 三道闸判停 → fire 刷新
+D. 用户对某内容点收藏 → 弹选单
+   → 30 分钟内有缓存 → 复用（连同 lastPage）
+   → 否则从首页拉
+```
+
+## 4. 关键权衡
+
+### 展开才加载，换来用户没看到的夹零成本
+
+**选择**：把取孩子函数设计成「在返回孩子的同时，如果发现这个夹还没加载过，就 fire-and-forget 触发一次真实拉取」。第一次 `getChildren` 立刻返回——要么是空列表（占位），要么是已加载的项；真正拉数据是异步进行的，拉完再 `fire(onDidChangeTreeData)` 让树重画。
+
+**换来**：用户没展开的夹永远零请求、零浏览器开销。首屏连一次接口都不发。
+
+**代价**：第一次展开必然有一次「占位项 → 真实数据」的视觉跳变。而且必须用「`isLoaded` + `isLoading`」**两个标志位同时**防重入——只设一个 `isLoading` 不够，因为渲染线程会在它置位前再问一次取孩子函数。
+
+> **化解的本质矛盾**：用户想随时看到全部数据 vs 反爬限频让一次拉全部必然失败。出路是把「看到」降级为「展开才看」——把首屏成本从「数据总量」改成「用户的好奇心」。
+
+### 同一棵树里混用两种分页协议
+
+**选择**：收藏夹这层走「HTML 页面分页」（拉 `/people/{token}/collections?page=N`、用浏览器渲染再解析 DOM）；收藏项这层走「JSON 接口的偏移分页」（拉 `/api/v4/collections/{id}/items?offset=N&limit=20`）。两层各自管各自的「下一页」概念，互不干扰。
+
+**换来**：两种数据源各取所长——夹列表需要私密标识、作者头像、更新时间这些**只在页面 DOM 里**的信息；夹内项只需要**结构化数据**，走接口更干净。
+
+**代价**：得维护两套「分页续传 + 终止判定」逻辑。更糟的是，两套判定**本质上都不可靠**（页满启发式与接口总数都会漂移），所以必须再叠一层兜底（见下条）。
+
+> **化解的本质矛盾**：同一个树协议里的同一种「分页」需求 vs 两种数据源各有所长。出路是让取孩子函数把两种分页协议透明掉——上层只看到「夹节点 / 收藏项节点」，不感知下面拉的是 HTML 还是 JSON。
+
+### 多道「还有没有更多」的闸门互证
+
+**选择**：因为「本页满 20 条 ≠ 真有下一页」「接口返回的总数会漂移」，单靠任何一种判定都会让分页在已耗尽的列表后无限转圈。于是叠三道闸门互相兜底：
+
+- **闸 1**：有总数时，比 `已加载数 ≥ 总数`；若已加载数已经超过接口宣称的总数，就把总数**就地修正**为已加载数（以实际为准，不再信接口）。
+- **闸 2**：没总数时退化为启发式——本页条数「是 20 的倍数」就认为可能还有下一页，不足一页立即判停。
+- **闸 3**：不论上面两道怎么判，只要「这一页加载前后，列表数量没变」，强制判停——这是对「接口返回空数组」「解析全失败」这类边界最后的兜底。
+
+**换来**：三种失效模式各自单独都会让分页死循环，叠加起来就绝不会无限空转。
+
+**代价**：判停逻辑分散在三个位置；总数被就地修正后，UI 上显示的总数与接口宣称的可能不一致。
+
+> **化解的本质矛盾**：接口给的「总数」不可靠 vs 不能让用户看到无限转圈。出路是放弃「单一可信源」的执念，转而**让多个不可靠判定互证**——任何一个判停了就停。
+
+### 选单走缓存续传，树每次走真实拉取
+
+**选择**：把「展示路径」与「高频复用路径」拆开。侧边栏树每次刷新都走真实拉取（浏览器 + 接口），不碰缓存；只有「点收藏弹选单」这条高频路径才读缓存。缓存里除了夹列表，还存「上次到第几页（`lastPage`）」，下次接着往后翻；30 分钟过期。
+
+**换来**：跨次收藏操作不重复拉夹列表，省浏览器实例、省接口配额。
+
+**代价**：30 分钟窗口内，用户在别处新建/删除的夹不会自动出现。所以代码强制在「新建夹」「删除夹」成功后**主动清缓存**——把代价约束在「写操作瞬间」。
+
+> **化解的本质矛盾**：高频复用同一份夹列表 vs 每次都拉太贵。出路不是「全缓存」或「全不缓存」，而是**承认两条路径对新鲜度的要求不同**——展示路径必须新鲜（每次真拉），高频路径可以容忍 30 分钟延迟（缓存 + 写后清）。
+
+## 5. 最小原理演示
+
+下面这段脚本不依赖 VSCode，能直接用 `node`/`bun` 跑。它演示三件事：**懒加载时序**（取孩子时未加载就返回占位 + 异步触发）、**不可靠终止的多层兜底**（三道闸）、**缓存续传点**（命中后从 `lastPage` 接着翻）。一个假接口（总数 45、每页 20、最后一页只回 5 条）演完整套机制。
 
 ```ts
-interface CollectionFolder {
+// 一个夹对象：把分页状态内聚到自己身上，没有全局分页表
+type Folder = {
   id: string;
-  title: string;
-  items: CollectionItem[];     // 已加载的收藏项
-  currentOffset: number;       // 当前游标（下次从这开始拉）
-  totalCount: number | null;   // 接口宣称的总数（可能漂移）
-  isLoaded: boolean;           // 有没有加载过
-  isLoading: boolean;          // 正在加载吗（防重入）
-  hasMore: boolean;            // 还有没有更多
-}
-```
-
-说人话就是：每个夹自己揣着「我加载到哪了」「我还有没有更多」的小账本，而不是把这些塞进一张全局分页表。为什么这样设计？因为同一时刻用户可能展开好几个夹，每个夹的进度都不一样。如果硬要用全局表，表的键就得是夹 id，最后还是退化成「每夹一份状态」——不如一开始就挂在夹上，干净。
-
-## 第二层机制：取孩子按 contextValue 分派，懒加载藏在返回里
-
-有了「夹」这个对象，再往上一层：怎么把它组织成树？
-
-收藏夹天然是三级结构：
-- 根：两个二级根节点——「我创建的」「我关注的」
-- 第二级：夹列表
-- 第三级：某个夹里的收藏项
-
-VSCode 的树协议只问一件事：`getChildren(element?)`——给我这个节点的孩子。所以三级树全靠这一个函数表达，函数体里用 `element.contextValue`（节点的上下文标签）来分派：
-
-```ts
-function getChildren(element) {
-  if (!element)                                       return getRoot();
-  if (element.contextValue === "myCollectionsRoot"
-      || element.contextValue === "followingRoot")   return getFolders(element);
-  if (element.contextValue === "folder")              return getFolderItems(element);
-}
-```
-
-**懒加载就藏在第三档里**。当用户展开一个夹，`getChildren` 被调用时，如果这个夹的 `isLoaded` 是 false（没加载过）且 `isLoading` 也是 false（不在加载中），就**在返回当前孩子的同时，异步发起真实请求**——也就是「返回即触发」：
-
-```ts
-function getFolderItems(folder) {
-  if (!folder.isLoaded && !folder.isLoading) {
-    folder.isLoading = true;
-    loadCollectionItems(folder.id);   // 真实代码里是 fire-and-forget，不 await
-  }
-  return folder.items;                // 第一次返回的可能是占位/空，加载完会再发事件刷新
-}
-```
-
-这一招是本章的核心时序：**取孩子函数不阻塞等待加载，而是立刻返回（可能只是占位项），把真实加载甩到后台**。后台拉到数据后，往夹的 `items` 里追加，再发一个「树数据变了」的事件，VSCode 就会重新调用 `getChildren`，把真实数据渲染出来。
-
-这个时序换来的是「用户没展开的夹永远零成本」——你有一百个夹，但只点开三个，那就只发三次请求，其余九十七个夹一个请求都不发。代价是首次展开必然有一次「占位 → 真实数据」的视觉跳变，而且必须用 `isLoaded` 和 `isLoading` **两个标志位同时**防重入——只设一个会被快速的并发点击反复触发。
-
-> 顺便提一句根级的设计：第一次打开收藏视图时，根级显示一个「点击加载收藏夹」按钮，**不主动发任何请求**。点击之后才发起拉取。这是同一个懒加载思想在「整棵树还没初始化」时的体现——首屏零请求。
-
-## 第三层机制：两种分页协议并存，且都不可靠
-
-到这里，夹列表怎么加载、夹内项怎么加载，得分别说。这里有个很现实的问题：**同一棵树里，这两层用的根本不是同一种分页**。
-
-- **夹列表这层走 HTML 页面分页**：拉 `/people/{token}/collections?page=N`，浏览器渲染 HTML 再解析。为什么不用 JSON？因为私密标识、作者头像、夹的更新时间这些字段，**只在页面 DOM 里**，JSON 接口拿不到。
-- **夹内项这层走 JSON 偏移分页**：拉 `/api/v4/collections/{id}/items?offset=N&limit=20`，要的是结构化数据，方便去重和分页。
-
-两种协议各自的「分页终止判定」都得自己写，而且——这是关键——**两套判定都本质不可靠**。不可靠的原因有几条：接口宣称的总数会漂移、最后一页可能不满 20 条、甚至可能返回 0 条。
-
-于是有了「还有没有更多」的**三道闸**，互相兜底：
-
-1. **第一道闸：有总数就比总数**。已加载数 ≥ 接口给的总数 → 停。
-2. **第二道闸：没总数就退化为启发式**。本页条数不是 20 的倍数（即不满一页）→ 停。
-3. **第三道闸：加载前后数量没变就强制判停**。这一页一条都没新增 → 一定停。
-
-第一道闸还会**就地修正总数**——如果接口说有 45 条但实际加载到第 50 条还没停（因为漂移），就以实际为准，把 totalCount 改成 50，**不再信接口**。
-
-这道闸的取舍很清楚：单靠任何一种判定都会出问题。比如「接口宣称有 100 条但只返回 80 条就停了」会让用户永远点不到底；「只看本页是否满 20」在接口提前返回 0 条时会无限空转。三道闸换来「绝不无限空转」，代价是判定逻辑分散在多处，第一次读会觉得「为什么要写三遍停」——因为有任何一遍漏了，都会变成无限加载。
-
-## 第四层机制：选单专用缓存，带续传点，与树刷新分离
-
-最后一块。前面讲的「树」是侧边栏里的展示路径。但收藏夹还有另一条消费路径：用户读一篇文章，点了「收藏」按钮，弹出一个**选单**让他挑要收进哪个夹。这个选单跨次操作会反复弹——今天读十篇文章、收十次，选单就弹十次。
-
-如果每次弹都重新拉一遍夹列表，那就太浪费了。所以这条路径上挂了一个本地缓存：
-
-```ts
-const cache = {
-  collections: Collection[],     // 夹列表
-  totalCount: number,
-  timestamp: number,             // 写入时刻
-  lastPage: number,              // 上次加载到第几页（续传点）
+  items: { id: string; created: number }[];
+  currentOffset: number;
+  isLoaded: boolean;
+  isLoading: boolean;
+  hasMore: boolean;
+  totalCount?: number; // 接口可能给、可能不给、还可能给错
 };
-const CACHE_EXPIRY = 30 * 60 * 1000;   // 30 分钟过期
-```
 
-命中（30 分钟内）时，选单直接用缓存数据，跳过接口请求；并且**从 `lastPage` 续传**——如果用户上次在选单里点过「加载更多」，这次再弹选单时从上次的下一页继续，不必从头来。
+// 假接口：总数 45、每页 20、最后一页只回 5 条
+function fakeFetchItems(folderId: string, offset: number) {
+  const total = 45;
+  const count = Math.max(0, Math.min(20, total - offset));
+  const items = Array.from({ length: count }, (_, i) => ({
+    id: `${folderId}-item-${offset + i}`,
+    created: Date.now() + offset + i,
+  }));
+  return Promise.resolve({ items, total });
+}
 
-**这里有个极易踩的坑**：这个缓存**只服务选单**，不服务树。侧边栏的树每次刷新都走真实加载（浏览器 + 接口），不读缓存。这是两条独立的数据消费路径：
+// 拉取一页：去重 + 偏移前移 + 三道闸判停
+async function loadOnePage(folder: Folder) {
+  const before = folder.items.length;
+  const { items, total } = await fakeFetchItems(folder.id, folder.currentOffset);
 
-- 树刷新：要展示给用户看「现在」的夹子，必须新鲜 → 不缓存
-- 选单：高频复用、用户能容忍 30 分钟内的新鲜度损失 → 缓存
+  // 用 created 去重（跨 answer/article/question 三种类型稳定，避免 id 命名空间冲突）
+  const seen = new Set(folder.items.map((i) => i.created));
+  const fresh = items.filter((i) => !seen.has(i.created));
+  folder.items.push(...fresh);
+  folder.currentOffset += fresh.length;
 
-把两者当一条路径会写出 bug——比如「我刚新建了个夹，为什么选单里看不到？」答案就是：新建夹后必须**主动清缓存**，否则选单在窗口内一直用旧数据。
+  if (typeof folder.totalCount === "undefined") folder.totalCount = total;
 
-## 演示：跑一遍三道闸和缓存续传
+  // 闸 1：有总数就比总数；已加载数反而超过接口宣称的总数，就地修正
+  if (folder.items.length >= (folder.totalCount ?? Infinity)) {
+    folder.totalCount = folder.items.length;
+    folder.hasMore = false;
+  }
+  // 闸 2：本页不足一页（启发式：20 的倍数才可能还有下一页）
+  else if (items.length % 20 !== 0) {
+    folder.hasMore = false;
+  }
+  // 闸 3：加载前后列表数量没变（接口返回空或全重复），强制判停
+  else if (folder.items.length === before) {
+    folder.hasMore = false;
+  }
+}
 
-下面这段脚本能直接用 `node`/`bun` 跑。它演示三件事：懒加载时序、三道闸在哪一道判停、缓存续传点怎么被写入与读回。
+// 取孩子：未加载就立即返回占位 + 异步触发真实拉取
+function getChildren(folder: Folder): string[] {
+  if (!folder.isLoaded && !folder.isLoading) {
+    folder.isLoading = true; // 防重入双标志之一，跟 isLoaded 一起把窗口压死
+    loadOnePage(folder).then(() => {
+      folder.isLoaded = true;
+      folder.isLoading = false;
+      console.log(
+        `  [刷新] 已加载 ${folder.items.length}/${folder.totalCount}，hasMore=${folder.hasMore}`
+      );
+    });
+    return ["（加载中…）"]; // 占位项立即返回，让取孩子函数同步可返回
+  }
+  return folder.items.map((i) => i.id);
+}
 
-```ts
-// demo.ts —— 可用 `bun run demo.ts` 或 `npx tsx demo.ts` 跑
-//
-// 假数据源：接口宣称总数=45，每页 20；第 3 页只回 5 条（不满 → 第二道闸）
+// 选单专用缓存：数据 + 续传页号 + 时间戳，30 分钟过期
+type Cache = { folders: string[]; lastPage: number; ts: number } | null;
+let cache: Cache = null;
+const TTL = 30 * 60 * 1000;
 
-const CLAIMED_TOTAL = 45;
-const PAGE_SIZE = 20;
-
-function fakeFetchItems(offset: number): Promise<{ items: any[]; total: number }> {
-  return new Promise((resolve) => {
-    setTimeout(() => {
-      const remaining = Math.max(0, 45 - offset);
-      const count = Math.min(PAGE_SIZE, remaining);
-      const items = Array.from({ length: count }, (_, i) => ({
-        created: offset + i,    // 用 created 当去重键（跨 answer/article/question 三类稳定）
-      }));
-      resolve({ items, total: CLAIMED_TOTAL });
-    }, 10);
+function fakeFetchFolderPage(page: number) {
+  return Promise.resolve({
+    folders: [`夹A-p${page}`, `夹B-p${page}`],
+    reachedEnd: page >= 2,
   });
 }
 
-// 夹对象：分页状态挂在自身
-function makeFolder(id: string) {
-  return {
-    id,
-    items: [] as any[],
+async function loadFoldersForPicker() {
+  const now = Date.now();
+  if (cache && now - cache.ts <= TTL) {
+    console.log(`[选单] 命中缓存，跳过接口，复用 ${cache.folders.length} 个夹`);
+    return cache.folders;
+  }
+  console.log("[选单] 缓存过期或不存在，从首页拉");
+  let page = 1;
+  const folders: string[] = [];
+  while (true) {
+    const { folders: cur, reachedEnd } = await fakeFetchFolderPage(page);
+    folders.push(...cur);
+    if (reachedEnd) break;
+    page++;
+  }
+  // 续传点随数据一起写入；下次命中缓存就不用再翻一遍
+  cache = { folders, lastPage: page, ts: now };
+  return folders;
+}
+
+async function main() {
+  const folder: Folder = {
+    id: "fav-1",
+    items: [],
     currentOffset: 0,
-    totalCount: null as number | null,
     isLoaded: false,
     isLoading: false,
     hasMore: true,
   };
-}
 
-// 三道闸的核心：去重 + 追加 + 偏移前移 + 判停
-async function loadMore(folder: any) {
-  if (!folder.hasMore) return;
-  const before = folder.items.length;
+  console.log("第 1 次取孩子：", getChildren(folder)); // 占位 + 异步触发
+  await new Promise((r) => setTimeout(r, 50));
 
-  // 第一道闸：有总数时比总数
-  if (folder.totalCount !== null && folder.items.length >= folder.totalCount) {
-    folder.hasMore = false;
-    console.log(`[闸1] 已加载数 ${folder.items.length} ≥ 总数 ${folder.totalCount} → 停`);
-    return;
-  }
-
-  const { items: fetched, total } = await fakeFetchItems(folder.currentOffset);
-  folder.totalCount = total;
-
-  // 去重（按 created）+ 追加 + 偏移前移
-  const existed = new Set(folder.items.map((i) => i.created));
-  const fresh = fetched.filter((i) => !existed.has(i.created));
-  if (fresh.length > 0) {
-    folder.items.push(...fresh);
-    folder.currentOffset += fresh.length;
-  }
-
-  // 第二道闸：本页不满一页 → 启发式判停
-  if (fetched.length < PAGE_SIZE) {
-    folder.hasMore = false;
-    console.log(`[闸2] 本页 ${fetched.length} < ${PAGE_SIZE} → 停`);
-    return;
-  }
-
-  // 第三道闸：加载前后数量没变 → 强制判停，且就地修正总数
-  if (folder.items.length === before) {
-    folder.hasMore = false;
-    folder.totalCount = folder.items.length;
-    console.log(`[闸3] 加载前后都是 ${before} → 强制停，总数修正为 ${folder.totalCount}`);
-    return;
-  }
-
-  console.log(`本轮 +${fresh.length}，累计 ${folder.items.length}`);
-}
-
-// 懒加载触发点：取孩子时「未加载且非加载中」就触发
-// 真实代码里 loadMore 是 fire-and-forget；这里为了日志顺序用了 await
-async function expandFolder(folder: any) {
-  if (!folder.isLoaded && !folder.isLoading) {
-    folder.isLoading = true;
-    console.log("展开夹 → 立刻返回占位，后台开始拉首页");
-    await loadMore(folder);
-    folder.isLoaded = true;
-    folder.isLoading = false;
-  }
-}
-
-async function main() {
-  const folder = makeFolder("c1");
-
-  await expandFolder(folder);          // 第一次展开：触发懒加载
   while (folder.hasMore) {
-    await loadMore(folder);            // 用户反复点「加载更多」
+    console.log("点「加载更多」…");
+    await loadOnePage(folder);
+    console.log(
+      `  已加载 ${folder.items.length}/${folder.totalCount}，hasMore=${folder.hasMore}`
+    );
   }
-  console.log("最终加载条数:", folder.items.length);
 
-  // —— 缓存写入：连同「上次到第几页」一起 ——
-  const cache = {
-    collections: folder.items,
-    totalCount: folder.totalCount,
-    timestamp: Date.now(),
-    lastPage: Math.ceil(folder.currentOffset / PAGE_SIZE),
-  };
-  console.log(`缓存写入：lastPage = ${cache.lastPage}，下次选单命中后从此处续传`);
+  console.log("\n--- 第一次拉选单 ---");
+  await loadFoldersForPicker();
+  console.log("\n--- 第二次拉选单（30 分钟内）命中缓存 ---");
+  await loadFoldersForPicker();
 }
 
 main();
 ```
 
-跑出来的轨迹大致是：
+跑一遍能看到：第一次 `getChildren` 立刻返回「加载中…」，然后异步日志显示加载到 20 条；点「加载更多」翻到 40 条；再点只回 5 条（不足一页），**闸 2 触发**判停，`hasMore` 翻成 false。选单第二次拉时直接命中缓存，完全不进接口。
 
-```
-展开夹 → 立刻返回占位，后台开始拉首页
-本轮 +20，累计 20
-本轮 +20，累计 40
-[闸2] 本页 5 < 20 → 停
-最终加载条数: 45
-缓存写入：lastPage = 3，下次选单命中后从此处续传
-```
+## 6. 执行轨迹
 
-注意三件事：
+输入：一个夹，接口宣称 `totalCount=45`、每页 20 条。
 
-1. **第一道闸没触发**——因为接口宣称总数=45，加到第 45 条之前已经被第二道闸拦下。这就是「三道闸互相兜底」的意思：哪一道先撞上就停，不靠任何一道独自扛。
-2. **总数没被就地修正**——因为本次假数据是诚实的。如果接口宣称 45 但实际只回得到 40 条，第三道闸会把 totalCount 改成实际值。
-3. **缓存的 `lastPage`**——这是续传点。下次选单命中缓存，从第 4 页开始拉（如果用户在选单里再点「加载更多」）。
+| 步骤 | 动作 | 内部状态 | 触发哪道闸 |
+|---|---|---|---|
+| 1 | 展开夹 | `isLoaded=false` → 立即返回「加载中…」并异步拉首页 | — |
+| 2 | 首页回来 | `items.length=20`、`currentOffset=20`、`hasMore=true` | 闸 1：20 < 45；闸 2：20%20=0；闸 3：变了。继续 |
+| 3 | 点「加载更多」 | `items.length=40`、`currentOffset=40`、`hasMore=true` | 闸 1：40 < 45；闸 2：20%20=0；闸 3：变了。继续 |
+| 4 | 再点「加载更多」 | 接口只回 5 条 → `items.length=45`、`currentOffset=45` | 闸 1：45 ≥ 45，**判停**（闸 2 也成立：5%20≠0） |
 
-## 关键权衡（四条）
+**对照变体**：若某一页接口实际只回 0 条（加载前后数量没变），即使闸 1、闸 2 都没触发，**闸 3 也会判停**，且 `totalCount` 被就地修正为 `items.length`——这就是「以实际为准，不再信接口」。
 
-下面四条权衡是这一章的核心交付。每一条都是「做了 X 选择 → 换来了 Y → 代价是 Z」的具体取舍。
+## 7. 教学简化说明
 
-### 权衡 1：懒加载的占位 + 异步请求
+本章演示故意省略了：
 
-**做了什么选择**：取孩子函数不阻塞，遇到「未加载的夹」就**立刻返回占位、同时异步发起真实请求**。
+- **HTML 解析细节**：cheerio 选择器的多路回退（属解析脆弱性，与原理无关）。
+- **VSCode TreeItem 的展示属性**：tooltip、图标、缩略图宽度、CollapsibleState——纯 UI。
+- **节点 ID 的展开态记忆**：夹节点用稳定 ID 让宿主记住展开态、按钮用随机 ID 强制重建——属宿主契约细节。
+- **写后乐观更新**：新建夹成功后 `unshift` 进本地列表、删除夹 `splice`、再延迟刷新——属交互层。
 
-**换来**：用户没展开的夹，请求成本永远是零。一百个夹只点开三个，就只发三次请求；首屏也零请求（根级是「点击加载」按钮）。
+## 8. 小结
 
-**代价**：
-- 首次展开必然有一次「占位 → 真实数据」的视觉跳变；
-- 必须用 `isLoaded` 和 `isLoading` **两个标志位同时**防重入——只设一个会被快速的双击或 VSCode 的并发取孩子反复触发加载。
-
-### 权衡 2：同一棵树里混用两种分页协议
-
-**做了什么选择**：夹列表层走 HTML 页面分页，夹内项层走 JSON 偏移分页。
-
-**换来**：两种数据源各取所长——HTML 拿到只在 DOM 里出现的私密标识、作者头像、夹更新时间；JSON 拿到结构化、好去重、好运筹的收藏项。
-
-**代价**：两套「分页终止判定」逻辑都得自己维护；而且——见下一条——两套都本质不可靠，所以还得再叠一层兜底。
-
-### 权衡 3：三道闸互相兜底
-
-**做了什么选择**：「还有没有更多」用三道闸判定——有总数比总数、没总数退化启发式、加载前后数量没变强制停。
-
-**换来**：绝不无限空转。哪怕接口宣称的总数漂移、哪怕最后一页只回 0 条，都能停下来。
-
-**代价**：
-- 判定逻辑分散在多处，第一次读会觉得啰嗦；
-- 第一道闸还会**就地修正总数**（以实际为准，不再信接口）——读代码的人一开始会困惑「为什么把接口给的总数改了」。
-
-### 权衡 4：选单专用缓存 + 续传点，与树刷新分离
-
-**做了什么选择**：收藏选单这条高频复用路径，挂一个 30 分钟 TTL 的本地缓存；缓存里除了数据还存「上次到第几页」，下次从断点续传。
-
-**换来**：跨次操作不重复拉取（省浏览器实例、省接口、省 Cookie）。今天读十篇文章收十次，夹列表只拉一次。
-
-**代价**：
-- 30 分钟窗口内可能看到过期的夹子，所以**每次新建/删除夹后必须主动清缓存**；
-- 缓存与树刷新是**两条独立路径**，混为一谈就会写出 bug——树每次刷新都走真实加载，缓存只在选单被读取。这是这一章最容易被读者误读的一点。
-
-## 小结
-
-把这一章的原理提炼成一句话：**把一个一次拉不完的集合，切成「展开才加载的多级树」+「两种分页协议并存」+「带续传点的本地缓存」，并用多重「还有没有更多」的判定互相兜底**。
-
-这里有几个互相独立的判断在共同起作用：
-- 「夹」的对象把分页状态挂进自身——因为同一时刻多个夹各自有进度；
-- 取孩子函数把懒加载藏在返回里——为了零首屏成本；
-- 同一棵树混用两种分页——因为两种数据源字段不一样；
-- 三道闸判停——因为没有任何单点判定是可靠的；
-- 选单缓存与树刷新分离——因为两条路径对「新鲜度」的容忍度不同。
-
-这些判断**单独看都像是「为特殊情况写的补丁」**，但组合起来，它们共同回答了一个问题：在一个数据会爆量、又不能一次拉完、又会被反复打开的场景里，怎么把请求成本压到最低，同时不让用户在「无限加载」和「过期数据」之间二选一。
-
-下一章会换个完全不同的方向——『智能伪装引擎』。它解决的是另一个问题：当摸鱼时 webview 一失焦，怎么把标签页的标题和图标瞬间换成看起来像真实工作文件的样子，让路过的人看不出你在摸鱼。那是个和数据加载无关、但同样需要在「稳定不闪」与「每次随机更真实」之间反复权衡的设计。
+收藏夹这一章把评论章的「两层 + 一种分页」扩到了「三级 + 两种分页 + 多层判停 + 选单缓存」。真正值得带走的是这套思路：**数据会爆量就把它切成树**、**接口不可靠就让多个判定互证**、**路径高频就单独缓存它**。下一章换口味，讲摸鱼的灵魂——失焦时怎么把整个界面换皮成假代码编辑器。

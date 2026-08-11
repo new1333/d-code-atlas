@@ -1,237 +1,234 @@
----
-title: "模板与渲染函数的重定向"
----
-
 # 模板与渲染函数的重定向
 
-想象你写 Vue 写熟了，某天突然有几个"别扭"的需求冒出来：这一段渲染逻辑分支太多，写在 `<template>` 里全是嵌套三元，想换成 JSX；你从 React 过来，习惯性地敲了 `export default` 想直接当渲染入口；你给插槽声明了精确的类型，却发现引入了没用的运行时代码；你想在同一个文件里复用一小段模板，又懒得为它单独抽一个子组件。
+> 本章属于 composite 层。前置：SFC 解析与增量 AST 编辑、编译期注入虚拟 helper 模块。
+> 学完你能：用一句话讲清「Vue 默认渲染来源只有 template 一种、vue-macros 怎么在不改 Vue 的前提下把它扩展到四种新形态、代价是什么」。
 
-原生 Vue 对这些诉求要么做不到，要么写法割裂。本章要讲的四个宏，就是把这四种"非默认的渲染来源"在编译期统一重定向成 Vue 认得的形态。重定向完，运行时跑的还是 Vue 那套原生渲染——宏只在编译期干活。
+## 1. 为什么需要它
 
-## 一个共同的问题：渲染从哪来
+上一章把 v-if/v-for 等模板指令翻译成 JSX 表达式，让 JSX 也能享有指令语义。但那章藏了一个前提——你得先选了 JSX。Vue 默认只认两种渲染来源：声明式的 `<template>` 块，或 `setup()` 函数末尾 `return` 一个渲染函数。
 
-可以把渲染来源想象成水龙头接的水源。Vue 默认只给你接了一根叫 `<template>` 的水管，偶尔允许你在 setup 里 `return` 一个渲染函数当备用。本章四个宏做的事，是给四条新水管装上转接头，让它们也能接到 Vue 的渲染出口上：
+可现实里写代码的人常常撞到这道墙：用 JSX 或 `h()` 写完渲染逻辑，还得自己手动把它包成 `return () => (...)`；习惯 React 的人下意识写 `export default <div/>`，Vue 编译器直接不认；只想给插槽声明精确类型、不想为类型多塞一行运行时代码，原生没这个能力；想在同一个 SFC 里复用一段模板、又懒得抽成独立子组件——只能复制粘贴。
 
-| 宏 | 你写的样子 | Vue 最终认的样子 | 本质 |
-|---|---|---|---|
-| define-slots | `defineSlots<T>()` | `/*defineSlots*/` | 整段抹掉，只留类型 |
-| define-render | `defineRender(jsx 或 h())` | `return jsx 或 h()` | 表达式搬进 return |
-| export-render | `export default h()` | `defineRender(h())` | 把 export 翻译成 defineRender |
-| named-template | `<template is="x"/>` | 调用 `块_x.render()` | 模板片段提升为可复用渲染单元 |
+本章四个宏就是把这些「非默认渲染来源」在编译期重定向成 Vue 认得的形态。define-render 把 setup 里任意一行调用变成渲染函数 return；export-render 把 export default 当渲染入口；define-slots 把纯类型插槽声明整段抹掉；named-template 把可命名复用的模板片段拉成虚拟模板模块。
 
-下面从最简单的那个讲起，一步步走到最复杂的 named-template。
+## 2. 核心思想
 
-## 最简单的那个：define-slots，把类型声明整个擦掉
+**渲染来源是一个可重定向的编译期接口，不是 Vue 的硬性约束**——只要在编译期能把「一段表达式」摆到 setup 末尾的 return 后、或者把整条语句抹成注释、或者把它引到一个虚拟模板模块，运行时根本不需要 Vue 知道有这么个机制存在。换句话说，「渲染入口唯一」是语法层的现象，不是语义层的硬约束。
 
-你给一个组件的插槽写了精确的类型，纯粹是给 IDE 和队友看的，运行时完全不需要它存在。
+## 3. 心智模型（以 named-template 为例）
 
-define-slots 做的事直接得让人意外：找到 setup 里的 `defineSlots(...)` 调用，把整条语句覆写成一条注释，运行时零残留。
+四个宏里 named-template 最复杂，把它讲清就能串全章。它的转换横跨三阶段、四类对象：
 
-```ts
-// 你写的
-defineSlots<{
-  default: (props: { item: Item }) => any
-}>()
-
-// 编译期被改成
-/*defineSlots*/
+```
+源 SFC
+  ├─ <template> 主模板：含 <template is="card"/>
+  └─ <template name="card"> 命名模板（用户定义的复用片段）
+        │
+        ▼  [preTransform · 源阶段]
+源 SFC 改写后
+  ├─ 主模板：引用处 <template is="card"/> → <component is="named-template-card"/>（动态组件占位）
+  ├─ 主模板内容外置到虚拟模块（避免和命名模板互相干扰）
+  └─ 命名模板：HTML 存进内存字典 templateContent[filename][name]、原节点就地隐藏
+        │
+        ▼  [Vue 自己的模板编译器跑一遍]
+编译产物 JS
+  └─ 占位被编译成 _createVNode(_resolveDynamicComponent('named-template-card'))
+        │
+        ▼  [postTransform · 产物阶段]
+最终 JS
+  ├─ 顶部补 import block_card from "<命名模板虚拟模块>"
+  ├─ 主模板 render 改成可变参数 (...args)
+  └─ 占位调用改写成 block_card.render(...args)
 ```
 
-为什么覆写成注释而不是直接删？因为这样那行代码在编辑链里原地"蒸发"，不改变周围代码的位置（基于偏移的增量编辑是第 1 章讲透的地基，这里只是它最朴素的应用）。
+四个角色：源 SFC（用户写的）、内存字典 templateContent（跨阶段共享状态）、虚拟模块（运行时由 load 钩子返回 render 委托）、编译产物 JS（Vue 编译器吐出的、含可识别的内部函数调用）。define-render 与 export-render 只在源/产物一端操作、define-slots 只在源端擦除，没有 named-template 这么多阶段。
 
-这里出现本章第一组核心权衡。
+## 4. 关键权衡
 
-**权衡一（擦除而非注入）**：define-slots 选择把整条调用替换成注释，换来零运行时开销——不像双向绑定宏那样注入运行时 helper，类型信息只活在编译期供 IDE 使用。代价是它必须卡在 Vue 编译擦除 setup 之前介入（插件用 `enforce: 'pre'`，抢在 Vue 前面），否则 Vue 看到一个不认识的 `defineSlots` 函数会直接报错；而且它自己不产生任何运行时行为，纯粹是个类型层工具。这个设计恰好和第 3 章「编译期注入虚拟 helper 模块」形成一组镜像对照：第 3 章是往源码里加东西（注入），这一节是把源码里的东西抹掉（擦除）。
+### 渲染来源下沉到 setup 任意位置
 
-## define-render：在 setup 任意位置用一行声明渲染来源
+**选择**：define-render 找到 setup 函数体里的 `defineRender(arg)` 调用、把它的实参搬到所在块的 `return` 后面、删掉调用本身。
 
-你想用 JSX 或者 `h()` 写渲染逻辑，因为这一段动态分支太多，写模板反而绕。
+**换来**：用户可在 setup 任意位置用一行声明渲染来源，不必非写在最后 `return`；JSX、`h()` 返回值、已有渲染函数引用都能直接喂进去；非函数实参（如 JSX 求值结果）自动包一层惰性 `() =>` 函数。
 
-最直观的写法本来是 setup 函数末尾 `return` 一个渲染函数。但 define-render 让你不用非得写在最后——你在 setup 体的任意位置写一行 `defineRender(渲染来源)`，它会帮你把这一行变成函数的 return。
+**代价**：这个宏必须在「Vue 把 `<script setup>` 编译成 setup() 函数体之后」才能介入（时序晚于大多数宏，`enforce: 'post'`），且要小心处理「setup 里本就有 return」的情况——必须先把旧 return 删掉，否则会出现两个 return。
 
-具体怎么变？先看看这个函数块里有没有已经存在的 return，有的话先删掉（否则会冒出两个 return）；接着在 return 的位置（或块末尾）插入 `return`，把你传给 defineRender 的实参搬到 return 后面；最后把 `defineRender(` 和配对的 `)` 这两个壳删掉。说人话就是：**把你那一行调用拆开，留下它的实参，再把实参挂到一个新建的 return 上。**
+这里有两个对立的需求在打架：`<script setup>` 想保持「setup 体写啥就是 setup 函数体内容」的简洁，而用户想「渲染来源只是 setup 里的一行普通语句、不是末尾的 return」。Vue 选了前者（return 必须在最后），define-render 把 return 从语法结构降级成「一行调用就能触发的副作用」。
 
-这里有个讨巧的细节。渲染函数要求的是"函数"，而你传进来的可能是个"值"——比如 `<h1>hi</h1>` 这种 JSX、或者 `h('div')` 这种 `h()` 调用，它们一求值就是个 vnode 对象，不是函数。define-render 检测到这种情况，会自动给你包一层惰性函数：`return () => (<h1>hi</h1>)`。但如果你传的是已经写好的渲染函数引用（一个标识符），或是个箭头函数，它就老老实实 `return`，不再多包。
+### 命名模板分两阶段：源层占位 + 编译产物改写
 
-下面这段最小演示，用一组语句对象模拟 setup 函数体，演透这套搬运动作：
+**选择**：定义阶段在 SFC 源层操作模板 AST（把命名模板内容外置、给引用处插占位 `<component is="named-template-X"/>`），等 Vue 自己编译完后，在 JS 产物层再识别占位、改写成命名模板 render 调用。
+
+**换来**：能完整复用 Vue 自己的「模板→render」编译管线，命名模板自动享有 v-if/v-for 等全部指令能力，插件不用自己造模板编译器；引用占位走 Vue 正常的动态组件解析路径（`<component is>`），不引入新概念。
+
+**代价**：后一阶段（postTransform）必须识别 Vue 编译器吐出的内部产物函数（`_createVNode` / `_createBlock` / `_resolveDynamicComponent`）——这些是不稳定的内部 API，编译策略或 Vue 版本一变就可能失效；而且同一个占位在不同位置会被编译成两种形态（普通创建节点 `_createVNode` vs 作为 block 根的 `_createBlock`+Fragment 包裹），必须分两条改写路径。
+
+打架的双方是「想直接复用 Vue 编译器、不重造模板编译轮子」和「Vue 编译器只认它自己的产物函数、不会替插件留稳定接口」。named-template 的解法是绕到编译器身后、在产物里做改写，承担 Vue 内部 API 变动的风险。
+
+### 命名模板内容外置成虚拟模板模块
+
+**选择**：把命名模板的 HTML 存进插件内存字典 `templateContent[filename][name]`，用虚拟模块加载机制（复用前置章「虚拟 helper 模块」的三件套）把它像独立模板一样返回、交给 Vue 编译；当别处 import 这个虚拟模块时，返回一段 render 委托代码（指向真正的模板资源）。
+
+**换来**：命名模板享有与主模板完全相同的编译能力，一段 HTML 被当作正经模板编译成 render；且能被任意多处 import 复用，同一份编译逻辑既服务主模板也服务命名模板。
+
+**代价**：必须在很早的源阶段就把模板文本暂存、跨到加载阶段才取出（跨阶段状态共享，靠虚拟 id 里的 filename 关联）；还要把主模板也用外置 src 指向虚拟模板，避免命名模板与主模板共存于同一个 SFC 时让 Vue 编译困惑——这一步看起来多余，其实是为了让命名模板与主模板走对称的独立编译路径。
+
+一边是「想让命名模板是真正的模板、享有 v-if/v-for 等完整编译能力」，另一边是「Vue 编译器一次只编一个 SFC 的一个 template」。named-template 把每个命名模板都「骗」成独立的虚拟模板文件，让 Vue 编译器以为自己在编第四个、第五个 SFC。
+
+### 纯类型宏走「擦除」而非「注入」
+
+**选择**：define-slots 找到 setup 里的 `defineSlots(...)` 调用，整条语句覆写成注释 `/*defineSlots*/`，运行时零残留。
+
+**换来**：零运行时开销（不像双向绑定宏那样注入运行时 helper），类型信息只留在编译期供 IDE 与类型检查使用——插槽签名是纯类型层契约。
+
+**代价**：必须在 Vue 编译擦除 setup 之前就介入（`enforce: 'pre'`），否则 Vue 编译器看到未知函数会报错；它本身不产生任何运行时行为，纯粹是类型层工具。
+
+一边是「想给插槽声明精确类型」，另一边是「不想引入任何运行时代码」。define-slots 的解法与前一章「编译期注入 helper」恰好相反：一个往源码加东西（运行时桥接），一个把源码抹掉（纯类型擦除），两者都是用编译期改写换不同诉求。
+
+## 5. 最小原理演示
 
 ```ts
-// 用语句对象模拟 setup 函数体（真实插件里是基于偏移操作源码，第 1 章已展开）
-type Stmt =
-  | { type: 'expr'; name: string; arg: string; raw: string }
-  | { type: 'return'; raw: string }
-  | { type: 'other'; raw: string }
+// 演示 defineRender：把 setup 体内一行 defineRender(arg) 改写成块末尾的 return arg
+// 含两个细节：先删旧 return（否则会有两个 return）；非函数实参包一层惰性 () => 让 JSX/h() 求值结果能当渲染函数
+const setupBefore = `
+function setup() {
+  const count = ref(0)
+  defineRender(h('div', count.value))
+  return someOldReturn
+}`
 
-function defineRenderRewrite(body: Stmt[]): Stmt[] {
-  // 1) 先删掉已有的 return —— 避免出现两个 return
-  body = body.filter(s => s.type !== 'return')
-
-  // 找到 defineRender 那一行
-  const idx = body.findIndex(s => s.type === 'expr' && s.name === 'defineRender')
-  if (idx === -1) return body
-  const call = body[idx] as Extract<Stmt, { type: 'expr' }>
-
-  // 2) 判定实参是不是"函数或标识符"：是则原样，否则要惰性包裹
-  const arg = call.arg.trim()
-  const isFnOrId = /=>/.test(arg) || /^function/.test(arg) || /^[a-zA-Z_$]\w*$/.test(arg)
-  const returned = isFnOrId ? arg : `() => (${arg})`
-
-  // 3) 把 defineRender(arg) 这一整行，原地改写成 return
-  body[idx] = { type: 'return', raw: `return ${returned}` }
-  return body
+function redirectRender(code: string): string {
+  const callMatch = code.match(/defineRender\((.+)\)/)
+  if (!callMatch) return code
+  const arg = callMatch[1]
+  // 删旧 return，否则 setup 会出现两个 return
+  let out = code.replace(/  return someOldReturn\n/, '')
+  // 删 defineRender 调用本身
+  out = out.replace(/  defineRender\(.+\)\n/, '')
+  // 实参是 h(...) 表达式（非函数、非标识符），包惰性函数；插入到块末尾 return
+  out = out.replace(/\}/, `  return () => (${arg})\n}`)
+  return out
 }
 
-const print = (body: Stmt[]) => body.map(s => s.raw).join('\n')
-
-// 场景 A：setup 末尾本来 return 了别的东西，现在改用 JSX
-console.log(print(defineRenderRewrite([
-  { type: 'other', raw: 'const state = ref(0)' },
-  { type: 'return', raw: 'return { }' },
-  { type: 'expr', name: 'defineRender', arg: '<h1>{state.value}</h1>', raw: 'defineRender(<h1>{state.value}</h1>)' },
-])))
-// 输出：
-// const state = ref(0)
-// return () => (<h1>{state.value}</h1>)      ← 旧 return 被删，JSX 被惰性包裹
-
-// 场景 B：传的是已经写好的渲染函数引用
-console.log(print(defineRenderRewrite([
-  { type: 'other', raw: 'const myRender = () => h("div")' },
-  { type: 'expr', name: 'defineRender', arg: 'myRender', raw: 'defineRender(myRender)' },
-])))
-// 输出：
-// const myRender = () => h("div")
-// return myRender                             ← 标识符，不包裹
+console.log(redirectRender(setupBefore))
+// function setup() {
+//   const count = ref(0)
+//   return () => (h('div', count.value))
+// }
 ```
-
-注意 define-render 的插件用的是 `enforce: 'post'`——它必须等 Vue 把 `<script setup>` 编译成真正的 `setup()` 函数体之后才动手。因为你要操作的"函数块"和"return 语句"，是 Vue 编译产物里才成型的结构，源码层的 `<script setup>` 还没有函数体的概念。
-
-**权衡二（把渲染函数声明降级为任意位置的一行调用）**：define-render 选择"找到那行调用，把实参搬到所在函数块的 return 后面"，换来你能在 setup 任意位置用一行声明渲染来源，不必非写在最后；而且 JSX、h() 返回值、已有的渲染函数引用都能直接喂进去（值类型自动包惰性函数）。代价是它必须晚于大多数宏介入（post 时序），且要小心处理 setup 里本就有 return 的情况——先删旧 return 是硬规矩，漏了就会出现两个 return。
-
-### export-render：define-render 的前置适配器
-
-如果你是从 React 过来的，可能更习惯 `export default` 当渲染入口。export-render 就是给你这个习惯补的适配器：它在源码层（`enforce: 'pre'`）找到 setup 里的 `export default <声明>`，把声明的文本切出来、删掉原语句，包成 `defineRender(...)` 追加到 `<script setup>` 末尾。
 
 ```ts
-// 你写的
-export default () => h('div', count.value)
+// 演示命名模板两阶段：源层把命名模板 HTML 暂存 + 引用占位；产物层识别 Vue 内部调用并改写
 
-// export-render 改写成
-defineRender(() => h('div', count.value))
-```
-
-改写完，剩下的活它就不操心了——交给上面的 define-render 插件兜底，把 `defineRender(...)` 变成 `return`。所以 export-render 自己不碰 return，它只负责把 `export default` 这个语法翻译成 define-render 认识的 `defineRender()` 调用。两个宏一前一后（export-render 是 pre，define-render 是 post），接力完成"用 export 写渲染"这件事。
-
-## named-template：把内联模板提升为可复用的渲染单元
-
-你在一个 SFC 里反复用到一小段相同的模板结构，抽成独立子组件太重，内联复制又难维护。命名模板让你给一段模板起个名字，在主模板里随时引用。
-
-这是本章最复杂的宏，它最能串起"重定向"这个主题。先建立一个简化的执行轨迹，看一遍它到底经历了什么：
-
-```
-你写的 SFC
-  └─ ① 源阶段(插件 pre)：命名模板的 HTML 存进内存字典；引用处 <template is="card"/> 变成 <component is="named-template-card"/> 占位符；主模板内容外置
-      └─ ② Vue 自己编译主模板：占位被编译成 _createVNode(_resolveDynamicComponent("named-template-card"))
-          └─ ③ 产物阶段(插件 post)：识别出上面那个调用，改写成 block_card.render(...args)，顶部补 import
-              └─ ④ 命名模板虚拟模块被加载：card 的 HTML 被当作正经模板编译成 render
-                  └─ ⑤ 运行时：引用处实际调用 block_card.render()，渲染出复用的片段
-```
-
-为什么要拆成"源阶段"和"产物阶段"两步、中间还插一个 Vue 自己的编译？这是本章最关键的设计决策，留到下面权衡里展开。先看两段最小演示把这条轨迹走一遍。
-
-第一段演示源阶段的占位改写：
-
-```ts
-// 跨阶段共享的内存字典：真实插件里靠虚拟 id 的 filename 关联 pre 和 post 两个插件闭包
-const store: Record<string, any> = { templateContent: {} }
-
-// === 源阶段（preTransform）===
-function preTransform(src: string): string {
-  // 1) 命名模板内容存字典、就地隐藏
-  const named = src.match(/<template name="(\w+)">([\s\S]*?)<\/template>/)
-  if (named) store.templateContent['App.vue'] = { [named[1]]: named[2] }
-
-  // 2) 主模板里 <template is="X"/> 改写成动态组件占位符
-  let main = src.replace(
-    /<template is="(\w+)"\s*\/>/g,
-    (_, n) => `<component is="named-template-${n}"/>`,
-  )
-  // 3) 删掉命名模板的定义本身
-  return main.replace(/<template name=\w+>[\s\S]*?<\/template>/, '')
-}
-
-const sfcSource = `
-<template><main><template is="card"/></main></template>
-<template name="card"><div class="card">card body</div></template>
+// 输入：用户写的 SFC（含命名模板 card、主模板里用 is="card" 引用）
+const sfc = `
+<template>
+  <h1>Main</h1>
+  <template is="card"/>
+</template>
+<template name="card"><div class="card">hi</div></template>
 `
-console.log(preTransform(sfcSource))
-// 输出：
-// <template><main><component is="named-template-card"/></main></template>
-//                                              ↑ 占位符：交给 Vue 当动态组件处理
-console.log(store.templateContent)
-// { 'App.vue': { card: '<div class="card">card body</div>' } }
-//                                              ↑ HTML 暂存，等加载阶段取
-```
 
-源阶段干完，Vue 接手编译主模板。它会把 `<component is="named-template-card"/>` 这个动态组件编译成一行创建节点的调用。我们把 Vue 吐出来的产物"假装"成下面这样（真实产物里 `_createVNode`/`_resolveDynamicComponent` 是 Vue 编译器内部的产物函数名）：
+// 跨阶段共享的内存字典（源阶段存、加载阶段取）
+const templateContent = new Map<string, string>()
 
-```ts
-const vueCompiled = `
-import { _createVNode, _resolveDynamicComponent } from 'vue'
+// 阶段 1：preTransform —— 在 SFC 源层操作
+function preTransform(sfc: string): string {
+  // 取出命名模板 HTML、暂存到内存字典（外置成虚拟模板模块）
+  const namedMatch = sfc.match(/<template name="(\w+)">([\s\S]+?)<\/template>/)
+  if (namedMatch) templateContent.set(namedMatch[1], namedMatch[2])
+  // 删除命名模板原节点
+  let out = sfc.replace(/<template name="\w+">[\s\S]+?<\/template>\n/, '')
+  // 引用 <template is="X"/> → 动态组件占位 <component is="named-template-X"/>
+  out = out.replace(/<template is="(\w+)"\/>/g, (_, n) =>
+    `<component is="named-template-${n}"/>`)
+  return out
+}
+
+const afterPre = preTransform(sfc)
+// <template>
+//   <h1>Main</h1>
+//   <component is="named-template-card"/>
+// </template>
+
+// 假装 Vue 编译器跑完主模板，吐出 JS 产物
+// 占位被编译成 _createVNode(_resolveDynamicComponent('named-template-card'))
+const compiled = `
+import { _createVNode, _resolveDynamicComponent, h as _h } from 'vue'
 export function render() {
-  return _createVNode('main', [
-    _createVNode(_resolveDynamicComponent("named-template-card"))
+  return _createVNode('div', null, [
+    _h('h1', null, 'Main'),
+    _createVNode(_resolveDynamicComponent('named-template-card'))
   ])
 }`
-```
 
-第二段演示在产物上做的改写：
-
-```ts
-// === 产物阶段（postTransform）===
+// 阶段 2：postTransform —— 在 Vue 编译产物（JS）里改写
 function postTransform(code: string): string {
-  // 1) 识别"创建节点(解析动态组件("named-template-X"))"这种 Vue 编译器产物
-  const re = /_createVNode\(_resolveDynamicComponent\("named-template-(\w+)"\)\)/g
-  const imports = new Set<string>()
-  const out = code.replace(re, (_, name) => {
-    imports.add(name)
-    return `block_${name}.render(...args)`   // 改写成命名模板的 render 调用
+  // 识别 Vue 内部产物调用、改写成命名模板 render 调用
+  const re = /_createVNode\(_resolveDynamicComponent\('named-template-(\w+)'\)\)/g
+  const names = new Set<string>()
+  const rewritten = code.replace(re, (_, name) => {
+    names.add(name)
+    return `block_${name}.render(...args)`
   })
-  // 2) 顶部补 import：每个用到的命名模板引一个虚拟模块
-  const importLines = [...imports]
-    .map(n => `import block_${n} from "App.vue?type=template&namedTemplate&name=${n}"`)
-    .join('\n')
-  // 3) render 参数改成可变转发，让命名模板能接住主模板透传的数据
-  const withArgs = out.replace(/export function render\(\)/, 'export function render(...args)')
-  return importLines + '\n' + withArgs
+  // 主模板 render 改成可变参数转发，让命名模板接住动态透传的数据
+  const withArgs = rewritten.replace(/export function render\(\)/,
+    'export function render(...args)')
+  // 顶部补 import 命名模板虚拟模块
+  const imports = [...names].map(n =>
+    `import block_${n} from 'named-template:${n}'`).join('\n')
+  return `${imports}\n${withArgs}`
 }
 
-console.log(postTransform(vueCompiled))
-// 输出：
-// import block_card from "App.vue?type=template&namedTemplate&name=card"
-// import { _createVNode, _resolveDynamicComponent } from 'vue'
+console.log(postTransform(compiled))
+// import block_card from 'named-template:card'
+// import { _createVNode, _resolveDynamicComponent, h as _h } from 'vue'
 // export function render(...args) {
-//   return _createVNode('main', [
+//   return _createVNode('div', null, [
+//     _h('h1', null, 'Main'),
 //     block_card.render(...args)
 //   ])
 // }
 ```
 
-改写完，引用处就变成了对 `block_card.render(...args)` 的真实调用。那 `block_card` 这个虚拟模块里的 render 从哪来？这正是第 3 章那套虚拟模块加载机制的变体——第 3 章用它装载运行时 helper，这里只是把装载内容换成了模板片段：当别的代码 import `App.vue?...&name=card` 这个虚拟 id 时，加载器从内存字典里取出之前存的 card 的 HTML，把它当作一段正经模板交给 Vue 编译成 render，再包成一个"有 render 方法的对象"返回。机制本身第 3 章已展开，这里不重复。
+## 6. 执行轨迹
 
-现在可以把 named-template 的两组核心权衡讲清楚了。
+输入 SFC（含 `<template name="card">…</template>` 且主模板里有 `<template is="card"/>`）：
 
-**权衡三（命名模板必须分两阶段：源层插占位符 + 编译产物改写）**：named-template 选择"在源层先给引用处插占位符（变成 Vue 认识的动态组件），真正的改写推迟到 Vue 编译完之后的 JS 产物层"，换来能完整复用 Vue 自己的"模板→render"编译管线——命名模板自动享有 `v-if`/`v-for` 等全部指令能力，不用自己造一个模板编译器；占位走的也是 Vue 正常的动态组件解析路径。代价是产物阶段必须去识别 Vue 编译器吐出的内部函数（`_createVNode`、`_createBlock`、`_resolveDynamicComponent`），而这些是不稳定的内部 API，编译策略或 Vue 版本一变就可能换名失效。更麻烦的是，同一个占位在不同位置会被编译成两种形态：普通位置是 `_createVNode(...)`，作为 block 根的时候会被包成 `_createBlock(_Fragment, [...])`。插件必须为这两种形态各写一条改写路径——前者直接整节点覆写成 `block_X.render(...args)`，后者要把首参换成 Fragment、再把 render 调用塞进 children 数组。这也解释了为什么 named-template 必须拆成 pre 和 post 两个插件实例：源层和产物层是两种完全不同的代码形态，单一 enforce 管不过来。
+```
+[源 SFC]
+  <template> <h1>Main</h1> <template is="card"/> </template>
+  <template name="card"><div class="card">hi</div></template>
+        │ preTransform 阶段
+        ▼
+  templateContent["card"] = "<div class=\"card\">hi</div>"   ← 内存字典记下
+  主模板里 <template is="card"/> → <component is="named-template-card"/>
+  命名模板节点：就地隐藏
+        │ Vue 自己的编译器跑一遍主模板
+        ▼
+[编译产物 JS]
+  _createVNode(_resolveDynamicComponent('named-template-card'))   ← 占位被编译成这样
+        │ postTransform 阶段
+        ▼
+  识别为「命名模板引用」 → 改写为 block_card.render(...args)
+  顶部补 import block_card from "named-template:card"
+  render 改成 (...args) 可变参数
+        │ 加载阶段（运行时）
+        ▼
+  import 触发 → load 钩子拦截虚拟 id → 返回 render 委托代码
+  → card 的 HTML 被作为独立模板编译成真实 render 函数
+        │ 渲染
+        ▼
+[运行时输出]
+  引用处实际调用 block_card.render() → 渲染出 <div class="card">hi</div>
+```
 
-**权衡四（命名模板内容外置成虚拟模板模块）**：named-template 选择"把命名模板的 HTML 存进插件内存字典，再用虚拟模块加载机制把它像独立模板一样返回、交给 Vue 编译"，换来命名模板享有和主模板完全相同的编译能力（一段 HTML 被当成正经模板编成 render），且能被任意多处 import 复用。代价是它必须跨阶段共享状态：源阶段就得把模板文本暂存、一直存到加载阶段才取出来用（靠虚拟 id 的 filename 在 pre/post 两个闭包间关联）。还有一个不那么显然的连带代价——当 SFC 同时含命名模板和主模板时，为了让两者不互相干扰，主模板的内容也得外置（给它加个 `src` 指向另一个虚拟模板），让主模板走和命名模板对称的独立编译路径。
+四类对象的最终命运：用户的命名模板 HTML 被复制到内存字典、经虚拟模块加载、编译成真实 render、在引用处被执行。
 
-## 把四种重定向放在一起看
+## 7. 教学简化说明
 
-回头看那张表，四个宏其实是同一个原理的四种应用：渲染输出来源不止 `<template>` 一种，用编译期重写把它扩展到 setup 内的命令式表达式、纯类型的插槽声明、可命名复用的模板片段。运行时仍然只跑 Vue 那套原生渲染，宏只在编译期把"非默认形态"翻译成"Vue 认得的形态"。
+本章演示故意省略了：真正的 Vue 模板编译器调用（演示 b 用字符串拼接模拟）、虚拟模块的真实 `resolveId`/`load`/`loadInclude` 接线、JSX/h() 的真实求值、`_createBlock` + Fragment 那条改写路径（只演示了 `_createVNode` 路径）、vapor 分支、模板名转义工程、HMR、rollup `order: 'post'` 的兼容处理。
 
-四组权衡也对应着这条原理的四个侧面：
-- define-slots：擦除而非注入，换零运行时开销，代价是必须抢在 Vue 之前介入。
-- define-render：把渲染声明降级为任意位置的一行，换书写自由，代价是 post 时序和删旧 return 的硬规矩。
-- named-template（两阶段）：源层插占位符 + 产物改写，换复用 Vue 模板编译管线，代价是依赖不稳定的编译器内部 API、还得为两种编译形态各写一条改写路径。
-- named-template（虚拟模块）：内容外置换对称的完整编译能力，代价是跨阶段状态共享和主模板被迫一起外置。
+## 8. 小结
 
-下一章《静态提升与 export 语义重写》会换一个角度处理 setup 内的语句：不再改"渲染从哪来"，而是改"哪些语句只该执行一次"——把静态常量从 `<script setup>` 提升到普通 `<script>`，再把 `export` 重写成 `defineExpose`/`defineProps`，让 setup 像普通模块那样用 export 暴露。
+四个宏共享同一个底层动作：「编译期重写渲染来源」，但落点各异：define-render 移动 setup 体内的一行调用、named-template 跨源层与产物层两阶段改写、export-render 把 export default 翻译成 defineRender 调用、define-slots 干脆把整条语句抹成注释。代价集中在「必须紧贴 Vue 编译器、依赖其内部 API 与执行时序」。下一章继续重写 setup 内语句，但落点不是渲染来源——是把 setup 里某些语句「提升」到只跑一次的普通 script、把 export 翻译成 expose/props。

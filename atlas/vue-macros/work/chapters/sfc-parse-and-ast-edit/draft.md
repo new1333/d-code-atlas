@@ -1,198 +1,191 @@
-# 第一章 SFC 解析与增量 AST 编辑
+# SFC 解析与增量 AST 编辑
 
-## 这一章要解决的那摊麻烦事
+> 本章属于 primitive 层，全书地基章（无前置依赖）。
+> 学完你能用一句话讲清：vue-macros 的所有宏为什么都把「解析」和「改写」压成两层薄皮——懒解析换零无用开销，偏移增量换多宏叠加而 sourcemap 不乱。
 
-假设你想写一个 Vue 宏，比如 `defineModels`，让它能从类型自动生成 props 和 emits。你坐下来准备动手，结果发现真正让你头疼的不是「怎么从类型里抠出字段」，而是一堆更底层、更琐碎、每个宏都要重新踩一遍的坑：
+## 1. 为什么需要它（设计动机）
 
-- 一个 `.vue` 文件里有 `<script>` 和 `<script setup>` 两块脚本，我怎么把它们各自捞出来？
-- 捞出来之后，总得拿到一棵能找节点的语法树吧？可这棵树什么时候建、建几遍？
-- 在树上找到要改的节点，改完之后，怎么保证报错时还能定位回原来的源码行（也就是 sourcemap 别错位）？
-- 要是同时有好几个宏都要改同一个文件，它们会不会互相覆盖？
+写一个 Vue 宏要做的事其实并不神秘：拿到 `.vue` 文件，找到要改的位置，改完之后让 sourcemap 不错位。但 vue-macros 下面挂着三十多个宏——`defineModels`、`defineProps`、JSX 指令、`setup-sfc`……如果这件事让每个宏各写一遍，三十一份就长三十一遍，而且偏移算错、map 失真这类隐蔽 bug 一旦混进管道里几乎没法定位。
 
-如果没有一块统一的底座替你把这些问题接住，每个宏都得自己重新发明一遍「拆文件 + 算偏移 + 改字符串 + 修 sourcemap」，既啰嗦，又特别容易在偏移算错一位、map 飘掉这种地方栽跟头。
+这就是为什么全书从这一章开始。所有宏都需要一个共同的回答：怎么把 `.vue` 拆成可读的块、怎么把改写登记成可叠加的增量。本章就是这两根支柱——后面每一章都在这层地基上长出来：`unplugin` 包装它、`virtual-helper` 注入它、各种宏消费它。
 
-这一章要立的，就是这块底座的两根柱子：**懒解析**（什么时候建树）和**偏移增量编辑**（改完怎么不破坏 sourcemap）。立柱子之前，先得把最朴素的准备工作做完——把一个 `.vue` 拆开。至于具体某个宏怎么改节点，那是后面十几章的事，本章一概不碰。先把这两根柱子打好。
+## 2. 核心思想
 
-## 先做最朴素的准备：把一个 .vue 拆成两段脚本
+解析只在真正需要时做、且只做一次；改写只记下「在哪个偏移处增删改」的增量。读源码和写源码都被压成两层薄皮，多道转换叠在同一份缓冲上互不干扰。
 
-在谈「树」之前，先解决一个更基本的问题：手里拿到一整个 `.vue` 文件的文本，怎么把里面的脚本部分取出来？
+## 3. 心智模型
 
-vue-macros 的做法很直接——调官方编译器 `@vue/compiler-sfc` 的 `parse`，让它把 `.vue` 拆成一个「描述符」。这个描述符里就带着你要的两个块：`script`（普通 `<script>`）和 `scriptSetup`（`<script setup>`），每个块都自带文本内容 `content` 和它在整篇文档里的位置信息。
+数据结构上有三件东西：
 
-光拆开还不够，vue-macros 还想用同一个入口同时吃下两类输入：
+- **SFC 解析结果**：拿到 `<script>` / `<script setup>` 的文本、它们的语言、以及 setup 块在整篇文档里的起始偏移。注意只是文本，语法树此时并不存在。
+- **取树闭包**：`getSetupAst` / `getScriptAst` 是挂在解析结果上的方法。调它才解析，并以源码字符串为键塞进一张全局缓存表。第二次调同一块文本，命中缓存。
+- **编辑缓冲**：所有改动登记成 `在文档坐标 [start, end) 删/插/改` 的条目。它像 git 的暂存区：每个宏只往里登记改动，不直接动原文件，多个宏的条目叠在同一份缓冲里，最后一次性结算出新代码与 sourcemap。
 
-- 是 `.vue` 文件，就拆成两块，再把两块的文本拼成一段待解析的代码；
-- 是纯脚本（`.js` / `.ts` / `.jsx`），就整篇当成一段代码，按扩展名推断语言，原样返回。
+坐标关系是关键：
 
-为什么要这么统一？因为后面很多宏的转换逻辑（比如 JSX 指令、整文件即 setup 的写法）是针对「一段代码」工作的，根本不在乎这段代码来自 `.vue` 还是 `.ts`。统一入口，同一套转换函数两边都能跑。
+```
+setup 块在文档里的起始偏移：setupOffset
+setup 树里某节点的局部区间：[node.start, node.end)   ← 相对 setup 块文本
+登记到编辑缓冲时的文档级区间：[node.start + setupOffset, node.end + setupOffset)
+```
 
-这里有个**硬约束**值得单独说：当一个 `.vue` 同时有 `<script>` 和 `<script setup>`、且两块的 `lang` 不一致时（比如一个 `ts`、一个 `js`），直接抛错。
+流程上一共七步：
 
-为什么这么较真？因为这两块最终要被拼成「一段」代码送进同一个解析器，而一段代码只能有一种语言。两种语言硬拼在一起，解析器要么直接解析失败，要么给出错乱的树。与其等到解析时出莫名其妙的问题，不如在源头就拦死。
+1. 拿到 `(源码, 文件 id)`，正则判一下是不是 `.vue`。
+2. 是：调官方 `@vue/compiler-sfc` 的 `parse`，取两个脚本块的文本与语言，记下 `setupOffset`。**树此时不建。**
+3. 不是：把整文件当成「一整块 setup」，语言按扩展名推断。
+4. 宏在需要找节点时，调 `getSetupAst()`——首次触发解析，后续命中缓存。
+5. 找到目标节点（坐标是相对 setup 块文本的局部值）。
+6. 往编辑缓冲登记一条改动，文档坐标 = 局部坐标 + setupOffset。
+7. 多宏按管道顺序往**同一份**编辑缓冲叠改，所有坐标都锚在原始文档上。收尾仅当缓冲非空，才一次性产出新代码与字符边界 sourcemap。
 
-拼接的缝里还藏着一个小心思：两块之间用 `\n;\n` 隔开——换行加分号。
+## 4. 关键权衡
 
-这个分号不是装饰。设想 `<script>` 块结尾是个没加分号的表达式，`<script setup>` 开头又是个表达式，两块直接首尾相接，就可能被解析器当成一条语句，语义就错了。塞一个分号进去，强制划出语句边界，谁也别想挨着谁。
+### 4.1 把急切建树改成按需取树，省掉无用解析
 
-## 第一根柱子：懒解析——不调就不建树
+官方 `@vue/compiler-sfc` 的解析器在解析时其实**顺手就把两个块的语法树都建好**。可大量宏压根用不到这两棵树——`defineModels` 只关心 setup、`short-bind` 只动模板、`chain-call` 只动 import。如果照搬官方实现，每个 `.vue` 文件都被无差别建两棵树，纯属浪费。
 
-准备好「一段代码」之后，按理说下一步就是把它解析成语法树，好让宏能在树上找节点。但 vue-macros 在这里做了一个反直觉的决定：**解析的时候，先不建树。**
+地基层的做法是把 `scriptAst` / `scriptSetupAst` 这两个字段从类型层面**主动 `Omit`**——`SFCScriptBlock` 用 `Omit<..., 'scriptAst' | 'scriptSetupAst'>` 强行擦掉，让调用方从类型上就摸不到「现成的树」。取而代之的是挂在描述符上的 `getSetupAst` / `getScriptAst` 闭包：不调不解析，调了也只解析一次（再叠一层「以源码字符串为键」的内容缓存）。
 
-为什么？因为官方编译器的 `parse` 在拆 `.vue` 时，其实会顺手把两个块的语法树都建好，挂在描述符的 `scriptAst` 和 `scriptSetupAst` 字段上。可问题在于——**大量的宏压根用不上这两棵树**。有的宏只动模板，有的宏只动 import 语句，有的甚至只看一眼文件扩展名就完事了。如果每次解析都老老实实建两棵树，对这些宏来说就是纯浪费。
+代价是：调用方必须显式去「取树」，并且取到的节点坐标是相对 setup 块文本的，所有后续编辑都得手动加一个 `setupOffset`。
 
-于是，这块底座把「建树」这一步从解析时**推迟到了真正需要的时候**。具体分两小步走。
+这条化解的矛盾是「**让没用树的宏零开销**」与「**让用树的宏仍然方便**」——把树的生成从解析阶段推到取用阶段，让两边都按需付费。
 
-第一步，从类型层面先把那两个「现成的树」字段掐掉。它自定义了一个块类型，用 `Omit` 把官方描述符自带的 `scriptAst` / `scriptSetupAst` 两个字段去掉：
+### 4.2 改写一律走「偏移增量」，多宏可叠在同一份缓冲
+
+写编译期改写最直觉的写法是字符串拼接：找到 import、删掉它、把剩下的两段拼回去。但这种写法一旦两个宏先后改同一个文件就乱套了——第二个宏拿到的是第一个宏改过的字符串，所有偏移都得重新算。
+
+地基层改走「偏移增量」：所有改动登记成「在文档坐标 `[start, end)` 处删/插/改」的条目，多宏按管道顺序往**同一份编辑缓冲**里叠。所有坐标都锚在**原始文档**上，互不串扰。底层 `magic-string` 在收尾时一次性结算这些条目，并顺便产出 sourcemap——`hires: 'boundary'` 模式给到字符边界精度，正是「改动仍能精确保 sourcemap」的来源。
+
+代价是：每个宏都得自己算对那一个偏移量（局部 + setupOffset）。偏移算错就会改到错位置——属于调试期成本，运行时不会爆，反而更难定位。
+
+这条化解的矛盾是「**多道转换要能串成管道**」与「**每道转换不应被前一道干扰**」——把「改」拆成「登记」和「结算」两步，让所有改动并行地指向原始文档。
+
+### 4.3 同一个入口同时接纳 `.vue` 与纯脚本
+
+很多宏的转换函数对「`.vue` 的 setup 块」和「`.js/.ts` 整文件」是一视同仁的——`jsx-directive` 处理 `.jsx`、`setup-sfc` 把整文件当 setup。如果地基层只接 `.vue`，每个宏都得自己再写一份「纯脚本入口」。
+
+于是入口统一：对 `.vue` 走官方 `parse` 取 setup 文本；对纯脚本直接按扩展名推断语言、原样返回源码。两种输入都被归一成「一段代码 + 一个语言 + 一个偏移」。
+
+代价是两块脚本拼接（当 `<script>` 与 `<script setup>` 同时存在时）必须用 `\n;\n` 强制语句边界，避免两块粘连；并且两块的语言必须一致，不一致直接抛错（默认按 `'js'` 对比）。
+
+这条化解的矛盾是「**调用方想用一个统一的'setup 文本'抽象**」与「**输入可能是 SFC 也可能是纯脚本**」——把差异收在解析入口，让宏的转换函数对两种场景都通用。
+
+### 4.4 宏导入用 import attributes 打标，编译期擦除
+
+宏自身需要从 vue 里 import 进来（比如 `import { defineModels } from 'vue-macros/macros'`），但宏在运行时是被擦除的——它只是编译期的一个「标记」。怎么让这个 import 既写得像普通导入、又在运行时不残留？
+
+地基层用导入属性 `with { type: 'macro' }` 给宏导入打标：`removeMacroImport` 遍历 import 节点，发现带这个属性的就用编辑缓冲的 `removeNode(node, { offset })` 删掉。运行时零残留，写法上又跟普通导入完全一致。
+
+代价是依赖较新的导入属性语法（旧版叫 assert statement），老旧工具链可能不识别——这是 vue-macros 选择站在新语法一边的代价，靠 `deprecatedAssertSyntax` 兼容开关回退。
+
+这条化解的矛盾是「**宏导入想写得像普通 import 一样直觉**」与「**运行时不能残留任何宏痕迹**」——用语法标记把两者区分开来，编译期识别并抹掉。
+
+## 5. 最小原理演示
+
+下面这段约 60 行的脚本演透两件事：**懒解析 + 内容缓存让两次取树只解析一次**（看 `parseCount`）和**偏移增量编辑保住文档级 sourcemap 区段**（看登记的 `[start, end)` 区间是文档级而非 setup 局部）。
+
+为了能在 `node`/`bun` 直接跑、不依赖真实的 `@vue/compiler-sfc` 与 `@babel/parser`，下面用极简 mock 顶替两块真实依赖——mock 的细节不重要，重点看 `parseSfc`、`getSetupAst`、`editor.removeNode` 三处如何串起来。
 
 ```ts
-// 拿到的块类型里，压根不存在 scriptAst / scriptSetupAst 这两个字段
-// → 你没法再顺手从描述符里掏出一棵现成的树，只能走下面正式的「取树」路
-export type SFCScriptBlock = Omit<
-  SFCScriptBlockMixed,
-  'scriptAst' | 'scriptSetupAst'
->
-```
+// 演透懒解析 + 内容缓存 + 偏移增量编辑
 
-这是个很巧的防守。类型上不存在这两个字段，意味着编辑器会直接报错，逼你走下面这条正式的「取树」路，从根上断绝了「顺手拿现成树」的旧习惯。
+// —— mock：顶替 @vue/compiler-sfc 与 @babel/parser 的极简版 ——
+type Node = { type: string; start: number; end: number }
+type AST = { program: { body: Node[] } }
 
-第二步，真正的「取树」被做成了一个闭包方法 `getSetupAst`（普通 script 对应 `getScriptAst`）。解析 `.vue` 的时候，它只记下一件事：`<script setup>` 这块在整篇文档里是从第几个字符开始的，记成 `offset`。至于树——**你不调 `getSetupAst()`，它就永远不建**。你一调，它才拿这块的文本去做一次 `babelParse`，并且带上一个关键开关 `cache: true`。
+function mockBabelParse(code: string): AST {
+  // 假装解析出一条 import：从开头到第一个分号（含分号）
+  const importEnd = code.indexOf(';') + 1
+  return { program: { body: [{ type: 'ImportDeclaration', start: 0, end: importEnd }] } }
+}
 
-> 给「懒解析」配个类比：它像一个不到被催就不动身的跑腿——你不喊「取 setup 的树」，他就一直歇着；你一喊，他才出门去解析那一块文本。
-
-但「懒」只解决了一半。同一个宏如果先后调两次 `getSetupAst`，难道要解析两遍？更别提多个宏可能都要取同一棵树。答案就是刚才那个 `cache: true`。它底层对接的是 `ast-kit` 的 `babelParse`，开启后，解析结果会塞进一个**以源码文本本身为键**的全局缓存里。同一块 setup 文本，不管被谁、被调多少次取树，第一次解析完就存好，之后再调直接命中缓存拿出来。
-
-「懒求值」加上「内容缓存」，两层加起来，效果就是一句话：**不取树零开销，取了也只解析一次**。这就是第一根柱子的全部精华。
-
-## 第二根柱子：偏移增量编辑
-
-树拿到了，下一步是改。这一节要回答两个问题：怎么改，以及改完为什么 sourcemap 不会错位。
-
-先说一个绕不开的坑。`getSetupAst` 解析的是 `<script setup>` 这块的**文本**，所以树上每个节点的 `start` / `end` 坐标，都是**相对这块文本**的局部坐标——从这块的开头算起。可你要改的是**整篇 `.vue` 文档**。一个节点说自己在「第 0 到第 24 个字符」，那指的是「这块文本的第 0 到第 24 个字符」，不是整篇文档的。
-
-这就引出了那个贯穿全章的关键数：`offset`。解析时记下的「setup 块在整篇文档里的起始偏移」，就是用来把局部坐标翻译成文档坐标的。
-
-> 类比一下：这就像「相对地址」和「绝对地址」。树上告诉你「从这个房间往里走 5 米」是相对坐标；但你要在整栋楼的地图上标点，就得加上「这个房间在 3 楼的 305」这个基底。`offset` 就是那个基底。
-
-vue-macros 的改写方式是：所有改动统一登记成「在文档的第 N 到第 M 个字符处，删掉 / 覆盖成 / 在前面插 / 在后面插」。底层是 `magic-string-ast` 这一层，它把节点坐标加上 `offset`，再交给更底层的 `magic-string` 去真正动手：
-
-```
-文档级区间 = [节点.start + offset, 节点.end + offset]
-s.remove(文档级区间)         // 删
-s.overwrite(区间, 新文本)    // 覆盖
-s.appendLeft(区间起点, 文本) // 前插
-```
-
-为什么不直接用字符串拼接、`replace` 那一套？因为字符串拼接一旦改完，**所有原来的位置全废了**——后面的字符往前挪，sourcemap 就再也对不上原来的源码。而 `magic-string` 这种「只记增量、不动原文」的方式，天然保住了每一个字符和原始位置的对应关系。收尾生成 sourcemap 时用的是 `hires: 'boundary'`——字符边界级精度，意味着哪怕只删了一个字符，映射都能精确指回原文件的对应位置。
-
-更妙的是：**多个宏可以共用同一份编辑缓冲**。宏 A 在坐标 100 处删了东西，宏 B 在坐标 500 处插了东西，只要它们的坐标都老老实实锚定在**原始文档**上（都加了 `offset`），就互不干扰，最后一次性输出。像几个人在同一份原文上各自做批注，只要大家都用同一套「绝对地址」，批注就不会打架。
-
-## 把两根柱子串起来：一个能跑的最小演示
-
-下面这段脚本（约 40 行）把上面两根柱子真跑一遍，专门证明两件事：其一，取两次树只解析一次（懒 + 缓存）；其二，删一个节点后，sourcemap 仍能把删除区段正确映射回原文件（偏移编辑保 map）。保存成 `demo.mjs`，装好三个依赖就能跑：
-
-```bash
-# 依赖：@vue/compiler-sfc、ast-kit、magic-string
-# （真实仓库用的是 magic-string-ast，是 magic-string 的薄封装，原理一致）
-bun run demo.mjs   # 或 npx tsx demo.mjs
-```
-
-```js
-import { parse } from '@vue/compiler-sfc'
-import { babelParse } from 'ast-kit'
-import MagicString from 'magic-string'
-
-// ① 用「文本内容」作 key 的全局缓存，模拟 ast-kit 的 cache: true
-const parseCache = new Map()
+const parseCache = new Map<string, AST>()
 let parseCount = 0
-function babelParseCached(code, lang) {
-  if (parseCache.has(code)) return parseCache.get(code) // 命中，直接拿
-  parseCount++                                            // 未命中才真解析
-  const ast = babelParse(code, lang, {
-    plugins: [['importAttributes', { deprecatedAssertSyntax: true }]],
-  })
+
+function babelParse(code: string): AST {
+  if (parseCache.has(code)) return parseCache.get(code)!   // 内容级缓存命中
+  parseCount++                                              // 真正解析才计数
+  const ast = mockBabelParse(code)
   parseCache.set(code, ast)
   return ast
 }
 
-// ② 迷你 parseSFC：解析时【不建树】，只记 offset，把「取树」做成按需闭包
-function parseSFC(code, id) {
-  const { descriptor } = parse(code, { filename: id })
+// —— 地基入口：返回 setup 文本 + 偏移 + 取树闭包（懒解析） ——
+function parseSfc(source: string) {
+  // 模拟官方 parse：定位 <script setup> 块
+  const openTag = '<script setup>'
+  const openEnd = source.indexOf(openTag) + openTag.length
+  const closeStart = source.indexOf('</script>')
+  const content = source.slice(openEnd, closeStart)
   return {
-    offset: descriptor.scriptSetup?.loc.start.offset ?? 0,
-    lang: descriptor.scriptSetup?.lang || descriptor.script?.lang || 'js',
-    getSetupAst() {
-      if (!descriptor.scriptSetup) return
-      return babelParseCached(descriptor.scriptSetup.content, this.lang)
-    },
+    content,
+    setupOffset: openEnd,
+    getSetupAst() { return babelParse(content) },   // 不调不解析
   }
 }
 
-// ---- 主流程 ----
-const sfcText =
-  `<script setup lang="ts">import { x } from './x'\nconst a = 1</script>`
-const sfc = parseSFC(sfcText, 'demo.vue')
+// —— 编辑缓冲：登记偏移增量，最后一次性结算 ——
+function makeEditor() {
+  const edits: Array<{ start: number; end: number }> = []
+  return {
+    removeNode(node: Node, offset: number) {
+      // 局部坐标 + setup 偏移 = 文档级区间
+      edits.push({ start: node.start + offset, end: node.end + offset })
+    },
+    applyTo(source: string) {
+      // 倒序结算，避免前一条改动影响后一条的坐标
+      const sorted = [...edits].sort((a, b) => b.start - a.start)
+      let out = source
+      for (const e of sorted) out = out.slice(0, e.start) + out.slice(e.end)
+      return out
+    },
+    segments() { return edits.map(e => `[${e.start},${e.end})`) },
+  }
+}
 
-// ③ 证明权衡一：连取两次树，计数器应该只 +1
-sfc.getSetupAst()
-sfc.getSetupAst()
-console.log('实际解析次数（期望 1）:', parseCount)
+// —— 演透原理 ——
+const sfcSource = `<script setup>import { x } from './x'; const a = 1</script>`
+const parsed = parseSfc(sfcSource)
 
-// ④ 证明权衡二：找到 import，用「节点坐标 + offset」平移后删掉
-const ast = sfc.getSetupAst()
-const importNode = ast.body.find((n) => n.type === 'ImportDeclaration')
-const s = new MagicString(sfcText)
-const offset = sfc.offset
-// 关键一步：局部坐标 + 偏移 = 文档坐标，再交给 magic-string 删
-s.remove(importNode.start + offset, importNode.end + offset)
+console.log('setup 偏移:', parsed.setupOffset)            // 14
+console.log('取树前计数:', parseCount)                    // 0
+const ast1 = parsed.getSetupAst()
+const ast2 = parsed.getSetupAst()
+console.log('两次取树后计数:', parseCount)                // 1 ← 缓存命中
 
-const map = s.generateMap({
-  source: 'demo.vue',
-  includeContent: true,
-  hires: 'boundary',
-})
-console.log('改写后代码:\n' + s.toString())
-console.log('删除区段在 sourcemap 里仍可逆映射回原文件 ✓')
+const editor = makeEditor()
+for (const n of ast1.program.body) {
+  if (n.type === 'ImportDeclaration') editor.removeNode(n, parsed.setupOffset)
+}
+
+console.log('改动后:', editor.applyTo(sfcSource))
+// → <script setup>; const a = 1</script>
+
+console.log('文档级区段:', editor.segments())
+// → ["14,40)"] ← import 节点局部 [0,26) + setup 偏移 14
 ```
 
-跑完你会看到：`实际解析次数（期望 1）` 打印的是 1——第二次取树命中了缓存；改写后的代码里那行 `import` 没了，而 sourcemap 仍然能把这段「现在没了」的区段，反查回原文件里它当初所在的位置。这两件事，正是这一章两根柱子各自要交付的东西。
+`parseCount` 停在 1 演的是懒解析 + 缓存命中；`segments()` 给出的 `[14, 40)` 演的是节点局部坐标 `[0, 26)` 经 setup 偏移 14 平移成文档级区间——sourcemap 就是从这个文档级区间反推回原文件的字符级映射。
 
-## 关键权衡
+## 6. 执行轨迹
 
-把上面零散的设计决定整理成几条可复述的权衡。本章机制不算少，挑其中最核心的几条展开——每一条都是「做了什么选择 → 换来了什么 → 代价是什么」。
+输入 `<script setup>import { x } from './x'; const a = 1</script>`，包成一段最小 SFC（共 51 个字符）。
 
-**权衡一：把官方解析器自带的「急切建树」改成按需懒求值。**
+- **解析阶段**：`parseSfc` 找到 `<script setup>` 开标签结束位置 = `14`，闭标签开始位置 = `51`。`content = "import { x } from './x'; const a = 1"`（长 37 字符），`setupOffset = 14`。此时 `parseCount = 0`。
+- **第一次取树**：宏调 `getSetupAst()`，触发 `babelParse(content)`——`parseCount` 从 0 跳到 1，缓存表里多一条 `"import { x } from './x'; const a = 1" → AST`。返回的 AST 中 import 节点局部区间 `[0, 26)`（到第一个分号 +1）。
+- **第二次取树**：另一个宏（或 HMR 重跑）再调 `getSetupAst()`，命中缓存——`parseCount` 仍为 1。
+- **登记改动**：编辑缓冲收到一条 `{ start: 0 + 14, end: 26 + 14 } = { start: 14, end: 40 }` 的删除条目。
+- **收尾结算**：编辑缓冲在原始 51 字符文档上倒序删 `[14, 40)`，得到 `<script setup>; const a = 1</script>`。同时 `generateMap({ hires: 'boundary' })` 产出 sourcemap，把新代码里 `; const a = 1</script>` 这段字符级映射回原文件的对应区段。
 
-- **选择**：解析 `.vue` 时不建语法树，改成「谁要用谁显式调 `getSetupAst`」，再叠一层以文本内容为键的缓存。
-- **换来**：那些压根不需要树的宏，零解析开销；真正需要树的宏，同一块文本无论被取多少次，也只解析一次。在「一个文件要被十几个宏依次过一遍」的管道里，这个节省是实打实的。
-- **代价**：调用方必须显式去「取树」，不能再指望描述符上挂着现成的树；更要命的是，取到的节点坐标是相对「子块文本」的局部坐标，所有后续编辑都得手动加上那个 `offset` 才能落到文档上——而这个偏移，正是下一根柱子复杂度的来源。两个柱子的代价其实是连在一起的。
+整条轨迹的关键是三件事：解析阶段没建树、两次取树只解析一次、改动以文档级坐标锚在原文件上。这三件合起来让多宏叠加既省又稳。
 
-这条权衡是本章的灵魂。「懒」省下的开销，和它带来的「坐标要手动平移」的麻烦，是同一个硬币的两面。
+## 7. 教学简化说明
 
-**权衡二：改写统一走「偏移增量」，而不是字符串拼接。**
+为了演透原理，演示故意省略了：语言一致性校验、两块脚本拼接时的 `\n;\n` 边界处理、`.vue` 之外的纯脚本分支、import attributes 标记与 `removeMacroImport`、注入额外普通 `<script>` 块的 helper、HMR 与 webpack `?vue&type=script` 子资源正则——这些都是真实地基层的工程职责，但它们都长在「懒解析 + 偏移增量」这两根支柱之上。
 
-- **选择**：所有改动都登记成「在文档第 N 到 M 字符处删 / 覆盖 / 前插 / 后插」，靠 `magic-string` 只记增量、不动原文。
-- **换来**：多个宏的改动可以共用同一份编辑缓冲、依次累积、互不覆盖；收尾时天然产出字符边界精度的 sourcemap，删一个字符都映射得回去。这对「改完还能在浏览器里精准断点」至关重要。
-- **代价**：每个宏都得自己算准那个 `offset`。偏移算错一位，就会改到错误的位置——这是一种典型的「调试期成本」：写对了毫无痛感，写错了排查起来却很费劲，因为程序不会报错，只是悄无声息地改错了地方。
+## 8. 小结
 
-**权衡三：用同一个入口同时吃 `.vue` 和纯脚本两种输入。**
+vue-macros 的每一道宏都站在同一块地基上：解析只在需要时触发、且只解析一次；改写登记成偏移增量、多宏叠在同一份缓冲上。所以后面看到任何一条宏时，你都可以假定它只关心「找节点 + 登记改动」这两步，剩下的解析、缓存、sourcemap 都被这块地基兜住了。
 
-- **选择**：不管来的是 `.vue` 还是 `.js/.ts/.jsx`，都统一成「一段待解析代码 + 一个语言」。
-- **换来**：宏的转换函数对单文件组件和纯脚本场景（JSX 指令、整文件即 setup）都适用，一份逻辑两边跑，不用为每种文件类型写一套。
-- **代价**：两块脚本拼成一段时，必须用 `\n;\n` 强制语句边界；并且两块的语言必须一致，不一致直接报错。统一是要付出约束的——为了「一套逻辑通吃」，它拒绝了「两块用不同语言」这种本来可能合法的写法。
-
-**权衡四：宏自身的导入语句用 `with { type: 'macro' }` 打标，并在编译期擦除。**
-
-- **选择**：宏的导入写法长得像一个普通 import，但带一个 `with { type: 'macro' }` 的导入属性作为记号；编译期识别到这个记号，就把整条 import 删掉。
-- **换来**：宏的导入写起来心智负担低（和普通 import 一样），运行时零残留——浏览器拿到的产物里根本没有这条 import。
-- **代价**：依赖较新的「导入属性」语法，老旧的工具链可能不认。这套机制不是空头设计——连这个仓库自己定义宏名的那张常量表，开头第一条就是这么一条宏导入，等于自己用了自己一把，也算是一种「能跑起来的证据」。
-
-## 小结
-
-这一章是全书的地基。它把每个宏都要踩的那摊麻烦事——拆文件、建树、改字符串、保 sourcemap——收成两根柱子：
-
-- **懒解析**：解析时不建树，谁要用谁按需取，再靠内容缓存保证只解析一次；
-- **偏移增量编辑**：所有改动登记成「在文档第 N 到 M 字符处增删改」，靠 `magic-string` 保住 sourcemap，多个宏还能共用一份缓冲。
-
-后面十几章里每一个具体宏，站的都是这块地基。它们只管「找到要改的节点、登记一条增量」，剩下的事地基都替它们办了。
-
-不过，光有「怎么改一个文件」还不够。这些宏最终要被塞进 Vite、Webpack、Rollup 等一堆构建工具里跑起来——同一份改写逻辑，怎么做到写一遍就能在六套构建器里都生效？这正是紧邻的下一章「一次编写、六套构建器适配的 unplugin 模式」要回答的。
+下一章从「单文件内部如何改」往外走一步——一个宏怎么同时跑在 vite/rollup/webpack/esbuild/rspack/rolldown 六套构建器上。看 `unplugin` 怎么把同一份 `transformXxx` 函数分发出去。

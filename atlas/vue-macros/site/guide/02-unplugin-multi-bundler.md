@@ -1,259 +1,141 @@
----
-title: "一次编写、六套构建器适配的 unplugin 模式"
----
-
 # 一次编写、六套构建器适配的 unplugin 模式
 
-## 先说一个让人头疼的局面
+> 本章属于 primitive 层。前置：SFC 解析与增量 AST 编辑。
+> 学完你能：用一句话讲清为什么一个 Vue 宏只需写一份转换、就能在六套构建器里跑，以及这个便利付出了什么代价。
 
-假设你写了一个 Vue 宏 `defineModels`，它的本事是：把组件里 `defineModels<{ foo: string }>()` 这种写法，在编译期改写成等价的 `defineProps` 加 `defineEmits`。改写这件事本身，你想清楚了——拿到源码，找出那几个调用，重新拼字符串。
+## 1. 为什么需要它
 
-但麻烦不在改写，在「改写之后，这段代码往哪儿塞」。
+上一章把 SFC 解析和 magic-string-ast 的增量编辑讲透了，到这一步我们已经能写出一个「拿到源码、吐改写后源码」的纯函数——比如 `defineModels` 内部把类型里的字段抽出来、注入到 `defineProps` 和 `defineEmits` 里。但这个纯函数只解决了一半问题：它要在 vite、rollup、webpack、esbuild、rspack、rolldown 六套构建器里都能跑起来，而它们的插件 API 形态各不一样。
 
-前端构建器不是只有一个，而是有 **六个**：vite、rollup、webpack、esbuild、rspack、rolldown。它们的插件长得根本不是一回事：vite 的插件是带 `enforce: 'pre'` 和 `transform(code, id)` 的对象，rollup 也是对象但没有 `transformInclude` 这种东西，webpack 的 loader 又是另一套回调形态……你手上明明只有一份改写逻辑，却好像要被迫把它抄六遍，每抄一遍还要适配一种构建器的脾气。更要命的是，你每多写一个宏，这个「乘以六」就要再来一次。
+想象一下没有抽象层的日子。今天写一个宏，得为 vite 写一份 `transform` 钩子、为 webpack 写一份 `loader`、为 esbuild 又写一份 `onLoad`，逻辑是同一段，但包壳的形状变了六次。再写一个宏，再乘以六。宏作者很快就被入口文件的复制粘贴淹没，使用者则可能因为自己用的构建器没在支持列表里而用不上这个宏。
 
-这一章要讲的就是 vue-macros 怎么把这件「乘法爆炸」的事压成「加法」：**把「改源码」写成一段跟构建器毫无关系的纯函数，再用一层薄薄的适配壳，把它分发成六套构建器各自认识的插件。**
+这层抽象就是为了化解这种乘法爆炸：把转换逻辑（与构建器无关）和构建器适配（与具体宏无关）拆成两个正交维度，让「宏数量 × 构建器数量」从乘法变加法。
 
-> 承前说明：上一章我们已经把「纯函数内部怎么改 AST」讲透了（用 magic-string-ast 做偏移增量编辑、每个宏自己处理 setupOffset）。**这一章完全不碰纯函数的内部**，只盯着它「怎么被包成一个跟构建器无关的壳、再分发到六个构建器」这件事。
+## 2. 核心思想
 
-## 第一块：转换是一个「不认识构建器」的纯函数
+把「做什么改写」和「在哪套构建器里跑」拆成正交的两层，中间用一层适配壳把它们重新粘合——改写逻辑只表达一次，构建器差异也只在适配壳里出现一次。
 
-一切从一个老老实实的函数开始。它的签名极简：
+## 3. 心智模型
 
-```ts
-function transformDefineModels(code: string, id: string): CodeTransform | undefined
-```
+整个机制是一条流水线：
 
-给它一段源码、给它文件的 id，它吐回改写后的源码（如果发现没有 `defineModels`，就返回 `undefined` 表示「这文件我不管」）。**它不知道、也不需要知道自己在哪个构建器里跑。** 它眼里只有字符串进、字符串出。
+1. 宏作者写一个纯函数 `transformXxx(code, id)`，它不知道自己在哪个构建器里跑。
+2. 用 `createUnplugin` 把纯函数包成工厂：工厂声明 `name`、`transformInclude`（过滤哪些文件）、`transform`（把活全委托回纯函数）。
+3. 工厂返回的对象上自动挂着六个方法 `.vite()` `.rollup()` `.webpack()` `.esbuild()` `.rspack()` `.rolldown()`，每个方法把同一份声明物化成对应构建器认得的原生插件。
+4. 每个宏包再写六个一行式入口文件，分别 re-export 对应方法，供消费者按构建器 import。
+5. 聚合插件拿到当前构建器名，对每个宏调一次分发函数：开关关就不产出插件，开关开就按构建器物化。
+6. 物化出的原生插件，其 `transformInclude` 决定改哪些文件，`transform` 把活委托回第 1 步的纯函数。
+7. 跨宏通用职责（文件过滤、找 vue 插件拿编译器 api、HMR 读改写）从 common 取用，宏只挑自己需要的。
 
-这一点很关键。它意味着「怎么改」这件事被彻底从「在哪改」里剥离了出来。改写的逻辑可以被单独测试、单独复用，不必为了换个构建器就重写一遍。说人话就是：**改写逻辑只此一份，它是后面所有花样的同一个内核。**
+不变量是：第 1 步那个纯函数对构建器一无所知。任何构建器差异都不应该漏进它，要么收进 common、要么收进工厂的分支逻辑。
 
-但光有一个纯函数，构建器是不认的——构建器要的是「插件对象」。于是我们需要第二块。
+## 4. 关键权衡
 
-## 第二块：用工厂把纯函数包成「能换插头」的插件
+### 适配抽象换一次编写六套入口
 
-打个比方：一台电器（纯函数）本身只认「标准电」，它的核心电路不关心你是在中国还是欧洲用。真正让它能在各国插座上工作的，是一个**插头适配器**。这一章的「适配壳」就是这个插头适配器。
+**选择**：所有构建器统一走 unplugin 库的适配抽象，宏只写一份转换。
+**换来**：一次编写、六套构建器原生入口自动生成，聚合层只关心当前构建器名。
+**代价**：宏被锁死在 unplugin 暴露的 API 面里，用不到未暴露的构建器私有特性；每个宏包要维护六个一行式入口文件，新增宏时这六份文件靠约定复制。
+**本质矛盾**：通用性（一份代码处处可跑）与私有特性的访问权（个别构建器才有的钩子）之争——这是所有跨平台抽象都会撞上的硬约束。
 
-这个壳是一个叫 `createUnplugin` 的工厂，它的核心是一个回调函数，签名长这样：
+### 工厂内运行时分支换怪癖内联处理
 
-```ts
-createUnplugin((userOptions = {}, { framework }) => {
-  // framework 是运行时才拿到的：'vite' | 'rollup' | 'webpack' | ...
-  const filter = createFilter(options)
-  return {
-    name,
-    transformInclude: filter,
-    transform(code, id) {
-      return transformDefineModels(code, id)   // 把活全委托回那个纯函数
-    },
-  }
-})
-```
+**选择**：不在工厂内部按构建器 if-else 写六份独立代码，而是让同一个工厂在运行时拿到「当前是哪个构建器」、就地分支。
+**换来**：构建器相关的怪癖（比如某构建器把单文件拆成多个虚拟子模块、文件 id 长得不一样）能在同一份逻辑里被内联处理，不需要复制整份插件。
+**代价**：构建器差异会「漏」进文件过滤逻辑，`transformInclude` 里偶尔会出现 `if (framework === 'webpack') ...` 这种判断，抽象并不完全透明。
+**本质矛盾**：抽象的透明性（调用方看不见底层差异）与现实差异的处理（差异总要有人接住）——抽象能藏起大部分差异，但藏不光的那些只能内联处理。
 
-注意第二行那个 `{ framework }`——这是整个设计的命门。**工厂不是在写代码时就把六套分支写死，而是在运行时才拿到「当前到底是哪个构建器」，就地决定该怎么配。** 最能说明问题的就是过滤规则：
+### 特性门控加按构建器分发换扁平聚合
 
-```ts
-function getFilterPattern(types, framework) {
-  const isWebpackLike = framework === 'webpack' || framework === 'rspack'
-  if (types.includes(VUE_SFC_WITH_SETUP)) {
-    filter.push(isWebpackLike ? REGEX_VUE_SUB_SETUP : REGEX_VUE_SFC)
-  }
-  // ...
-}
-```
+**选择**：用一个统一的「特性门控 + 按构建器分发」函数，作为聚合层与每个宏之间的唯一接口。
+**换来**：聚合插件的主入口是一张扁平的「宏 × 开关」清单，新增或禁用一个宏只改一行；特性开关与按构建器分发共用同一机制。
+**代价**：要求每个宏都长得一样（同一个适配器形状）。少数不符合形状的宏只能被强转塞进去，甚至只能跑在部分构建器上。
+**本质矛盾**：异构插件的多样性（每个宏的转换语义都不同）与统一调度的简洁（聚合层只想要一个标准接口）——标准化的代价永远是边缘案例被挤压。
 
-同样是「挑出带 `<script setup>` 的 `.vue` 文件」，webpack/rspack 和别的构建器用的是**不同的正则**——因为 webpack 会把一个 `.vue` 文件拆成一串带 `?vue&type=script&setup=true` 的虚拟子模块，文件 id 的长相跟 vite/rollup 完全不一样。工厂在运行时根据 `framework` 挑正则，就把这个怪癖就地处理掉了，**不需要为 webpack 单独写一份插件**。
+### 通用职责收 common 换宏自身的简洁
 
-`createUnplugin` 收下这个回调后，会自动给它挂上六套方法：`.vite()`、`.rollup()`、`.webpack()`、`.esbuild()`、`.rspack()`、`.rolldown()`。每调一个，就把同一个内核「物化」成那个构建器认识的原生插件。一件电器，六种插头，自动配齐。
+**选择**：把跨宏通用职责（文件过滤、找 vue 插件拿编译器 api、HMR 读改写）集中收在 common 公共层。
+**换来**：宏自身只剩语义改写，可读性高、可独立维护，加新宏时心智负担小。
+**代价**：同一套公共设施要同时伺候两种异形宏——「改 script 的纯转换宏」和「改 template、需往 vue 编译器里塞节点 transform 的宏」。后者甚至不走适配抽象，造成约定上的破口。
+**本质矛盾**：复用收益（一处实现处处可用）与抽象破口（少数异类无法套进同一抽象）——共用基础设施永远会向最复杂的那个使用者倾斜。
 
-## 第三块：六个一行式入口文件
+## 5. 最小原理演示
 
-消费者（也就是最终用这个宏的开发者）是按构建器来 import 的。所以每个宏包都准备了六个入口文件，每个都短到只有一行：
+下面这段脚本演透三条原理：转换是纯函数、一个工厂给出多套构建器适配形态、分发函数等于特性门控加按构建器选适配器。真实库自动挂六个方法，这里手写两个足够说明。
 
 ```ts
-// vite.ts
-import unplugin from '.'
-export default unplugin.vite as typeof unplugin.vite
-```
-
-```ts
-// rollup.ts
-import unplugin from '.'
-export default unplugin.rollup as typeof unplugin.rollup
-```
-
-webpack、esbuild、rspack、rolldown 各一个，长得几乎一模一样，区别只是 `.vite` 换成 `.webpack` 之类。用 vite 的人 `import DefineModels from '@vue-macros/define-models/vite'`，用 webpack 的人 import `/webpack`。入口文件本身就是「指路牌」：告诉打包器「我要这套构建器的那个插件」。
-
-## 第四块：聚合层——一张「宏 × 开关」的扁平清单
-
-vue-macros 主插件底下挂着二三十个宏。它要做的，是给每个宏按需「点亮」或「关掉」，并把亮着的那些物化成当前构建器的插件，排成一个有序列表。这件事全压在一个叫 `resolvePlugin` 的分发函数里：
-
-```ts
-function resolvePlugin(unplugin, framework, options) {
-  if (!options) return           // 开关门控：options 为 false，不产出插件
-  return unplugin[framework](options)   // 物化：按当前构建器挑外壳
-}
-```
-
-就这三行，但信息量很大。`options` 就是特性开关——用户在配置里把某个宏设成 `false`（或默认关），这里直接 `return undefined`，**连插件都不物化**；只有开着的时候，才拿 `framework` 去挑对应的 `.vite()` / `.webpack()`。
-
-主插件把这些调用结果一张张拼成一个数组，最后 `filter(Boolean)` 把关掉的（返回 `undefined` 的）抹掉：
-
-```ts
-const plugins = [
-  resolvePlugin(VueSetupSFC, framework, options.setupSFC),
-  resolvePlugin(VueDefineModels, framework, options.defineModels),
-  resolvePlugin(VueBetterDefine, framework, options.betterDefine),
-  // ... 二三十行，每行一个宏
-].filter(Boolean)
-```
-
-**这个扁平清单就是整个宏系统的真实形态。** 新增一个宏 = 往这张表里加一行；禁用一个宏 = 把那行的开关设成 `false`。聚合层本身不关心改写逻辑，它只管「谁该亮、按什么顺序亮」。
-
-## 一张图把七步串起来
-
-把上面四块拼起来，整个机制其实是一条单向流水线，可以拆成七步：
-
-```
-① 宏作者写纯函数 transformXxx(code, id)
-        │  （不知道构建器，字符串进字符串出）
-        ▼
-② createUnplugin 工厂收下它：运行时拿 framework，
-   就地算好过滤规则，声明 name / transformInclude / transform
-        │
-        ▼
-③ 适配库自动挂六套方法 .vite()/.rollup()/.webpack()/...
-        │
-        ▼
-④ 每个宏包写六个一行式入口文件，re-export 对应构建器的方法
-        │
-        ▼
-⑤ 聚合层 resolvePlugin：开关关→undefined；开关开→unplugin[framework](opts)
-        │
-        ▼
-⑥ 物化出的原生插件：transformInclude 决定改哪些文件，
-   transform 把活全委托回第①步的纯函数
-        │
-        ▼
-⑦ 过滤、拿 vue 编译器 api、HMR 读改写等通用职责，
-   集中放在 common 公共层，宏按需取用
-```
-
-走一遍**执行轨迹**，把这条流水线坐实。假设现在 `framework = 'vite'`，用户没开 `defineModels`：
-
-```
-framework = 'vite'
-resolvePlugin(VueDefineModels, 'vite', false)
-  → options 为 false，门控命中
-  → return undefined
-resolvePlugin(VueShortEmits, 'vite', { /* 开着 */ })
-  → return VueShortEmits.vite({ ... })
-  → 物化出 { name: 'vue-macros-short-emits', transform: <委托回纯函数>, ... }
-
-聚合层数组 = [ undefined, { short-emits 插件 }, ... ]
-  → .filter(Boolean)
-  → [ { short-emits 插件 }, ... ]   ← defineModels 那个 undefined 被抹掉
-```
-
-`defineModels` 因为没开，从头到尾连插件对象都没被创建，更不会去碰任何源码。这就是「门控 + 物化」叠加起来的效果：**关掉的宏零成本，开着的宏自动长成当前构建器的样子。**
-
-## 演示：从零写一个最小的多构建器适配
-
-下面这段脚本不依赖任何构建器，也不 import 原仓库，`node` 直接能跑。它把上面三条原理演透：**① 转换是纯函数；② 一个工厂同时给出多套构建器适配形态；③ 分发 = 门控 + 按构建器物化。** 真实库里挂的是六套适配器，这里手写三套（vite/rollup/webpack）演示「同一份内核、不同外壳、怪癖就地处理」。
-
-```js
-// ===== 原理点①：转换是纯函数，与构建器无关 =====
-// 输入：源码字符串；输出：改写后的源码，或 undefined（表示「这文件我不动」）
-// 它根本不知道自己在 vite 还是 webpack 里跑
-function transformFoo(code) {
-  if (!code.includes('defineFoo(')) return undefined   // 没命中，这文件不管
+// 转换是纯函数：拿到源码吐改写后的源码，对构建器一无所知
+function transformFoo(code: string): string {
   return code.replaceAll('defineFoo(', 'defineBar(')
 }
 
-// ===== 原理点②：一个工厂同时给出多套构建器适配形态 =====
-// 真实库里 createUnplugin 自动挂 6 个方法，这里手写 3 个，
-// 演示「同一份逻辑、不同外壳、构建器怪癖就地分支」
+// 工厂：声明插件名和转换，对外给出多套构建器认得的形态
 function makeFooFactory() {
+  // 每个分支把同一份声明物化成对应构建器的原生插件形状
   return {
-    // vite 认识这个插件对象：有 enforce（执行顺序）和 transformInclude
-    vite(opts) {
-      return {
-        name: 'foo-macro',
-        enforce: 'pre',
-        transformInclude(id) { return id.endsWith('.vue') },
-        transform(code) { return transformFoo(code) },
-      }
-    },
-    // rollup 不需要 transformInclude，自己在 transform 里判断 id
-    rollup(opts) {
-      return {
-        name: 'foo-macro',
-        transform(code, id) {
-          if (!id.endsWith('.vue')) return null
-          return transformFoo(code)
-        },
-      }
-    },
-    // webpack 会把单文件拆成 ?vue&type=script 这种虚拟子模块，id 长得不一样
-    // 这个「差异」就地内联处理，不用单独写一份 webpack 插件
-    webpack(opts) {
-      return {
-        name: 'foo-macro',
-        transform(code, id) {
-          if (!/\.vue(\?.*)?$/.test(id)) return undefined
-          return transformFoo(code)
-        },
-      }
-    },
+    vite: () => ({
+      name: 'foo',
+      enforce: 'pre' as const,
+      transform(code: string) {
+        return { code: transformFoo(code), map: null }
+      },
+    }),
+    rollup: () => ({
+      name: 'foo',
+      transform(code: string) {
+        return { code: transformFoo(code), map: null }
+      },
+    }),
   }
 }
 
-// ===== 原理点③：分发函数 = 特性门控 + 按构建器物化 =====
-// 开关关（options === false）→ 返回 undefined；否则按 framework 物化出原生插件
-function resolve(factory, framework, options) {
-  if (options === false) return undefined       // 门控：关掉就什么都不产出
-  return factory[framework](options)            // 物化：挑当前构建器的外壳
+// 分发函数：开关关就直接返回空，开关开则按构建器选对应的物化方法
+function resolve(
+  factory: ReturnType<typeof makeFooFactory>,
+  framework: 'vite' | 'rollup',
+  enabled: boolean,
+) {
+  if (!enabled) return undefined
+  return factory[framework]()
 }
 
-// ===== 聚合层：把每个宏的 resolve 结果拼成一张扁平清单 =====
-const framework = 'vite'
-const macros = [
-  { factory: makeFooFactory(), feature: true },    // 开关开
-  { factory: makeFooFactory(), feature: false },   // 开关关 → resolve 返回 undefined
-]
-const plugins = macros
-  .map(m => resolve(m.factory, framework, m.feature))
-  .filter(Boolean)                                 // 抹掉 undefined
+// 聚合层：拿到当前构建器名和一张「宏 × 开关」清单，分发成扁平插件列表
+const framework = 'vite' as const
+const plugins = [
+  resolve(makeFooFactory(), framework, true),
+  resolve(makeFooFactory(), 'rollup', false),     // 开关关 → undefined
+].filter(Boolean)                                 // 抹掉 undefined，聚合层是 flat list
 
-// ===== 执行轨迹 =====
-console.log('当前构建器 =', framework)
-console.log('聚合后的插件数 =', plugins.length)              // → 1
-console.log('插件名 =', plugins[0].name)                    // → foo-macro
-console.log('纯函数改写 =', transformFoo('const x = defineFoo(1)'))  // → const x = defineBar(1)
+console.log(plugins.length, (plugins[0] as { name: string }).name)
+// → 1 'foo'
 ```
 
-跑一下你会看到：开了的那个宏物化成了 `{ name: 'foo-macro', ... }`，关掉的那个化成了 `undefined` 被 `filter(Boolean)` 抹掉，最后只剩一个插件。注意 `webpack` 那一支里的 `/\.vue(\?.*)?$/` 正则——它就是前文说的「构建器怪癖就地分支」的影子：同一份逻辑，遇到 webpack 就自动换一套匹配规则，**全靠工厂运行时拿到 `framework` 这一个信息**。
+脚本里每个原理点都对应着一处代码：`transformFoo` 对应「转换与构建器无关」、`makeFooFactory` 返回对象上的 vite/rollup 两个分支对应「一个工厂给多套形态」、`resolve` 里的 `if (!enabled) return undefined` 加上 `factory[framework]()` 对应「特性门控加按构建器分发」。
 
-## 关键权衡
+## 6. 执行轨迹
 
-这套设计不是白捡的，每个选择都换来了一样、也丢掉了一样。下面挑最关键的三条讲透。
+拿一个具体场景走一遍：用户在 vite 项目里启用了 `defineModels`、关掉了 `chainCall`。
 
-**权衡一：统一走 unplugin 抽象，换来六套入口自动生成，代价是被锁死在它暴露的 API 面里。**
-作者选择「所有构建器一律通过 `createUnplugin` 这个抽象来适配，宏只写一份转换」。换来的是极其划算的结果：你写完那个纯函数、写完工厂回调，`.vite()` 到 `.rolldown()` 六套原生入口**自动就有了**，宏的数量 × 构建器的数量本来是乘法爆炸，现在压回了加法（写一份转换、零成本拿六套入口）。
-代价有二。一是你能用的，只能是这个抽象愿意暴露的钩子——某个构建器有个它没暴露的私有特性，你就用不上。二是上面第三块那六个一行式入口文件得每个宏包都维护一份，纯重复劳动，只能靠「约定」收敛（它们确实长得几乎一模一样，照着抄就行）。
+聚合插件启动时拿到 `framework = 'vite'` 和一张表 `{ defineModels: true, chainCall: false }`。它对表里每一项调 `resolve(factory, 'vite', enabled)`：
 
-**权衡二：同一份工厂在运行时按 `framework` 就地分支，换来怪癖内联处理、不用复制插件，代价是构建器差异会「漏」进过滤逻辑。**
-作者没有选择「在工厂里写六份互不相干的 if-else 代码」，而是让同一个工厂运行时拿到 `framework`，就地算过滤规则（前面 `isWebpackLike ? 这套正则 : 那套正则` 就是活生生的例子）。换来的是 webpack 拆虚拟子模块这种怪癖能内联在同一份逻辑里被处理掉，**无需为它单独维护一份插件**。
-代价是：抽象因此并不「完全透明」。你本以为「换构建器对宏是透明的」，结果发现文件过滤这一层悄悄出现了 `framework === 'webpack'` 的分支——构建器的差异漏了进来。好处（不复制）和坏处（不透明）是同一枚硬币的两面。
+- `defineModels` 这一项：`enabled` 为 `true`，进入 `factory.vite()`，物化出一个原生插件 `{ name: 'vite:vue-macros-define-models', enforce: 'pre', transform(code, id) { ... } }`。
+- `chainCall` 这一项：`enabled` 为 `false`，直接返回 `undefined`。
 
-**权衡三：用统一的「门控 + 分发」函数作为聚合层与每个宏的唯一接口，换来扁平清单、增删宏只改一行，代价是要求每个宏都长得一样。**
-作者选择让 `resolvePlugin(unplugin, framework, options)` 成为「聚合层 ↔ 单个宏」之间**唯一的接口形状**。换来的是聚合层那张表干净得惊人——每个宏就是一行 `resolvePlugin(某宏, framework, 某开关)`，新增一个宏加一行、禁用一个改个开关，特性开关和分发还复用同一套机制。
-代价是：**这套接口要求每个宏都长成「`unplugin[framework](options)`」这一个形状。** 少数不符合形状的宏就尴尬了——主插件里能看到它们被 `as any` 强转塞进去，而且只能在部分构建器上跑。统一的代价，就是容不下异类。
+`filter(Boolean)` 把 `undefined` 抹掉，最终 vite 拿到一份只有一个插件的列表。用户写的 `.vue` 文件被 vite 喂给这个插件的 `transform`，内部委托回纯函数 `transformDefineModels(code, id)`，改写后的代码继续走 vite 的下游管道。整条链路里，`transformDefineModels` 始终不知道自己在 vite 里跑——它只看见了源码字符串和文件 id。
 
-（还有一条更隐蔽的：过滤、拿 vue 编译器 api、HMR 读改写这些**跨宏通用职责**集中放在 common 公共层，换来每个宏自身只剩语义改写、清爽可独立维护；代价是这一套公共设施要同时伺候两种异形宏——「改 script 的纯转换宏」和「要往 vue 编译器里塞节点 transform、改 template 的宏」，后者甚至绕开了适配抽象，造成约定上的一个破口。这条与权衡三其实是同一类困境的不同表现：统一接口总是要把异形往里塞。）
+## 7. 教学简化说明
 
-## 小结
+本章演示故意省略了这些：
 
-这一章的核心可以浓缩成一句话：**把改写写成纯函数，让构建器适配变成一层可以自动生成六套外壳的薄壳，再用「门控 + 物化」把它们聚成一张扁平清单。** 改写逻辑只此一份（内核），构建器适配一次性解决（外壳），聚合层只管「谁该亮、按什么顺序亮」（清单）。宏的数量再怎么涨，也不再乘以六。
+- 真实 unplugin 库的完整 API（`resolveId`、`load`、`buildStart`、`buildEnd` 等钩子），只演示了 `transform` 这一条主路径。
+- HMR 的 hack：构建器之间 HMR API 差异更大，unplugin 靠 `getCombinedHooks` 抹平，本章不展开。
+- 构建期宏生成插件名的规则（如 `vite:vue-macros-define-models` 这种带构建器前缀的命名）。
+- webpack 把单文件拆成多个虚拟子模块时、文件 id 的正则细节。
+- TypeScript 的选项泛型（`Plugin<T>` 的选项类型推导）。
+- 虚拟模块（`resolveId` / `load`）——这是下一章的主题。
 
-值得留意的是，那个工厂回调里其实还藏着两个钩子——`resolveId` 和 `load`——本章演示里我们故意把它们删掉了。因为它们干的不是「改源码」，而是「凭空变出一个磁盘上根本不存在的模块」。这恰好是下一章「编译期注入虚拟 helper 模块」要讲的事：宏往源码里插入的 `import`，目标文件其实不存在于磁盘，全靠这两个钩子拦下 id、就地返回代码。下一章我们接着拆。
+## 8. 小结
+
+三层各管一段：作者那层写纯函数，工厂那层把它包成构建器认得的形状，聚合层那层决定开哪些宏、当前在哪个构建器里跑。加新宏时不需要懂另外两层，代价是抽象的天花板和异形宏的破口。
+
+可宏改写源码时往往会往里插入 `import` 语句，目标模块在磁盘上根本不存在——这就是下一章「编译期注入虚拟 helper 模块」要接的口子。
