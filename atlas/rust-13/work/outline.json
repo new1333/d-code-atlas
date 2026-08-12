@@ -1,0 +1,212 @@
+{
+  "repo": "rust-13",
+  "generatedAt": "2026-08-12T03:52:53.638Z",
+  "chapters": [
+    {
+      "slug": "rust-paradigm-and-toolchain",
+      "title": "Rust 的设计哲学与编译模型总览",
+      "layer": "primitive",
+      "dependsOn": [],
+      "sourceFiles": [],
+      "summary": "Rust 用『编译期静态检查 + 无 GC 的所有权模型』同时达成内存安全与零成本抽象——核心权衡是把 JS 里由运行时/GC 兜底的问题前移到编译期，换来零运行时开销但更高的前期学习与编译期斗争成本。本章建立 Cargo/rustc『提前编译 + 借用检查』的心智总图，作为后续所有权、借用、生命周期等所有机制的上位概念。"
+    },
+    {
+      "slug": "ownership-and-move-semantics",
+      "title": "所有权与移动语义：取代 GC 的核心机制",
+      "layer": "primitive",
+      "dependsOn": [
+        "rust-paradigm-and-toolchain"
+      ],
+      "sourceFiles": [],
+      "summary": "用『单一所有权 + 默认移动语义 + 离开作用域自动析构』取代 GC：值有唯一主人，赋值/传参默认 move 而非拷贝，主人离场即 drop。关键权衡是『确定性析构换可预测性能』，代价是从 JS『万物引用共享』转向值语义带来的心智冲击，以及大量 clone 的诱惑。"
+    },
+    {
+      "slug": "borrow-and-references",
+      "title": "借用与引用：编译期的别名分析",
+      "layer": "primitive",
+      "dependsOn": [
+        "ownership-and-move-semantics"
+      ],
+      "sourceFiles": [],
+      "summary": "用引用『借』值而不夺取所有权，靠『多条不可变借用 或 唯一可变借用』的排他规则让编译器做别名分析。核心思想是把 GC 语言的运行时安全检查变成编译期证明，代价是与 JS『随意共享可变引用』的直觉直接冲突——这正是初学者与借用检查器缠斗的根源。"
+    },
+    {
+      "slug": "lifetimes",
+      "title": "生命周期：编译期证明引用有效性",
+      "layer": "primitive",
+      "dependsOn": [
+        "borrow-and-references"
+      ],
+      "sourceFiles": [],
+      "summary": "用生命周期标注让编译器证明『引用不会比被引用者活得更久』，把悬垂引用在编译期消灭。关键权衡是把引用有效性检查从运行时（RC/GC）前移到编译期签名标注，换来零开销内存安全，代价是泛型 API 签名复杂度与初学者对 'a 标注的畏惧。"
+    },
+    {
+      "slug": "stack-heap-and-copy-clone",
+      "title": "栈与堆：数据布局与 Copy/Clone 语义",
+      "layer": "primitive",
+      "dependsOn": [
+        "ownership-and-move-semantics"
+      ],
+      "sourceFiles": [],
+      "summary": "Rust 默认栈分配、对实现 Copy 的类型按位复制、其它类型必须显式 clone——与 JS『对象都逃逸到堆、赋值即共享引用』截然不同。核心原理是『让数据布局与拷贝成本对程序员可见、可控』，权衡是性能收益（栈 + Copy 零成本）换来必须主动判断哪些值该 Clone。"
+    },
+    {
+      "slug": "enums-pattern-matching",
+      "title": "代数数据类型：枚举与穷尽模式匹配",
+      "layer": "primitive",
+      "dependsOn": [
+        "rust-paradigm-and-toolchain"
+      ],
+      "sourceFiles": [],
+      "summary": "enum 是真正的代数数据类型（和类型），每个变体可携带不同负载数据，配合 match 的穷尽性检查把『非法状态』在类型层消灭。核心思想是『让非法状态不可表达』，远超 TS 联合类型仅在类型层的约束——运行时也保证不漏分支。"
+    },
+    {
+      "slug": "traits-and-generics",
+      "title": "Trait 与泛型：编译期单态化的静态多态",
+      "layer": "composite",
+      "dependsOn": [
+        "enums-pattern-matching"
+      ],
+      "sourceFiles": [],
+      "summary": "trait 定义能力契约，泛型配合 trait bound 在编译期单态化（为每个具体类型生成一份代码），实现『静态多态 = 零成本』。关键权衡是『单态化换极致性能』，代价是代码膨胀（二进制体积）和编译时间——这是 Rust 零成本抽象最具代表性的一章。"
+    },
+    {
+      "slug": "closures-and-functional-traits",
+      "title": "闭包与 Fn/FnMut/FnOnce：捕获方式即类型",
+      "layer": "composite",
+      "dependsOn": [
+        "borrow-and-references",
+        "traits-and-generics"
+      ],
+      "sourceFiles": [],
+      "summary": "闭包按捕获环境的方式被编译器自动归类为 FnOnce（消耗）/FnMut（可变借用）/Fn（不可变借用）三类 trait，使所有权与借用规则自然延伸到函数式抽象。关键思想是『捕获方式决定可调用性』，让高阶函数能精确约束闭包能做什么，代价是三类 trait 的概念负担。"
+    },
+    {
+      "slug": "trait-objects-and-dispatch",
+      "title": "动态派发：dyn Trait 与 vtable",
+      "layer": "composite",
+      "dependsOn": [
+        "traits-and-generics",
+        "lifetimes"
+      ],
+      "sourceFiles": [],
+      "summary": "当需要异构集合或运行时多态时，用 dyn Trait 走 vtable 做动态派发，牺牲一次间接调用的性能换灵活性。关键权衡正是与单态化的对照：静态派发（快、但代码膨胀、需编译期已知具体类型）vs 动态派发（灵活、但对象安全限制 + 运行时开销）。"
+    },
+    {
+      "slug": "error-handling-result-option",
+      "title": "错误即值：Result/Option 与 ? 运算符",
+      "layer": "composite",
+      "dependsOn": [
+        "enums-pattern-matching"
+      ],
+      "sourceFiles": [],
+      "summary": "Rust 没有异常也没有 null：用 Option 表达『可能无值』、Result 表达『可能失败』，错误是值而非控制流跳转，编译器强制你处理。? 运算符做早返回降低啰嗦度，panic 只留给真正不可恢复。核心权衡是『把失败编进类型、强制显式处理』换极高健壮性，代价是相对 JS try/catch 更多样板。"
+    },
+    {
+      "slug": "collections-and-iterators",
+      "title": "集合与迭代器：零成本抽象的典范",
+      "layer": "composite",
+      "dependsOn": [
+        "ownership-and-move-semantics",
+        "closures-and-functional-traits"
+      ],
+      "sourceFiles": [],
+      "summary": "标准集合（Vec/HashMap）解决堆上动态数据，迭代器是惰性抽象，经编译器融合优化后等价于手写循环——零成本抽象的典范。核心思想是『高阶链式表达不牺牲性能』，代价是必须理解所有权在迭代中的传递（for/iter/into_iter 差异），否则频繁与借用检查器冲突。"
+    },
+    {
+      "slug": "smart-pointers-and-interior-mutability",
+      "title": "智能指针与内部可变性：借用规则的运行时逃生舱",
+      "layer": "composite",
+      "dependsOn": [
+        "borrow-and-references",
+        "lifetimes"
+      ],
+      "sourceFiles": [],
+      "summary": "当单一所有权与编译期借用规则不够用时，用 Rc/Arc 做引用计数、用 RefCell/Mutex 把借用检查延迟到运行期（内部可变性）。核心权衡是『用运行时检查换编译器无法证明的共享/可变模式』，换灵活性但付出运行时开销，并把编译期报错降级为运行时 panic。"
+    },
+    {
+      "slug": "macros-and-metaprogramming",
+      "title": "宏系统：编译期代码生成",
+      "layer": "composite",
+      "dependsOn": [
+        "rust-paradigm-and-toolchain"
+      ],
+      "sourceFiles": [],
+      "summary": "用编译期代码生成（macro_rules! 的模式匹配替换 / 过程宏操作 token 流）实现超出类型系统的抽象，如 vec!、println!、#[derive]。关键权衡是『极强的表达力换不参与类型检查、调试难、编译慢』——因此惯例是能用 trait/generics 就不用宏，宏留作最后手段。"
+    },
+    {
+      "slug": "concurrency-and-send-sync",
+      "title": "无畏并发：Send/Sync 与编译期线程安全",
+      "layer": "composite",
+      "dependsOn": [
+        "borrow-and-references",
+        "smart-pointers-and-interior-mutability"
+      ],
+      "sourceFiles": [],
+      "summary": "用 Send/Sync 两个 marker trait 在编译期证明类型能否跨线程移动/共享，把数据竞争在编译期消灭，实现『无畏并发』。与 JS 单线程事件循环『天然无数据竞争』形成对照，Rust 的并发安全由所有权+借用+类型共同静态保证，代价是与生命周期紧密耦合的陡峭学习曲线；channel（消息传递）vs Mutex（共享状态）是核心设计抉择。"
+    },
+    {
+      "slug": "async-await-and-futures",
+      "title": "异步模型：Future、poll 与可选运行时",
+      "layer": "composite",
+      "dependsOn": [
+        "concurrency-and-send-sync",
+        "traits-and-generics"
+      ],
+      "sourceFiles": [],
+      "summary": "async 函数返回一个被编译成状态机的 Future，由外部 executor 通过 poll 主动驱动——与 JS『Promise 创建即运行、事件循环内置』根本不同。核心权衡是『把运行时拆成可选组件』换来对堆分配/调度的极致控制，代价是生态运行时分裂（Tokio 事实标准）且 Future 是惰性的、必须 .await 才执行。"
+    },
+    {
+      "slug": "modules-crates-and-cargo",
+      "title": "模块、Crate 与 Cargo：工程组织与标准化工具链",
+      "layer": "system",
+      "dependsOn": [
+        "rust-paradigm-and-toolchain"
+      ],
+      "sourceFiles": [],
+      "summary": "Cargo 把构建、依赖解析、测试、文档、发布统一成一套标准化工具链；crate 是编译单元、mod 是代码组织。核心思想是『靠强约定消除配置地狱』（对比 node_modules/webpack 的碎片化），代价是理解 edition 语义与 SemVer 依赖解析规则，但换来『开箱即用』的工程体验。"
+    },
+    {
+      "slug": "unsafe-and-ffi",
+      "title": "unsafe 与 FFI：安全边界的逃逸舱",
+      "layer": "system",
+      "dependsOn": [
+        "lifetimes",
+        "smart-pointers-and-interior-mutability"
+      ],
+      "sourceFiles": [],
+      "summary": "Rust 的安全保证由 unsafe 显式打开：裸指针、调用 C、手写并发原语等必须用 unsafe 标注，程序员负责 uphold 编译器无法证明的不变式。关键权衡是『把危险收缩到最小、可审计的区域』换底层能力，代价是把保证从『编译期证明』降级为『人工契约』——FFI 也由此成为 Rust 与 C 生态互操作的边界。"
+    },
+    {
+      "slug": "rust-for-webassembly",
+      "title": "Rust 编译到 WebAssembly：前端工程师的落地接口",
+      "layer": "system",
+      "dependsOn": [
+        "lifetimes",
+        "unsafe-and-ffi"
+      ],
+      "sourceFiles": [],
+      "summary": "Rust 的无 GC、确定性内存与强类型使其成为编译到 WebAssembly 的理想源语言，通过 wasm-bindgen 与 JS 互操作。核心权衡是『把计算密集/性能敏感模块交给 Rust+wasm 换数量级性能提升』，代价是 JS-wasm 边界的数据序列化成本与体积，因此实战中只在 hot path 值得——本章把前面所有原理落到前端工程师最直接的落地场景。"
+    }
+  ],
+  "topoOrder": [
+    "rust-paradigm-and-toolchain",
+    "ownership-and-move-semantics",
+    "borrow-and-references",
+    "lifetimes",
+    "stack-heap-and-copy-clone",
+    "enums-pattern-matching",
+    "traits-and-generics",
+    "closures-and-functional-traits",
+    "trait-objects-and-dispatch",
+    "error-handling-result-option",
+    "collections-and-iterators",
+    "smart-pointers-and-interior-mutability",
+    "macros-and-metaprogramming",
+    "concurrency-and-send-sync",
+    "async-await-and-futures",
+    "modules-crates-and-cargo",
+    "unsafe-and-ffi",
+    "rust-for-webassembly"
+  ]
+}
