@@ -19,6 +19,7 @@ import {
   readdirSync,
   readFileSync,
   writeFileSync,
+  appendFileSync,
   existsSync,
   rmSync,
   mkdirSync,
@@ -31,17 +32,14 @@ const root = resolve(import.meta.dirname, "..");
 const atlasRoot = join(root, "atlas");
 const distRoot = join(root, "dist-sites");
 
-/** 在指定 cwd 运行命令，非零退出码即终止。 */
+/** 在指定 cwd 运行命令，返回退出码（非零不直接终止，交由调用方决定是否跳过该站点）。 */
 function run(cmd, args, cwd) {
   const res = spawnSync(cmd, args, {
     cwd,
     stdio: "inherit",
     shell: process.platform === "win32",
   });
-  if (res.status !== 0) {
-    console.error(`[publish] FAILED: ${cmd} ${args.join(" ")}`);
-    process.exit(res.status ?? 1);
-  }
+  return res.status ?? 1;
 }
 
 /**
@@ -118,8 +116,7 @@ function injectBase(configPath, key, basePrefix) {
     `defineConfig({\n  base: "${base}",`,
   );
   if (injected === original) {
-    console.error(`[publish] 无法在 ${configPath} 注入 base（未找到 defineConfig({）`);
-    process.exit(1);
+    throw new Error(`无法在 ${configPath} 注入 base（未找到 defineConfig({）`);
   }
   writeFileSync(configPath, injected);
   console.log(`[publish] ${key}: 注入 base=${base}`);
@@ -154,23 +151,47 @@ const basePrefix = resolveBasePrefix();
 rmSync(distRoot, { recursive: true, force: true });
 mkdirSync(distRoot, { recursive: true });
 
+const failed = [];
 const links = [];
 for (const key of keys) {
   const siteDir = join(atlasRoot, key, "site");
   const configPath = join(siteDir, ".vitepress", "config.ts");
-  const original = injectBase(configPath, key, basePrefix);
+  let original = null;
   try {
+    original = injectBase(configPath, key, basePrefix);
     console.log(`[publish] ${key}: bun install + docs:build（base=${basePrefix}${key}/）`);
-    run("bun", ["install", "--frozen-lockfile"], siteDir);
-    run("bun", ["run", "docs:build"], siteDir);
+    const installCode = run("bun", ["install", "--frozen-lockfile"], siteDir);
+    if (installCode !== 0) throw new Error(`bun install 退出码 ${installCode}`);
+    const buildCode = run("bun", ["run", "docs:build"], siteDir);
+    if (buildCode !== 0) throw new Error(`docs:build 退出码 ${buildCode}`);
     cpSync(join(siteDir, ".vitepress", "dist"), join(distRoot, key), {
       recursive: true,
     });
-    // 用相对链接：聚合页无论部署在项目子路径（/d-code-atlas/）还是根路径都能正确跳转。
+    // 用相对链接：聚合页无论部署在域名根还是项目子路径都能正确跳转。
     links.push(`<li><a href="${key}/">${siteTitle(siteDir, key)}</a></li>`);
+  } catch (e) {
+    failed.push(key);
+    const msg = `[publish] ${key}: 构建失败，已跳过（其余站点继续）— ${e.message}`;
+    console.error(msg);
+    if (process.env.GITHUB_ACTIONS) console.log(`::error::${msg}`);
   } finally {
-    writeFileSync(configPath, original);
+    // 仅在成功注入过 base 时还原；注入阶段抛错说明文件未改写，无需还原。
+    if (original !== null) writeFileSync(configPath, original);
   }
+}
+
+// 汇总失败站点写入 GITHUB_OUTPUT 供工作流标红；全部失败才中止（无可发布内容）。
+if (process.env.GITHUB_ACTIONS && process.env.GITHUB_OUTPUT) {
+  appendFileSync(process.env.GITHUB_OUTPUT, `failed_sites=${failed.join(" ")}\n`);
+}
+if (failed.length > 0) {
+  console.warn(
+    `[publish] ${failed.length} 个站点构建失败（${failed.join(", ")}），已跳过；成功站点继续发布。`,
+  );
+}
+if (links.length === 0) {
+  console.error("[publish] 所有站点均构建失败，无可发布内容。");
+  process.exit(1);
 }
 
 writeFileSync(
@@ -192,4 +213,4 @@ ${links.join("\n")}
 `
 );
 
-console.log(`[publish] 完成：${distRoot}/（${keys.length} 个站点 + 根 index.html）`);
+console.log(`[publish] 完成：${distRoot}/（${links.length}/${keys.length} 个站点 + 根 index.html）`);

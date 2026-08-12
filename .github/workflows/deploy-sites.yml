@@ -27,6 +27,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
 
       - name: Build all atlas sites
+        id: build
         # 已启用 GitHub Pages 自定义域名，站点部署在域名根下，资源 base 不再带 /d-code-atlas/ 前缀；
         # 通过 ATLAS_PAGES_BASE="/" 覆盖 publish-sites.mjs 默认推导出的项目子路径。
         run: bun scripts/publish-sites.mjs
@@ -40,3 +41,13 @@ jobs:
           publish_dir: ./dist-sites
           publish_branch: gh-pages
           force_orphan: true
+
+      - name: Report build failures
+        # publish-sites.mjs 遇单个站点失败会跳过并继续发布其余站点（不阻断）；这里仅把失败名单
+        # 作为 error 抛出让本次 run 标红便于发现——部署已在上一步完成。
+        if: always() && steps.build.outputs.failed_sites != ''
+        env:
+          FAILED_SITES: ${{ steps.build.outputs.failed_sites }}
+        run: |
+          echo "::error::以下站点构建失败，已跳过（其余站点已正常发布到 gh-pages）：$FAILED_SITES"
+          exit 1
